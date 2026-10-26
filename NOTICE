@@ -1,0 +1,8 @@
+sFNX is MIT-licensed (LICENSE). It includes or derives from:
+
+- front/: ported from Strata's serve/ (https://github.com/Niko1221/Strata), MIT, Copyright (c) 2026 Niko1221 and the
+  Strata contributors (front/LICENSE). vision/sfnx_vision.cpp derives from Strata's tools/vision, same license.
+- data/tokenizer/: Qwen3.8-Flash-Next's tokenizer (vocab, merges, token types, chat template), exported from the
+  model's GGUF; the model and its tokenizer are Apache License 2.0, Copyright the Qwen team, Alibaba Cloud.
+- ref/long64.bin, ref/long114.bin, ref/long164.bin: test prompts made of Strata's own source files (MIT, as above).
+- It builds against llama.cpp (https://github.com/ggml-org/llama.cpp, MIT) at a37cc46, which is not included.

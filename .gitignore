@@ -1,0 +1,32 @@
+# build outputs
+bin/
+build/
+__pycache__/
+.venv
+*.so
+*.log
+
+# llama.cpp at a37cc46: a checkout (or link) here, see Makefile
+llama.cpp
+
+# made locally: the draft layer's runtime files (tools/mtp_experts.py), lab output, profiler captures
+data/mtp-rt
+tmp/
+*.nsys-rep
+*.qdstrm
+*.sqlite
+
+# ref/: the reference tools built from their .cpp, the logits dumps (fnx_run logits / fnx_logref / img_logref
+# remake them) and the weight dumps; the prompts (ref/*.bin) and the picture's reference files stay in git
+ref/fnx_ref
+ref/fnx_logref
+ref/img_logref
+ref/mmid_bench
+ref/lgr
+ref/fnx1.bin
+ref/ref1.bin
+ref/ref_gdn0.bin
+ref/ref_ub5.bin
+
+# the GGUFs: a link to the folder holding UD-Q4_K_XL/, Q8_0/ and mmproj-F16.gguf (see README, "Running it")
+models

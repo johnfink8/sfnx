@@ -1,0 +1,24 @@
+[Unit]
+Description=sFNX: Qwen3.8-Flash-Next UD-Q4_K_XL split over 3x V100 (OpenAI/Anthropic API on 0.0.0.0:8080)
+After=network-online.target nvidia-power-limit.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+# sFNX's front end (front/) drives the engine named in the config. A template: `make install` fills in the
+# checkout (@ROOT@) and the user who runs it
+WorkingDirectory=@ROOT@
+ExecStart=@ROOT@/.venv/bin/python -m front.server --engine sfnx --config @ROOT@/serve/sfnx.json --port 8080 --host 0.0.0.0
+Environment=PYTHONUNBUFFERED=1 STRATA_DEBUG=1
+LimitMEMLOCK=infinity
+# ~72 GiB of weights from the page cache (minutes from the SSD when cold)
+TimeoutStartSec=30min
+TimeoutStopSec=90
+KillMode=mixed
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,204 @@
+// fnx: Flash-Next (qwen4exp) split across the cards. Every layer runs on every card: attention and recurrent heads,
+// every expert's ff width and the output vocabulary are divided; the hyper-connection mixes, the router and the
+// embeddings are copied. Two sums across the cards per layer.
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "gguf.hpp"
+
+namespace fnx {
+
+constexpr int NCARD = 3;
+constexpr int N = 2560, HC = 4, D = N * HC, LR = 320;
+constexpr int NL = 48, NEXP = 512, TOPK = 10, FF = 640, FF_SH = 640;
+constexpr int NKH = 16, NVH = 48, HS = 128;            // recurrent: key heads, value heads, head size
+constexpr int NQH = 24, NKVH = 2, HD = 256, NROT = 64; // attention
+constexpr int MAXT = 16;                               // rows per window
+constexpr int PLE_LAYER = 1, PLE_HEADS = 16, PLE_DIM = 160;
+
+inline bool is_attn(int l) { return (l + 1) % 4 == 0; }
+
+// Q8_0 split for kernels that read 8 values at a time: int8 values [rows][n], f16 scale bits [rows][n / 32]
+struct Q8S {
+    int8_t* q = nullptr;
+    uint16_t* d = nullptr;
+};
+
+// device weight slice: raw ggml blocks, row-major over output rows
+struct DW {
+    void* p = nullptr;
+    uint32_t type = 0;
+    int n_in = 0, n_out = 0;   // the slice's shape
+    size_t row_bytes = 0;
+    Q8S s;                     // dense Q8_0 matrices: the split layout instead of p (see Up::dense)
+    // routed experts with some kept in RAM: a device table of where each expert's matrix is now, a VRAM slot of the
+    // card's ExpertCache or its copy in mapped page-locked host memory; null: expert e at p + e * stride
+    const char* const* ep = nullptr;
+};
+
+// The routed experts when VRAM holds only some (FNX_EXPERT_RAM_GIB): every expert has a copy in mapped page-locked
+// host memory; VRAM holds slots (gate|up, then down) for the ones in use, filled at load with the hottest by the
+// profile, one pool per expert size (layers whose experts have the same gate|up and down bytes share a pool). A decode
+// window's experts that are not in a slot take one of their pool's (CLOCK: the first slot not used since the pool's
+// hand last passed), copied in from RAM, and the layer's tables (LayerW gu_e.ep / down_e.ep: rows of ep_gu / ep_dn)
+// follow. All device memory; the same steps on every card.
+constexpr int EC_POOLS = 4;
+struct ExpertCache {
+    int n_slots = 0;                     // all pools'
+    int n_pools = 0;
+    int pool_of[NL] = {};                // each layer's pool
+    int s0[EC_POOLS] = {}, n[EC_POOLS] = {};   // a pool's slots: [s0, s0 + n) of the slot numbers
+    size_t slot_bytes[EC_POOLS] = {}, dn_off[EC_POOLS] = {};
+    char* pool[EC_POOLS] = {};
+    const char** ep_gu = nullptr;        // [NL * NEXP]: where each expert's gate|up is now
+    const char** ep_dn = nullptr;
+    const char* const* host_gu = nullptr;  // [NL * NEXP]: its copy in host memory
+    const char* const* host_dn = nullptr;
+    int* slot_of = nullptr;              // [NL * NEXP]: its slot, or -1
+    int* owner = nullptr;                // [n_slots]: the expert in it (layer * NEXP + expert)
+    unsigned char* ref = nullptr;        // [n_slots]: used since the hand passed (2: by the layer being planned, 3: lent)
+    int* hand = nullptr;                 // [EC_POOLS]: each pool's, a slot number in it
+    // FNX_ARENA: the pool whose slots the K/V pool can borrow (the largest), its slots coldest first by the profile and
+    // its memory the engine's (the arena: K/V pages, then these slots); a pool's first lent[p] slots are lent (empty,
+    // ref 3, skipped by CLOCK). -1: no arena
+    int arena_pool = -1;
+    int arena_full = 0;                  // every expert in a slot at the start (no FNX_EXPERT_RAM_GIB): nothing lent, nothing out
+    int* lent = nullptr;                 // [EC_POOLS]
+};
+
+struct LayerW {
+    // copied
+    const float* hc_norm[2] = {};      // attn, ffn: [hc*n] f32
+    Q8S hc_down[2];                    // [LR][D]
+    Q8S hc_up[2];                      // [D][LR]
+    uint16_t* hc_inj[2] = {};          // bf16 [HC][D]
+    float* router = nullptr;           // f32 [NEXP + 1][N]: the router's rows, then the shared expert's gate
+    // recurrent slice: this card's key heads and their value heads
+    DW qkv, z, ssm_out;                // qkv rows: q (nk*HS), k (nk*HS), v (nv*HS); ssm_out: [N][nv*HS]
+    DW qkvz;                           // qkv rows then z rows, one matrix
+    float* ab = nullptr;               // f32 [2 * nv][N]: alpha rows then beta rows
+    float* conv = nullptr;             // f32 [channels][4]
+    float* alpha = nullptr;            // f32 [nv][N]
+    float* beta = nullptr;
+    float* ssm_a = nullptr;            // [nv]
+    float* dt_bias = nullptr;          // [nv]
+    float* ssm_norm = nullptr;         // [HS]
+    // attention slice: this card's query heads (q and gate rows per head), its KV heads
+    DW wq, wk, wv, wo;
+    float* q_norm = nullptr;
+    float* k_norm = nullptr;
+    // QSA indexer (every card the whole of it): the trunk's bf16 q (4 x 128 rows) and k (128 rows) projections, or the
+    // draft layer's Q8 [q | k] (640 rows); the per-head norms
+    uint16_t* idx_wq = nullptr;
+    uint16_t* idx_wk = nullptr;
+    DW idx_qk;
+    float* idx_qn = nullptr;
+    float* idx_kn = nullptr;
+    // MoE slice: every expert's ff range [ff0, ff1)
+    DW gu_e, down_e;                   // per expert: [gate; up] [2 ff][N], down [N][ff]; expert stride = rows * row_bytes
+    size_t gu_e_stride = 0, down_e_stride = 0;
+    DW sh_gu, sh_down;                 // shared expert ff range, gate and up stacked the same way
+};
+
+struct CardW {
+    int dev = 0;
+    // recurrent split
+    int k0 = 0, nk = 0;                // key heads [k0, k0 + nk) (their q and k)
+    std::vector<int> vheads;           // value heads (global s * NKH + k, k in the key heads), in order
+    int* vmap = nullptr;               // device, per local value head: local key head | (writes its q/k history) << 8
+    int nv() const { return (int) vheads.size(); }
+    int conv_ch() const { return (2 * nk + nv()) * HS; }
+    // attention split
+    int q0 = 0, nq = 0;                // query heads [q0, q0 + nq)
+    int kv0 = 0, nkv = 0;              // KV heads [kv0, kv0 + nkv)
+    // ff split
+    int ff0 = 0, ff1 = 0;
+    // output vocabulary split
+    int v0 = 0, v1 = 0;
+    std::vector<LayerW> L;
+    const float* head_norm = nullptr;
+    Q8S head_down, head_up;
+    DW out;                            // output head rows [v0, v1)
+    // PLE layer weights (copied)
+    DW ple_key, ple_value;
+    float* ple_norm_key = nullptr;
+    float* ple_norm_query = nullptr;
+    float* ple_norm_conv = nullptr;
+    float* ple_conv = nullptr;         // [D][4]
+    size_t bytes = 0;                  // what the loader allocated
+    size_t host_bytes = 0;             // routed experts' copies in RAM (page-locked, mapped)
+    ExpertCache ec;                    // n_slots 0: every routed expert in VRAM at its DW's p
+    std::vector<const char*> ec_host_gu, ec_host_dn;   // ec.host_gu / host_dn on the host
+    std::vector<int> ec_owner0, ec_slot0;   // ec.owner / slot_of as loaded (an arena engine starts from them again)
+    std::vector<void*> expert_mem;     // what Model::place_experts allocated (freed by free_experts)
+    size_t expert_bytes = 0;
+};
+
+// the draft (MTP) layer on one card: an attention layer (hc [0] before the attention, [1] before the MoE), its input
+// projections, the final mixer, and this card's rows [dv0, dv1) of the draft head
+struct MtpCard {
+    LayerW L;
+    DW fc_emb, fc_hid;                 // every card: [N][N] each
+    const float* norm_emb = nullptr;   // [N]
+    const float* norm_hid = nullptr;   // [D]: one RMS over the four streams
+    const float* mix_norm = nullptr;   // the final mixer (no inject)
+    Q8S mix_down, mix_up;
+    DW head;
+    int dv0 = 0, dv1 = 0;
+    int dev = 0;
+    std::vector<void*> allocs;         // this card's device memory, freed with the Mtp
+};
+
+struct Model;
+// its device memory is freed with it: an engine it is attached to must not run the draft layer after that
+struct Mtp {
+    std::vector<MtpCard> cards;        // one per Model card, on the same devices
+    std::vector<int> vocab;            // the draft vocabulary: head row -> token id
+    // vocab_file: the draft vocabulary (int32 token ids); empty: rt_dir/draft_vocab.bin
+    Mtp(const Model& m, const std::string& rt_dir, const std::string& vocab_file = "");
+    ~Mtp();
+    Mtp(const Mtp&) = delete;
+    Mtp& operator=(const Mtp&) = delete;
+};
+
+struct Store;
+// How a Model loads: PLAIN (bin/sfnx, fnx_run: everything its own); HOLD (the lab's holder, tools/fnx_hold.cpp: the
+// weights into the Store's shared memory, every routed expert to a host copy, none placed); ATTACH (a lab worker,
+// tools/fnx_lab.cpp: the holder's memory already mapped by the Store, its cards' tables from image, the experts placed
+// here by this process's settings)
+enum class Load { PLAIN, HOLD, ATTACH };
+struct Model {
+    Gguf g;
+    std::vector<CardW> cards;
+    const Tensor* tok_embd = nullptr;  // stays in the mapping: rows are gathered on the host
+    const Tensor* ple_table = nullptr;
+    std::vector<uint64_t> ple_mult, ple_off, ple_vocab;
+    int64_t ple_eos = 0;
+    int64_t ple_image = 0;   // what the PLE n-grams read for an image cell
+    float eps = 1e-6f, rope_base = 1e7f;
+    int vocab = 0;
+    // [NL][NEXP]: the routed experts in VRAM at the start (empty: all, no ExpertCache). FNX_EXPERT_RAM_GIB=G (default 3;
+    // off: no cache) leaves the coldest G GiB of them (whole experts, all cards' slices) out, ranked by
+    // FNX_EXPERT_PROFILE (FNX_ROUTE_COUNT's tallies; default data/expert-routes.bin)
+    std::vector<std::vector<char>> resident;
+    int ram_extra = 0;                   // more of the coldest in RAM than FNX_EXPERT_RAM_GIB's (the engine, VRAM short)
+    // the arena (the default; FNX_ARENA=0: none): every expert resident at the start, the largest pool's slots in the
+    // engine's arena and lent to the K/V pool coldest first as it grows (score: the profile's, per byte; higher is hotter)
+    bool arena = false;
+    std::vector<double> score;           // [NL * NEXP]
+    explicit Model(const std::string& gguf_first_shard, Load how = Load::PLAIN, Store* store = nullptr, const std::string* image = nullptr);
+    // the residency and arena settings (FNX_EXPERT_RAM_GIB, FNX_ARENA, FNX_EXPERT_PROFILE) read again
+    void choose_residency();
+    // a worker's routed experts from their host copies: every one in VRAM, or an ExpertCache (with the arena: its
+    // largest pool left to the engine). free_experts gives that back, so new settings can place them again
+    void place_experts();
+    void free_experts();
+    std::string image() const;          // HOLD: the cards' tables for a worker
+    // ATTACH: the holder's tables, every address in them moved to where store mapped the holder's memory
+    void restore(const std::string& image, const Store& store);
+};
+
+}  // namespace fnx
