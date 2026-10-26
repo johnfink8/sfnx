@@ -278,6 +278,10 @@ private:
     // read ~20% faster than at 1024 for ~1.1 GiB more a card; Q4 at 262k makes room with FNX_EXPERT_RAM_GIB) and its jobs
     int pf_c_ = 4096, pf_jobs_ = 0;
     void prefill_alloc();
+    // the prompt path's two stages for the experts in RAM: their size follows where the experts are, so they are
+    // allocated once that is final (Engine::Engine, after the arena's sizing has placed any more of them in RAM)
+    size_t pf_stage_bytes(int c) const;
+    void prefill_stages();
     // a pass: up to PF_PASS chunks, each layer over all of them before the next layer (with an ExpertCache the layer's
     // experts not in a slot are copied into VRAM once per pass); a chunk's rows are embedded in its pinned set already.
     // `between` runs on the host while the cards work

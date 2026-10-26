@@ -311,7 +311,8 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
                 size_t fr = 0, tot = 0;
                 ck(cudaMemGetInfo(&fr, &tot), "cudaMemGetInfo");
                 const size_t sb = ec.slot_bytes[ec.arena_pool],
-                             need = (size_t) ec.n[ec.arena_pool] * sb + reserve + (size_t) (extra_pages + 1) * kvp_page(c) * sizeof(uint16_t);
+                             need = (size_t) ec.n[ec.arena_pool] * sb + reserve + (size_t) (extra_pages + 1) * kvp_page(c) * sizeof(uint16_t) +
+                                    2 * pf_stage_bytes(c);
                 if (fr < need) {   // 256 MiB more than short, so the next engine's few MiB of drift place nothing again
                     more = std::max(more, (int) ((need - fr + (256u << 20) + sb - 1) / sb));
                     short_mib = std::max(short_mib, (need - fr) >> 20);
@@ -325,6 +326,7 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
             m.ram_extra += more;
             m.place_experts();
         }
+        prefill_stages();
         for (int c = 0; c < NCARD; ++c) {
             const ExpertCache& ec = m.cards[c].ec;
             if (ec.arena_pool < 0) throw std::runtime_error("FNX_ARENA: card " + std::to_string(c) + " has no arena pool");
@@ -355,6 +357,8 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
             const size_t room = (size_t) (ec.n[p] - keep) * ec.slot_bytes[p] + (arena_slot_off(c) - (size_t) n_pages * page);
             arena_cap_ = std::min(arena_cap_, n_pages + (int) (room / page));
         }
+    } else {
+        prefill_stages();
     }
     for (int c = 0; c < NCARD; ++c) {
         CardBuf* b = cb_[c];

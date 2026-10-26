@@ -675,7 +675,7 @@ void Engine::pf_seq_reset(unsigned start) {
 }
 
 void Engine::prefill_alloc() {
-    if (!pf_.empty()) return;
+    if (!pf_.empty()) throw std::runtime_error("prefill_alloc: the prompt path's buffers exist already");
     pf_.resize(NCARD);
     for (int c = 0; c < NCARD; ++c) {
         CardBuf& b = *cb_[c];
@@ -853,18 +853,7 @@ void Engine::prefill_alloc() {
                     }
             }
         }
-        if (w.ec.n_slots) {
-            // a stage holds the largest layer's experts not in a slot at the start, FNX_PF_STAGE_MIB at most
-            size_t most = 0;
-            for (int l = 0; l < NL; ++l) {
-                size_t n = 0;
-                for (int e = 0; e < NEXP; ++e) n += m_.resident[(size_t) l][(size_t) e] ? 0 : 1;
-                most = std::max(most, n * (w.L[(size_t) l].gu_e_stride + w.L[(size_t) l].down_e_stride));
-            }
-            const long long stage_mib = env_int("FNX_PF_STAGE_MIB", 384);
-            if (stage_mib < 0) throw std::runtime_error("FNX_PF_STAGE_MIB: want MiB >= 0, got " + std::to_string(stage_mib));
-            p->stage_bytes = std::min(most, (size_t) stage_mib << 20);
-            for (char*& st : p->stage) st = palloc<char>(p->stage_bytes);
+        if (w.ec.n_slots) {   // the stages themselves: prefill_stages, once the experts' places are final
             const long long stage_rows = env_int("FNX_PF_STAGE_ROWS", 2048);
             if (stage_rows < 0 || stage_rows > INT32_MAX)
                 throw std::runtime_error("FNX_PF_STAGE_ROWS: want tokens >= 0, got " + std::to_string(stage_rows));
@@ -884,9 +873,6 @@ void Engine::prefill_alloc() {
                     ckc(cudaEventCreateWithFlags(e, cudaEventDisableTiming), "event");
                     own_event(*e);
                 }
-            if (env_flag("FNX_PF_TIMING"))
-                std::fprintf(stderr, "prefill on card %d: passes of %d chunks, stages of %zu MiB (the largest layer's experts in RAM: %zu MiB)\n", c,
-                             p->pass, p->stage_bytes >> 20, most >> 20);
         }
         pf_[c] = p;
         if (env_flag("FNX_PF_TIMING"))
@@ -920,6 +906,35 @@ void Engine::prefill_alloc() {
     if (seq0 < 0 || seq0 > (long long) UINT32_MAX)
         throw std::runtime_error("FNX_PF_SEQ_START: want 0.." + std::to_string(UINT32_MAX) + ", got " + std::to_string(seq0));
     pf_seq_reset((unsigned) seq0);
+}
+
+size_t Engine::pf_stage_bytes(int c) const {
+    const CardW& w = m_.cards[c];
+    if (!w.ec.n_slots) return 0;
+    // a stage holds the largest layer's experts not in a slot at the start, FNX_PF_STAGE_MIB at most
+    size_t most = 0;
+    for (int l = 0; l < NL; ++l) {
+        size_t n = 0;
+        for (int e = 0; e < NEXP; ++e) n += m_.resident[(size_t) l][(size_t) e] ? 0 : 1;
+        most = std::max(most, n * (w.L[(size_t) l].gu_e_stride + w.L[(size_t) l].down_e_stride));
+    }
+    const long long stage_mib = env_int("FNX_PF_STAGE_MIB", 384);
+    if (stage_mib < 0) throw std::runtime_error("FNX_PF_STAGE_MIB: want MiB >= 0, got " + std::to_string(stage_mib));
+    return std::min(most, (size_t) stage_mib << 20);
+}
+
+void Engine::prefill_stages() {
+    for (int c = 0; c < NCARD; ++c) {
+        Pf& p = *pf_[c];
+        if (p.stage[0]) throw std::runtime_error("prefill_stages: card " + std::to_string(c) + " has its stages already");
+        p.stage_bytes = pf_stage_bytes(c);
+        if (!p.stage_bytes) continue;
+        ckc(cudaSetDevice(p.dev), "set");
+        pf_card_bytes = 0;
+        for (char*& st : p.stage) st = palloc<char>(p.stage_bytes);
+        if (env_flag("FNX_PF_TIMING"))
+            std::fprintf(stderr, "prefill on card %d: passes of %d chunks, stages of %zu MiB\n", c, p.pass, p.stage_bytes >> 20);
+    }
 }
 
 // the draft layer over a chunk's rows, for its state only (its K/V and QSA keys; its outputs over a prompt are never
@@ -963,7 +978,6 @@ void Engine::prefill_draft(int C, int set) {
 void Engine::prefill(const std::vector<int>& tokens, int after) {
     if (!pending_.empty() || !rows_pending_.lanes.empty()) throw std::runtime_error("prefill: a window is not committed");
     if (mtp_ && after < 0) throw std::runtime_error("prefill: the draft layer needs the token after the last row");
-    prefill_alloc();
     if (pf_[0]->seq >= PF_SEQ_RESET) {
         std::fprintf(stderr, "fnx: prompt ring sequence numbers at %u: flags zeroed, numbers from 0 again\n", pf_[0]->seq);
         pf_seq_reset(0);
