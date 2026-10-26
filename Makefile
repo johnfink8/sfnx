@@ -160,5 +160,5 @@ $(LU)/build/bin/libmtmd.so:
 	test -d $(LU)/.git || { echo "clone llama.cpp at a37cc46 into $(LU) first (or make LLAMA=path)" >&2; exit 1; }
 	cmake -S $(LU) -B $(LU)/build -G Ninja -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70 -DCMAKE_BUILD_TYPE=Release \
 	    -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_CUDA_HOST_COMPILER=g++-14 \
-	    -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
+	   
 	cmake --build $(LU)/build --target mtmd llama
