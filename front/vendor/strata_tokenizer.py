@@ -1,10 +1,9 @@
-"""tools/strata_tokenizer.py - the tokenizer, as the reference implementation of record.
+"""front/vendor/strata_tokenizer.py - the model's tokenizer.
 
 WHY THIS EXISTS AND WHERE IT SITS.  The GGUF carries the whole tokenizer in metadata: `tokenizer.ggml.model`
 = `gpt2`, 248,320 `tokens`, 247,587 `merges`, `token_type`, `pre` = `qwen35`, and a Jinja `chat_template`.
-None of that needs the 35 GB of weights, so it is extracted into the pack's `tokenizer/` directory
-(docs/pack-format.md §6) and this module is what reads it back.  A C++ port follows and is tested against
-this one.
+None of that needs the weights, so it was extracted once into data/tokenizer (vocab.json, merges.txt,
+token_type.json, chat_template.jinja) and this module is what reads it back.
 
 THE DECISIVE PROPERTY IS THE ROUND TRIP.  Byte-level BPE maps each BYTE to a printable unicode character so
 that any UTF-8 input is representable with no UNK token.  Every failure mode of that mapping - the wrong
@@ -16,9 +15,6 @@ emoji (4-byte), combining marks, whitespace runs, and C0 control bytes.
 from __future__ import annotations
 
 import bisect
-import json
-import pathlib
-import sys
 import threading
 
 import regex
@@ -67,12 +63,9 @@ QWEN35_PATTERN = (
 
 
 class Tokenizer:
-    def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
-                 pre: str = "qwen35", special_ids: dict[str, int] | None = None):
+    def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None):
         self.tokens = tokens
-        self.pre = pre
         self.token_types = token_types
-        self.special_ids = special_ids or {}
         self.ids = {t: i for i, t in enumerate(tokens)}
         if len(self.ids) != len(tokens):
             raise ValueError("vocabulary has duplicate tokens: %d entries, %d unique"
@@ -125,25 +118,6 @@ class Tokenizer:
         if not literals:
             return None
         return regex.compile("|".join(regex.escape(s) for s in sorted(literals, key=len, reverse=True)))
-
-    # -------------------------------------------------------------- constructors
-    @classmethod
-    def from_gguf(cls, path) -> "Tokenizer":
-        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-        from gguf_reader import GGUFFile
-        md = GGUFFile(pathlib.Path(path)).metadata
-        need = ["tokenizer.ggml.tokens", "tokenizer.ggml.merges"]
-        missing = [k for k in need if k not in md]
-        if missing:
-            raise ValueError("GGUF is missing %s; it does not carry a tokenizer" % ", ".join(missing))
-        model = md.get("tokenizer.ggml.model")
-        if model != "gpt2":
-            raise ValueError("expected a byte-level BPE tokenizer (model 'gpt2'), got %r" % model)
-        special = {k: int(md[k]) for k in md
-                   if k.startswith("tokenizer.ggml.") and k.endswith("_token_id")}
-        return cls(list(md["tokenizer.ggml.tokens"]), list(md["tokenizer.ggml.merges"]),
-                   list(md.get("tokenizer.ggml.token_type") or []) or None,
-                   md.get("tokenizer.ggml.pre", "qwen35"), special)
 
     # -------------------------------------------------------------- the algorithm
     def _bpe(self, word: str) -> list[str]:
@@ -420,68 +394,3 @@ class PromptEncoder:
         """The prompt with these ids was refused: it is not kept."""
         with self.lock:
             self.entries = [e for e in self.entries if e[2] != ids]
-
-
-# ------------------------------------------------------------------ the pack's tokenizer/ directory
-def extract(gguf_path, out_dir) -> dict:
-    """Write the tokenizer into `<out_dir>/tokenizer/` so the engine never opens the weight shards for it."""
-    out = pathlib.Path(out_dir) / "tokenizer"
-    out.mkdir(parents=True, exist_ok=True)
-    tk = Tokenizer.from_gguf(gguf_path)
-    cfg = {
-        "model": "gpt2",
-        "pre": tk.pre,
-        "vocab_size": len(tk.tokens),
-        "n_merges": len(tk.ranks),
-        "special_ids": tk.special_ids,
-        "add_bos_token": False,
-        # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
-        # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
-        "pre_pattern": QWEN35_PATTERN,
-        "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
-    }
-    (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
-    (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in
-                                              sorted(tk.ranks.items(), key=lambda kv: kv[1])), encoding="utf-8")
-    (out / "token_type.json").write_text(json.dumps(tk.token_types), encoding="utf-8")
-    (out / "tokenizer.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
-    # the model's own chat template: fine-tunes change it (Swift 1.5 differs from Qwen3.8-Flash-Next's)
-    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-    from gguf_reader import GGUFFile
-    tpl = GGUFFile(pathlib.Path(gguf_path)).metadata.get("tokenizer.chat_template")
-    if tpl:
-        (out / "chat_template.jinja").write_text(tpl, encoding="utf-8", newline="\n")
-    return cfg
-
-
-def main() -> int:
-    import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--gguf", required=True)
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--check", action="store_true", help="round-trip a corpus and report")
-    args = ap.parse_args()
-    cfg = extract(args.gguf, args.out)
-    print("tokenizer/: vocab %d, merges %d, pre %s, specials %s"
-          % (cfg["vocab_size"], cfg["n_merges"], cfg["pre"], cfg["special_ids"]))
-    if args.check:
-        tk = Tokenizer.from_gguf(args.gguf)
-        corpus = ["", "Hello, world!", "  leading and trailing  ", "a\n\n\nb",
-                  "def f(x):\n\treturn x  # comment\n", "\u4f60\u597d\uff0c\u4e16\u754c", "\u0645\u0631\u062d\u0628\u0627",
-                  "\U0001f600\U0001f680\U0001f1fa\U0001f1f8", "e\u0301\u0301 combining", "\x00\x01\x7f control",
-                  "\u00a0non-breaking\u00a0space", "1234567890", "MixedCASE_and-dashes", "\r\n\r\n", "\u2028\u2029",
-                  "x" * 5000]
-        bad = 0
-        for s in corpus:
-            ids = tk.encode(s)
-            back = tk.decode(ids)
-            if back != s:
-                print("  *** ROUND TRIP FAILED *** %r -> %d ids -> %r" % (s[:40], len(ids), back[:40]))
-                bad += 1
-        print("round trip: %d strings, %d failed" % (len(corpus), bad))
-        return 0 if bad == 0 else 1
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

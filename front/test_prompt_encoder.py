@@ -126,7 +126,7 @@ class Served(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exceeds the context"):
             svc.prepare(refused, None, {}, 1 << 20)
         self.assertNotIn(refused_ids, [e[2] for e in svc.prompts.entries])
-        self.assertNotIn(full.render_prompt(refused, None, {}), [e[0] for e in svc.prompts.entries])
+        self.assertNotIn(full.template.render(refused), [e[0] for e in svc.prompts.entries])
 
     def test_random_messages_equal_a_full_encode(self):
         """Messages quoting control-token texts and <think> tags at random, growing, edited and cut back between

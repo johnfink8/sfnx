@@ -157,6 +157,19 @@ class Hardening(unittest.TestCase):
                                                        "max_tokens": 8, "temperature": "0.7", "top_k": "40"})
         self.assertEqual(code, 200, out)
 
+    def test_logit_bias_and_unknown_sampling_keys_are_refused(self):
+        from front.server import check_request_sampling, sampling_defaults_from_config
+        with self.assertRaisesRegex(ValueError, "logit_bias"):
+            check_request_sampling({"logit_bias": {"1": 5}})
+        check_request_sampling({"logit_bias": {}})                  # an empty one asks for nothing
+        code, out = self.post("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}],
+                                                       "max_tokens": 8, "logit_bias": {"42": -100}})
+        self.assertEqual(code, 400, out)
+        self.assertIn("logit_bias", out["error"]["message"])
+        with self.assertRaises(SystemExit) as cm:                  # a typo in the config's block stops the start
+            sampling_defaults_from_config({"sampling": {"temprature": 0.6}})
+        self.assertIn("temprature", str(cm.exception))
+
     def test_llama_cpp_names_for_the_repetition_penalty(self):
         """#1819: repeat_penalty / repeat_last_n are repetition_penalty / penalty_last_n; the OpenAI-style name wins."""
         from front.server import SAMPLING_ALIASES, check_request_sampling, sampling_defaults_from_config

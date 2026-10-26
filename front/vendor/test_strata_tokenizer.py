@@ -1,64 +1,32 @@
-"""Tests for tools/strata_tokenizer.py: llama.cpp's reference vectors, the piece cache (0.1.41: the ids are the ones the
-merge loop gives, cache cold, warm or switched off), and the incremental prompt encoder, which must give exactly the
-ids of a plain encode.
+"""Tests for front/vendor/strata_tokenizer.py: the piece cache (0.1.41: the ids are the ones the merge loop gives,
+cache cold, warm or switched off), and the incremental prompt encoder, which must give exactly the ids of a plain
+encode.  The real vocabulary is the model's own, data/tokenizer.
 
-    python -m unittest tools.test_strata_tokenizer -v
-
-The real vocabulary comes from $STRATA_TOKENIZER (a pack's tokenizer/ directory) when set, else from llama.cpp's
-`models/ggml-vocab-qwen35.gguf` next to the gguf-py the tools use ($STRATA_GGUF_PY, third_party/llama.cpp); the
-tests that need it are skipped without one.  The chat template's USER_DEFINED tokens (`<think>`, `<tool_call>`,
-...) are added to the llama.cpp vocabulary, which does not have them, as the pack's has.
+    python -m pytest -q front/vendor/test_strata_tokenizer.py
 """
 from __future__ import annotations
 
 import json
-import os
 import random
 import sys
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "tools"))
-sys.path.insert(0, str(ROOT))
+REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "front" / "vendor"))
+sys.path.insert(0, str(REPO))
 import strata_tokenizer as ST  # noqa: E402
-
-ADDED = ["<think>", "</think>", "<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>",
-         "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
-
-
-def vocab_gguf() -> Path | None:
-    cands = [os.environ.get("STRATA_GGUF_PY"), ROOT / "third_party" / "llama.cpp" / "gguf-py", "/opt/llama.cpp/gguf-py"]
-    for c in cands:
-        if c and (Path(c).parent / "models" / "ggml-vocab-qwen35.gguf").is_file():
-            return Path(c).parent / "models" / "ggml-vocab-qwen35.gguf"
-    return None
 
 
 def load_tokenizer():
-    pack = os.environ.get("STRATA_TOKENIZER")
-    if pack and (Path(pack) / "vocab.json").is_file():
-        t = Path(pack)
-        vocab = json.loads((t / "vocab.json").read_text(encoding="utf-8"))
-        tokens = [None] * len(vocab)
-        for s, i in vocab.items():
-            tokens[i] = s
-        return ST.Tokenizer(tokens, (t / "merges.txt").read_text(encoding="utf-8").split("\n"),
-                            json.loads((t / "token_type.json").read_text()))
-    path = vocab_gguf()
-    return None if path is None else gguf_tokenizer(path)
-
-
-def gguf_tokenizer(path):
-    """llama.cpp's qwen35 vocabulary with the template's added tokens: the one its test vectors were made with."""
-    from gguf_reader import GGUFFile
-    md = GGUFFile(path).metadata
-    tokens, types = list(md["tokenizer.ggml.tokens"]), list(md["tokenizer.ggml.token_type"])
-    for s in ADDED:
-        if s not in tokens:
-            tokens.append(s)
-            types.append(4)
-    return ST.Tokenizer(tokens, list(md["tokenizer.ggml.merges"]), types)
+    """The model's own tokenizer (data/tokenizer)."""
+    t = REPO / "data" / "tokenizer"
+    vocab = json.loads((t / "vocab.json").read_text(encoding="utf-8"))
+    tokens = [None] * len(vocab)
+    for s, i in vocab.items():
+        tokens[i] = s
+    return ST.Tokenizer(tokens, (t / "merges.txt").read_text(encoding="utf-8").split("\n"),
+                        json.loads((t / "token_type.json").read_text()))
 
 
 def byte_tokenizer(specials: list[str]) -> ST.Tokenizer:
@@ -139,31 +107,10 @@ def conversation_prompts(template, rnd: random.Random) -> list[tuple[str, str]]:
     return out
 
 
-class Oracle(unittest.TestCase):
-    """llama.cpp's own tokenizer test vectors for qwen35."""
-
-    def test_llama_cpp_vectors(self):
-        path = vocab_gguf()
-        if path is None or not path.with_suffix(".gguf.inp").is_file():
-            self.skipTest("llama.cpp's ggml-vocab-qwen35.gguf test vectors are not here")
-        tk = gguf_tokenizer(path)                  # not $STRATA_TOKENIZER: the vectors belong to this vocabulary
-        inp = path.with_suffix(".gguf.inp").read_text(encoding="utf-8").split("\n__ggml_vocab_test__\n")
-        out = path.with_suffix(".gguf.out").read_text(encoding="utf-8").split("\n")
-        n = 0
-        for text, want in zip(inp, out):
-            if text.endswith("\n__ggml_vocab_test__"):
-                text = text[:-len("\n__ggml_vocab_test__")]
-            self.assertEqual(tk.encode(text), [int(x) for x in want.split()], repr(text[:40]))
-            n += 1
-        self.assertGreater(n, 40)
-
-
 class Marks(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tk = load_tokenizer()
-        if cls.tk is None:
-            raise unittest.SkipTest("no tokenizer (set STRATA_TOKENIZER or STRATA_GGUF_PY)")
 
     def test_marks(self):
         text = "a<|im_start|>user\nhi<|im_end|>\n<think>\n"
@@ -181,16 +128,14 @@ class Prompts(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tk = load_tokenizer()
-        if cls.tk is None:
-            raise unittest.SkipTest("no tokenizer (set STRATA_TOKENIZER or STRATA_GGUF_PY)")
-        from serve.frontend import ChatTemplate
-        cls.template = ChatTemplate(ROOT / "serve" / "chat_template.jinja")
+        from front.frontend import ChatTemplate
+        cls.template = ChatTemplate(REPO / "front" / "chat_template.jinja")
 
     def check(self, enc, text):
         self.assertEqual(enc.encode(text), self.tk.encode(text, parse_special=True))
 
     def test_chat_golden(self):
-        cases = json.loads((ROOT / "serve" / "chat_golden.json").read_text(encoding="utf-8"))
+        cases = json.loads((REPO / "front" / "chat_golden.json").read_text(encoding="utf-8"))
         enc = ST.PromptEncoder(self.tk)
         for c in cases + cases:                         # the second round finds its own earlier prompts
             if c.get("rendered"):

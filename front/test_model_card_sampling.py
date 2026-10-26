@@ -62,7 +62,6 @@ class ModelCardSampling(unittest.TestCase):
         self.assertEqual(model_card_sampling("qwen4exp", True), {"temperature": 1.0, "top_p": 0.95, "top_k": 20})
         self.assertEqual(model_card_sampling("qwen4exp", False),
                          {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5})
-        self.assertEqual(model_card_sampling("qwen35moe", True)["presence_penalty"], 1.5)
         self.assertEqual(model_card_sampling(None, True), {})
         self.assertEqual(model_card_sampling("unknown", False), {})
 

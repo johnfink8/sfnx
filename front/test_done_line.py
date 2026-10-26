@@ -17,7 +17,7 @@ class DoneLine(unittest.TestCase):
                                        drafts_accepted=7, drafts_offered=12, reused=5))
         self.assertEqual(d.figures(), {"generated": 4, "prompt_tokens": 20, "prompt_ms": 40.0, "decode_ms": 30.5,
                                        "finish": "stop", "drafts_accepted": 7, "drafts_offered": 12, "reused": 5})
-        for finish in ("stop", "length", "cancel", "nonfinite"):
+        for finish in ("stop", "length", "cancel"):
             self.assertEqual(EngineDone.parse(f"DONE 0 1 0 0 {finish} 0 0 0").finish, finish)
 
     def test_a_malformed_line_names_the_field(self):

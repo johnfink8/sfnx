@@ -29,13 +29,11 @@
   "/usr/local/cuda/lib64"
  ],
  "port": 8095,
- "cuda": 12,
  "gpu": [
   0,
   1,
   2
  ],
- "gpus_asked": true,
  "sampling": {
   "temperature": 0.6,
   "top_p": 0.95,

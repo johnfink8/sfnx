@@ -238,30 +238,6 @@ class ConversationCacheCard(unittest.TestCase):
     """#596: /metrics' "conversation_cache": the parked conversations from the engine's log lines, the budget and
     slots from its INFO line, and how much of the prompts the cache gave back."""
 
-    PARK = ("strata serve: conversation cache: parked 5000 tokens in 12.0 ms; parked=1 bytes=104857600 evictions=0 "
-            "snapshot_bytes=104857600 reused_kv_bytes=0\n")
-    RESTORE = "strata serve: conversation cache: restored 4000 tokens (exact) in 30.0 ms; parked=2 bytes=209715200\n"
-
-    def test_the_log(self):
-        from front.server import ConvCacheLog
-        import tempfile
-        with tempfile.TemporaryDirectory() as d:
-            log = Path(d) / "strata.log"
-            log.write_text("an earlier run\n" + self.PARK, encoding="utf-8")
-            start = log.stat().st_size                 # this run starts here: the earlier run's park is not counted
-            c = ConvCacheLog()
-            self.assertEqual(c.poll(str(log), start)["parked"], 0)
-            with open(log, "a", encoding="utf-8") as f:
-                f.write("strata serve: something else\n" + self.PARK + self.RESTORE + "strata serve: conversation ca")
-            st = c.poll(str(log), start)
-            self.assertEqual((st["parked"], st["bytes"], st["parks"], st["restores"]), (2, 209715200, 1, 1))
-            self.assertEqual((st["last_event"], st["last_tokens"]), ("restored", 4000))
-            with open(log, "a", encoding="utf-8") as f:   # the cut line is read once it is whole
-                f.write("che: dropped 1 superseded copy of this conversation; parked=1\n")
-            self.assertEqual(c.poll(str(log), start)["parked"], 1)
-            self.assertEqual(c.poll(str(log), log.stat().st_size)["parked"], 0)   # the engine started again
-            self.assertEqual(c.poll(None, None)["parked"], 0)
-
     # bin/sfnx's own lines (src/session.cpp), as serve/sfnx.log has them; arena and slot lines between them
     SFNX = [
         "conversation cache: parked 11305 tokens in 140 ms, parked=40 bytes=55713546240",

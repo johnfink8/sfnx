@@ -25,8 +25,8 @@ FAKE_BATCH = r'''import queue, sys, threading, time
 args = sys.argv[1:]
 slots = int(args[args.index("--batch") + 1]) if "--batch" in args else 0
 fit = int(args[args.index("--fit") + 1]) if "--fit" in args else slots
-fail = "--fail-window" in args
-groups = int(args[args.index("--says-groups") + 1]) if "--says-groups" in args else 0   # INFO batch_groups=G (--batch-groups auto)        # #997: the first window over two slots fails
+fail = "--fail-window" in args          # #997: the first window over two slots fails
+
 STEP = 0.02
 CH = 32
 lines, stop = queue.Queue(), threading.Event()
@@ -40,7 +40,7 @@ def reader():
     lines.put(None)
 threading.Thread(target=reader, daemon=True).start()
 print("INFO engine=0.1.39" + (f" batch_slots={fit}" if fit >= 2 else "") +
-      (" slot_cache=1" if "--slotcache" in args else "") + (f" batch_groups={groups}" if groups > 1 else ""), flush=True)
+      (" slot_cache=1" if "--slotcache" in args else ""), flush=True)
 print("READY 4096 stop", flush=True)
 LONG = list(b"LONGREPLY")
 def continued(ids):        # (the whole reply, how much of it the prompt already ends with: a request continued)
@@ -53,20 +53,13 @@ def reply(ids):            # the rest of the reply after what the prompt already
     return R[k:]
 active = {}          # slot -> [tokens left, max_new, produced]
 stopped = set()      # BSTOPped slots: they end "cancel"
-# #879: a prompt with NFSOLO / NFADMIT ends its first GEN / BGEN with DONE ... nonfinite (nothing emitted); one with
-# NFSLOT ends its slot with BDONE ... nonfinite after its second token
-fired, nf_slots = set(), set()
+fired = set()
 def window():        # one batch window: every active slot one token
     if fail and len(active) >= 2:     # as the engine: the reason on stdout, then exit code 1
         print("ERR verify batch: layer 34 never rang (graph finished)", flush=True)
         sys.exit(1)
     for b in sorted(active):
         left, max_new, produced = active[b]
-        if b in nf_slots and produced >= 2:
-            nf_slots.discard(b)
-            print(f"BDONE {b} {produced} nonfinite 1.0 0 0 {produced}", flush=True)
-            del active[b]
-            continue
         t = left.pop(0) if left else 257
         produced += 1
         print(f"BT {b} {t}", flush=True)
@@ -115,23 +108,13 @@ while True:
             continue
         if log:
             log.write(f"{f[0]} {slot} {len(ids)} {max(len(active), 0)}\n"); log.flush()
-        pb = bytes(int(x) & 255 for x in ids)
-        mark = b"NFSOLO" if f[0] == "GEN" else b"NFADMIT"
-        if mark in pb and mark not in fired:
-            fired.add(mark)
-            print(f"DONE 0 {len(ids)} 5.0 0.0 nonfinite 0 0 0", flush=True)
-            if slot is not None:
-                print(f"BADM {slot} 0", flush=True)
-            continue
-        if slot is not None and b"NFSLOT" in pb:
-            nf_slots.add(slot)
         toks = reply(ids)
         stop.clear()
         # the prompt read: CH tokens a chunk, a PP line each; a BYIELD <s> gives way at a chunk boundary
         given = None
         for q in range(CH, len(ids) - 1, CH):
             time.sleep(STEP / 2)
-            if (q // CH) % PPK:   # --pp-every K: a PP line and a boundary every K chunks (the pipelined groups' pieces)
+            if (q // CH) % PPK:   # --pp-every K: a PP line and a boundary every K chunks
                 continue
             print(f"PP {q} {len(ids)} 1 1", flush=True)
             held = []
@@ -192,30 +175,26 @@ class ParallelArgs(unittest.TestCase):
         self.assertEqual(parallel_args({"parallel": 4}, []), ["--batch", "4"])
         self.assertEqual(parallel_args({"parallel": 1}, []), [])
         self.assertEqual(parallel_args({}, []), [])
-        self.assertEqual(parallel_args({"parallel": 2}, ["--batch", "3"]), [])       # the args' own value wins
-        self.assertEqual(parallel_args({"parallel": "4"}, []), [])                   # said and ignored
-        self.assertEqual(parallel_args({"parallel": True}, []), [])
         self.assertEqual(parallel_args({"parallel": PARALLEL_MAX}, []), ["--batch", str(PARALLEL_MAX)])
+        self.assertEqual(engine_args({"args": ["--native", "m"], "parallel": 2})[-2:], ["--batch", "2"])
 
-    def test_parallel_above_the_engine_s_slots_refuses_to_start(self):
-        with self.assertRaises(SystemExit) as cm:
-            parallel_args({"parallel": PARALLEL_MAX + 1}, [])
-        self.assertIn(f"at most {PARALLEL_MAX}", str(cm.exception))
-
-        args = engine_args({"args": ["--pack", "p"], "parallel": 2})
-        self.assertEqual(args[-2:], ["--batch", "2"])
+    def test_a_bad_value_refuses_to_start(self):
+        for bad in ("4", True, 0, PARALLEL_MAX + 1):
+            with self.subTest(parallel=bad), self.assertRaises(SystemExit) as cm:
+                parallel_args({"parallel": bad}, [])
+            self.assertIn(f"1..{PARALLEL_MAX}", str(cm.exception))
+        with self.assertRaises(SystemExit):                     # the args' own --batch beside it: which one?
+            parallel_args({"parallel": 2}, ["--batch", "3"])
 
 
 class PickSlot(unittest.TestCase):
     def engine(self, n):
         e = StrataEngine("missing-executable", [], lazy=True)
         e.batch = n
-        e.slot_order = list(range(n))
         e.slot_busy = [False] * n
         e.slot_held = [[] for _ in range(n)]
         e.slot_used = [0.0] * n
         e.slot_live = [None] * n
-        e.slot_group = [0] * n
         return e
 
     def test_the_slot_that_holds_the_conversation(self):
@@ -260,21 +239,6 @@ class PickSlot(unittest.TestCase):
         e.slot_held = [held_a, held_b + [T, 1, 2]]
         self.assertEqual(e.pick_slot(held_b + [T, 1, 2, 3, 4]), 1)
 
-    def test_batch_groups_spread_requests_over_the_groups(self):
-        # #1249: with --batch-groups 2 over 4 slots (groups {0,1} and {2,3}) a second request goes to the other group,
-        # and a short held prefix does not pull it back into the busy one
-        e = self.engine(4)
-        e.slot_groups = 2
-        e.slot_group = [0, 0, 1, 1]
-        e.slot_busy[0] = True
-        e.slot_held[1] = [1, 2, 3]
-        self.assertEqual(e.pick_slot([1, 2, 3, 4, 5]), 2)
-        e.slot_held[1] = list(range(1, 601))                       # a long prefix is worth the unbalanced group
-        self.assertEqual(e.pick_slot(list(range(1, 700))), 1)
-        e.slot_groups, e.slot_group = 1, [0] * 4                   # without groups: any held prefix, as before
-        e.slot_held[1] = [1, 2, 3]
-        self.assertEqual(e.pick_slot([1, 2, 3, 4, 5]), 1)
-
     def test_slots_view(self):
         e = self.engine(2)
         e.slot_held[1] = [1, 2]
@@ -289,7 +253,7 @@ class PickSlot(unittest.TestCase):
 class FakeEngineCase(unittest.TestCase):
     """The real StrataEngine and Service over HTTP, the fake engine behind them."""
 
-    def start(self, slots, fit=None, slot_cache=False, fail=False, reuse=False, says_groups=0, more=()):
+    def start(self, slots, fit=None, slot_cache=False, fail=False, reuse=False, more=()):
         import front.server as server
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_strata.py"
@@ -300,7 +264,7 @@ class FakeEngineCase(unittest.TestCase):
         extra += ["--slotcache"] if slot_cache else []
         extra += ["--fail-window"] if fail else []
         extra += ["--reuse"] if reuse else []
-        extra += ["--says-groups", str(says_groups)] if says_groups else []
+
         extra += list(more)
         with mock.patch.object(server.subprocess, "Popen",
                                lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
@@ -401,35 +365,6 @@ class ParallelService(FakeEngineCase):
         self.start(4, fit=2)
         self.assertEqual(self.engine.batch, 2)
         self.assertEqual(self.get("/v1/status")["concurrency"]["serving"], 2)
-
-
-
-
-
-
-    def test_batch_groups_auto_follows_the_engine(self):
-        """--batch-groups auto: the engine picks the groups and says so (INFO batch_groups=G); the server spreads the
-        requests over those groups, and a plain number is read as before."""
-        self.start(8, says_groups=4, more=["--batch-groups", "auto"])
-        e = self.engine
-        self.assertEqual((e.batch, e.slot_groups), (8, 4))
-        self.assertEqual(e.slot_group, [0, 0, 1, 1, 2, 2, 3, 3])
-        self.assertEqual(e.slot_order[:4], [0, 2, 4, 6])
-        self.tearDown(); self.httpd = self.engine = self.tmp = None
-        self.start(8, more=["--batch-groups", "auto"])          # an engine that reports none: one group
-        self.assertEqual(self.engine.slot_groups, 1)
-        self.tearDown(); self.httpd = self.engine = self.tmp = None
-        self.start(8, more=["--batch-groups", "2"])
-        self.assertEqual(self.engine.slot_groups, 2)
-        self.tearDown(); self.httpd = self.engine = self.tmp = None
-        self.start(8, says_groups=4)                           # 0.1.41: no flag on a layer split = the engine's choice
-        self.assertEqual(self.engine.slot_groups, 4)
-        self.tearDown(); self.httpd = self.engine = self.tmp = None
-        self.start(8, says_groups=4, more=["--batch-groups", "1"])   # the opt-out
-        self.assertEqual(self.engine.slot_groups, 1)
-
-
-
 
     def test_a_burst_of_connections_is_not_reset(self):
         """30-40 clients at once got "connection reset by peer" with the listen backlog of 5 (4 x R9700 burst): the
