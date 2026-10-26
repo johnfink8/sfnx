@@ -86,7 +86,7 @@ code edit 100.00% / 2.79e-6 / 2.1e-5. Both inside the Q4 bar above — llama.cpp
 | The top-k ties | `bin/topk_test` |
 | The engine's stdin handling | `bin/sfnx_input_test` |
 | The conversation cache where prompts share much: two conversations alternating on a lane, a system prompt changed near its end | `tools/lab.sh cmd cache2` |
-| The front end's own tests | `.venv/bin/python -m pytest -q front/` (970 passed, 19 skipped, ~6 min; against fake engines, no `bin/sfnx`) |
+| The front end's own tests | `.venv/bin/python -m pytest -q front/` (967 passed, 19 skipped, ~6 min; against fake engines, no `bin/sfnx`) |
 
 Bases for the exactness runs live in `/tmp/fnx-lab-$UID`, which a reboot empties: regenerate them with the previous
 build before judging a new one (`tools/lab.sh exact base` writes one only when every prompt passes).
