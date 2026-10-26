@@ -12,6 +12,7 @@
 // fnx_run MODEL.gguf exact|read|decode|batch|compare ...   the lab's standard checks (lab_check below)
 #include <cmath>
 #include <numeric>
+#include <optional>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -432,8 +433,8 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
                 return 2;
             }
         }
-        fnx::Engine e(m, env_ctx(262144), 6);
         const fnx::Mtp mtp(m, FNX_DIR "/data/mtp-rt", FNX_DIR "/data/draft_vocab_en.bin");
+        fnx::Engine e(m, env_ctx(262144), 6);
         e.mtp_attach(mtp);
         const std::vector<int> eos{248044, 248046};
         fnx::Sampling greedy, served;
@@ -515,8 +516,8 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
             return a;
         };
         auto msg = [&](int role, const std::vector<int>& body) { return cat({TURN, role}, body); };
-        fnx::Engine e(m, env_ctx(65536), 1);
         const fnx::Mtp mtp(m, FNX_DIR "/data/mtp-rt", FNX_DIR "/data/draft_vocab_en.bin");
+        fnx::Engine e(m, env_ctx(65536), 1);
         e.mtp_attach(mtp);
         const std::vector<int> eos{248044, 248046};
         int fails = 0;
@@ -607,8 +608,8 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
         if (nl < 1 || nl > 6 || n < 1) { std::fprintf(stderr, "bdecode [LANES 1..6] [N >= 1] [PROMPTS]\n"); return 2; }
         const std::string names = argc > 5 ? argv[5] : "prose2,code1";
         if (fnx::batch_drafts() == fnx::BatchDrafts::off) { std::fprintf(stderr, "bdecode: set FNX_BATCH_DRAFTS (lookup or 1)\n"); return 2; }
-        fnx::Engine e(m, env_ctx(262144), 6);
         const fnx::Mtp mtp(m, FNX_DIR "/data/mtp-rt", FNX_DIR "/data/draft_vocab_en.bin");
+        fnx::Engine e(m, env_ctx(262144), 6);
         e.mtp_attach(mtp);
         const std::vector<int> eos{248044, 248046};
         std::vector<int> lanes{0};
@@ -693,8 +694,9 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
         // tools/batch_check.sh's lanes: two long prompts (past 2,048 positions, so the QSA selection runs) and a short one
         const int gen = argc > 3 ? std::atoi(argv[3]) : 64;
         if (gen < 1) { std::fprintf(stderr, "batch [GEN]: GEN >= 1\n"); return 2; }
+        const fnx::Mtp mtp(m, FNX_DIR "/data/mtp-rt", "data/draft_vocab_en.bin");
         fnx::Engine e(m, env_ctx(100000));
-        return batch_check(m, e, FNX_DIR "/data/mtp-rt", "data/draft_vocab_en.bin", gen,
+        return batch_check(m, e, mtp, gen,
                            {ref_tokens("ref/long2.bin"), ref_tokens("ref/code1.bin"), ref_tokens("ref/long2.bin")});
     }
     // exact: the model's llama.cpp reference (FNX_EXACT_REF for long64, else by the model's name: Q4's from llama.cpp
@@ -866,6 +868,8 @@ extern "C" int fnx_run_cmd(fnx::Model* model, int argc, char** argv) {
     fnx::Model& m = *model;
 
     // FNX_MAX_CTX: the context the engine allocates for (default 4096); FNX_LANES: lanes the K/V pool has room for
+    std::optional<fnx::Mtp> mtp_mode;   // mode mtp's draft layer, made before the engine
+    if (mode == "mtp" && argc >= 7) mtp_mode.emplace(m, argv[3], argc > 7 ? argv[7] : "");
     fnx::Engine e(m, (int) fnx::env_int("FNX_MAX_CTX", 4096),
                   (int) fnx::env_int("FNX_LANES", 1));
     if (mode == "logits") {
@@ -875,7 +879,7 @@ extern "C" int fnx_run_cmd(fnx::Model* model, int argc, char** argv) {
     }
     if (mode == "mtp") {
         if (argc < 7) { std::fprintf(stderr, "mtp needs RT_DIR REF.bin N K\n"); return 2; }
-        const fnx::Mtp mtp(m, argv[3], argc > 7 ? argv[7] : "");
+        const fnx::Mtp& mtp = *mtp_mode;
         e.mtp_attach(mtp);
         const std::vector<int> prompt = ref_tokens(argv[4]);
         const int n_gen = std::atoi(argv[5]), K = std::atoi(argv[6]);

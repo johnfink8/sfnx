@@ -143,75 +143,6 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         ctx_pages = (int) (ctx_pages * ratio);
     }
     int n_pages = ctx_pages + extra_pages;
-    // FNX_ARENA: the pool's own pages are those, or as many as every card's free VRAM holds beside the arena pool's
-    // slots and FNX_ARENA_RESERVE_MIB (default 1792 at 1,024 prompt rows a chunk, +600 for each 1,024 more: the engine's
-    // other buffers, ~1.45 GiB a card at 262k with six lanes and 1,024 rows, the prompt buffers growing with the chunk,
-    // and room to spare; +320 with batched drafts: a verify graph per row total, 2 to MAXT, ~8-14 MB each), or
-    // FNX_ARENA_BASE_PAGES; the slots follow the own pages in the same allocation, and the pool grows into them (lent
-    // coldest first) up to where every card keeps 2 MAXT TOPK slots
-    if (m.arena) {
-        const long long reserve_mib =
-            env_int("FNX_ARENA_RESERVE_MIB", 1792 + 600 * (pf_c_ - 1024) / 1024 + (batch_drafts() != BatchDrafts::off ? 320 : 0));
-        if (reserve_mib < 0) throw std::runtime_error("FNX_ARENA_RESERVE_MIB: want MiB >= 0, got " + std::to_string(reserve_mib));
-        const size_t reserve = (size_t) reserve_mib << 20;
-        // a card with less free VRAM than the slots, the reserve and the smallest own pool (another process on it, a
-        // leak): the coldest experts that many slots' worth go to RAM, placed again, and the engine goes on. Too few
-        // slots left for a window is still an error (Model::place_experts says so)
-        for (int round = 0;; ++round) {
-            int more = 0;
-            size_t short_mib = 0;
-            for (int c = 0; c < NCARD; ++c) {
-                const ExpertCache& ec = m.cards[c].ec;
-                if (ec.arena_pool < 0) throw std::runtime_error("FNX_ARENA: card " + std::to_string(c) + " has no arena pool");
-                ck(cudaSetDevice(m.cards[c].dev), "cudaSetDevice");
-                size_t fr = 0, tot = 0;
-                ck(cudaMemGetInfo(&fr, &tot), "cudaMemGetInfo");
-                const size_t sb = ec.slot_bytes[ec.arena_pool],
-                             need = (size_t) ec.n[ec.arena_pool] * sb + reserve + (size_t) (extra_pages + 1) * kvp_page(c) * sizeof(uint16_t);
-                if (fr < need) {   // 256 MiB more than short, so the next engine's few MiB of drift place nothing again
-                    more = std::max(more, (int) ((need - fr + (256u << 20) + sb - 1) / sb));
-                    short_mib = std::max(short_mib, (need - fr) >> 20);
-                }
-            }
-            if (!more) break;
-            if (round == 8) throw std::runtime_error("FNX_ARENA: VRAM still short after placing the experts again 8 times");
-            std::fprintf(stderr, "fnx: VRAM short by %zu MiB on a card (another process on it?): %d more of the coldest experts to RAM\n",
-                         short_mib, more);
-            m.free_experts();
-            m.ram_extra += more;
-            m.place_experts();
-        }
-        for (int c = 0; c < NCARD; ++c) {
-            const ExpertCache& ec = m.cards[c].ec;
-            if (ec.arena_pool < 0) throw std::runtime_error("FNX_ARENA: card " + std::to_string(c) + " has no arena pool");
-            ck(cudaSetDevice(m.cards[c].dev), "cudaSetDevice");
-            size_t fr = 0, tot = 0;
-            ck(cudaMemGetInfo(&fr, &tot), "cudaMemGetInfo");
-            const size_t slots = (size_t) ec.n[ec.arena_pool] * ec.slot_bytes[ec.arena_pool], page = kvp_page(c) * sizeof(uint16_t);
-            const int fit = fr > slots + reserve ? (int) ((fr - slots - reserve) / page) : 0;
-            if (fit <= extra_pages)
-                throw std::runtime_error("FNX_ARENA: card " + std::to_string(c) + " has " + std::to_string(fr >> 20) + " MiB free: the arena's " +
-                                         std::to_string(slots >> 20) + " MiB of slots, " + std::to_string(reserve >> 20) +
-                                         " MiB in reserve (FNX_ARENA_RESERVE_MIB) and the lanes' blocks do not fit");
-            n_pages = std::min(n_pages, fit);
-        }
-        if (std::getenv("FNX_ARENA_BASE_PAGES")) {
-            const long long want = env_int("FNX_ARENA_BASE_PAGES", 0);
-            if (want <= extra_pages || want > n_pages)
-                throw std::runtime_error("FNX_ARENA_BASE_PAGES: want " + std::to_string(extra_pages + 1) + " to " + std::to_string(n_pages) +
-                                         " (the lanes' blocks take " + std::to_string(extra_pages) + ")");
-            n_pages = (int) want;
-        }
-        arena_base_ = arena_w_ = n_pages;
-        arena_cap_ = INT32_MAX;
-        for (int c = 0; c < NCARD; ++c) {
-            const ExpertCache& ec = m.cards[c].ec;
-            const int p = ec.arena_pool, keep = 2 * MAXT * TOPK;
-            const size_t page = kvp_page(c) * sizeof(uint16_t);
-            const size_t room = (size_t) (ec.n[p] - keep) * ec.slot_bytes[p] + (arena_slot_off(c) - (size_t) n_pages * page);
-            arena_cap_ = std::min(arena_cap_, n_pages + (int) (room / page));
-        }
-    }
     for (int c = 0; c < NCARD; ++c) {
         const CardW& w = m.cards[c];
         CardBuf* b = new CardBuf();
@@ -325,6 +256,109 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         for (int l = 0; l < NL; ++l) n_rec += is_attn(l) ? 0 : 1;
         b->snap_block = dalloc<float>(snap_floats * n_rec);
         b->snap_block_bytes = snap_floats * n_rec * sizeof(float);
+        for (int l = 0, k = 0; l < NL; ++l) {
+            if (is_attn(l)) {
+                b->qsa_ring[l] = dalloc<uint16_t>((size_t) qsa_ring_rows() * 128);
+            } else {
+                b->S[l] = dalloc<float>((size_t) w.nv() * HS * HS);
+                b->chist[l] = dalloc<float>((size_t) 2 * 3 * w.conv_ch());
+                b->snap[l] = b->snap_block + snap_floats * k++;
+                b->hsnap[l] = dalloc<float>((size_t) MAXT * 3 * w.conv_ch());
+            }
+        }
+        b->ple_hist = dalloc<float>((size_t) 9 * D);
+        b->ple_hsnap = dalloc<float>((size_t) MAXT * 9 * D);
+        b->ctl = dalloc<int>(2);
+        b->ring.card = c;
+        // sized for fp32 words (two per pair); fp16 pairs use the first half of each slot row's room
+        b->ring.in = dalloc<unsigned long long>(ring_in_words(MAXT));
+        b->ring.ag = dalloc<unsigned long long>(ring_ag_words(MAXT));
+        b->ring.f32 = env_flag("FNX_RING_F32");
+        b->ring.err = dalloc<unsigned>(1);
+        b->att_ring.card = c;
+        b->att_ring.in = dalloc<unsigned long long>(att_ring_words());
+        b->att_ring.err = b->ring.err;
+        cb_.push_back(b);
+    }
+    for (int c = 0; c < NCARD; ++c) {
+        cb_[c]->ring.next_in = cb_[(c + 1) % NCARD]->ring.in;
+        cb_[c]->ring.next_ag = cb_[(c + 1) % NCARD]->ring.ag;
+        cb_[c]->att_ring.next_in = cb_[(c + 1) % NCARD]->att_ring.in;
+    }
+    // the prompt path's buffers now, so the arena below is sized from what is left after them
+    prefill_alloc();
+    // FNX_ARENA: the pool's own pages are those, or as many as every card's free VRAM holds beside the arena pool's
+    // slots and FNX_ARENA_RESERVE_MIB, or FNX_ARENA_BASE_PAGES; the slots follow the own pages in the same allocation,
+    // and the pool grows into them (lent coldest first) up to where every card keeps 2 MAXT TOPK slots. The buffers
+    // above and the draft layer (an Mtp is made before its Engine) are already allocated, so the reserve is only what
+    // comes later: the window graphs captured at first use (with batched drafts a verify graph per row total), cuBLAS's
+    // workspaces and the lanes' page tables. Default 512: they took ~270 MiB a card on three cards and ~340 on two,
+    // through one to six lanes, batched drafts and a 114k prompt
+    if (m.arena) {
+        const long long reserve_mib = env_int("FNX_ARENA_RESERVE_MIB", 512);
+        if (reserve_mib < 0) throw std::runtime_error("FNX_ARENA_RESERVE_MIB: want MiB >= 0, got " + std::to_string(reserve_mib));
+        const size_t reserve = (size_t) reserve_mib << 20;
+        // a card with less free VRAM than the slots, the reserve and the smallest own pool (two cards, another process
+        // on it, a leak): the coldest experts that many slots' worth go to RAM, placed again, and the engine goes on.
+        // Too few slots left for a window is still an error (Model::place_experts says so)
+        for (int round = 0;; ++round) {
+            int more = 0;
+            size_t short_mib = 0;
+            for (int c = 0; c < NCARD; ++c) {
+                const ExpertCache& ec = m.cards[c].ec;
+                if (ec.arena_pool < 0) throw std::runtime_error("FNX_ARENA: card " + std::to_string(c) + " has no arena pool");
+                ck(cudaSetDevice(m.cards[c].dev), "cudaSetDevice");
+                size_t fr = 0, tot = 0;
+                ck(cudaMemGetInfo(&fr, &tot), "cudaMemGetInfo");
+                const size_t sb = ec.slot_bytes[ec.arena_pool],
+                             need = (size_t) ec.n[ec.arena_pool] * sb + reserve + (size_t) (extra_pages + 1) * kvp_page(c) * sizeof(uint16_t);
+                if (fr < need) {   // 256 MiB more than short, so the next engine's few MiB of drift place nothing again
+                    more = std::max(more, (int) ((need - fr + (256u << 20) + sb - 1) / sb));
+                    short_mib = std::max(short_mib, (need - fr) >> 20);
+                }
+            }
+            if (!more) break;
+            if (round == 8) throw std::runtime_error("FNX_ARENA: VRAM still short after placing the experts again 8 times");
+            std::fprintf(stderr, "fnx: VRAM short by %zu MiB on a card: %d more of the coldest experts to RAM\n",
+                         short_mib, more);
+            m.free_experts();
+            m.ram_extra += more;
+            m.place_experts();
+        }
+        for (int c = 0; c < NCARD; ++c) {
+            const ExpertCache& ec = m.cards[c].ec;
+            if (ec.arena_pool < 0) throw std::runtime_error("FNX_ARENA: card " + std::to_string(c) + " has no arena pool");
+            ck(cudaSetDevice(m.cards[c].dev), "cudaSetDevice");
+            size_t fr = 0, tot = 0;
+            ck(cudaMemGetInfo(&fr, &tot), "cudaMemGetInfo");
+            const size_t slots = (size_t) ec.n[ec.arena_pool] * ec.slot_bytes[ec.arena_pool], page = kvp_page(c) * sizeof(uint16_t);
+            const int fit = fr > slots + reserve ? (int) ((fr - slots - reserve) / page) : 0;
+            if (fit <= extra_pages)
+                throw std::runtime_error("FNX_ARENA: card " + std::to_string(c) + " has " + std::to_string(fr >> 20) + " MiB free: the arena's " +
+                                         std::to_string(slots >> 20) + " MiB of slots, " + std::to_string(reserve >> 20) +
+                                         " MiB in reserve (FNX_ARENA_RESERVE_MIB) and the lanes' blocks do not fit");
+            n_pages = std::min(n_pages, fit);
+        }
+        if (std::getenv("FNX_ARENA_BASE_PAGES")) {
+            const long long want = env_int("FNX_ARENA_BASE_PAGES", 0);
+            if (want <= extra_pages || want > n_pages)
+                throw std::runtime_error("FNX_ARENA_BASE_PAGES: want " + std::to_string(extra_pages + 1) + " to " + std::to_string(n_pages) +
+                                         " (the lanes' blocks take " + std::to_string(extra_pages) + ")");
+            n_pages = (int) want;
+        }
+        arena_base_ = arena_w_ = n_pages;
+        arena_cap_ = INT32_MAX;
+        for (int c = 0; c < NCARD; ++c) {
+            const ExpertCache& ec = m.cards[c].ec;
+            const int p = ec.arena_pool, keep = 2 * MAXT * TOPK;
+            const size_t page = kvp_page(c) * sizeof(uint16_t);
+            const size_t room = (size_t) (ec.n[p] - keep) * ec.slot_bytes[p] + (arena_slot_off(c) - (size_t) n_pages * page);
+            arena_cap_ = std::min(arena_cap_, n_pages + (int) (room / page));
+        }
+    }
+    for (int c = 0; c < NCARD; ++c) {
+        CardBuf* b = cb_[c];
+        ck(cudaSetDevice(b->dev), "cudaSetDevice");
         // the K/V pool and lane 0's page table (pages taken as it grows); with an arena the pool is its start and
         // n_pages counts the pages it can grow to
         if (m.arena) {
@@ -349,23 +383,13 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         b->pg.rows = kvp_rows(c);
         b->pg.q8 = kv_q8();
         const size_t kv_halves = kvp_rows_halves(c, kv_q8());
-        for (int l = 0, k = 0, slot = 0; l < NL; ++l) {
+        for (int l = 0, slot = 0; l < NL; ++l)
             if (is_attn(l)) {
                 b->kc[l] = b->pool + (size_t) slot * kvp_slot(c);
                 b->vc[l] = b->kc[l] + kv_halves;
                 b->qsa_pooled[l] = b->kc[l] + 2 * kv_halves;
-                b->qsa_ring[l] = dalloc<uint16_t>((size_t) qsa_ring_rows() * 128);
                 ++slot;
-            } else {
-                b->S[l] = dalloc<float>((size_t) w.nv() * HS * HS);
-                b->chist[l] = dalloc<float>((size_t) 2 * 3 * w.conv_ch());
-                b->snap[l] = b->snap_block + snap_floats * k++;
-                b->hsnap[l] = dalloc<float>((size_t) MAXT * 3 * w.conv_ch());
             }
-        }
-        b->ple_hist = dalloc<float>((size_t) 9 * D);
-        b->ple_hsnap = dalloc<float>((size_t) MAXT * 9 * D);
-        b->ctl = dalloc<int>(2);
         {   // lane 0: the buffers above
             LaneDev L;
             L.pt = b->pt;
@@ -376,21 +400,6 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
             L.ctl = dalloc<int>(2);
             b->lanes.push_back(L);
         }
-        b->ring.card = c;
-        // sized for fp32 words (two per pair); fp16 pairs use the first half of each slot row's room
-        b->ring.in = dalloc<unsigned long long>(ring_in_words(MAXT));
-        b->ring.ag = dalloc<unsigned long long>(ring_ag_words(MAXT));
-        b->ring.f32 = env_flag("FNX_RING_F32");
-        b->ring.err = dalloc<unsigned>(1);
-        b->att_ring.card = c;
-        b->att_ring.in = dalloc<unsigned long long>(att_ring_words());
-        b->att_ring.err = b->ring.err;
-        cb_.push_back(b);
-    }
-    for (int c = 0; c < NCARD; ++c) {
-        cb_[c]->ring.next_in = cb_[(c + 1) % NCARD]->ring.in;
-        cb_[c]->ring.next_ag = cb_[(c + 1) % NCARD]->ring.ag;
-        cb_[c]->att_ring.next_in = cb_[(c + 1) % NCARD]->att_ring.in;
     }
     for (CardBuf* b : cb_) { ck(cudaSetDevice(b->dev), "set"); ck(cudaDeviceSynchronize(), "init sync"); }
     lanes_.emplace_back();

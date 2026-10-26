@@ -131,8 +131,8 @@ int main(int argc, char** argv) {
     }
     if (argc < 6) { std::fprintf(stderr, "see the header for the usage\n"); return 2; }
     fnx::Model m(argv[1]);
-    fnx::Engine e(m, 65536);
     const fnx::Mtp mtp(m, argv[2], argv[3]);
+    fnx::Engine e(m, 65536);
     e.mtp_attach(mtp);
     const std::string mode = argv[4];
     fnx::Session sess(e, 4, 7, {248044, 248046}, TURN, (size_t) 32 << 30);

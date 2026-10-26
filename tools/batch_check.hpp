@@ -16,9 +16,7 @@
 #include "../src/engine.hpp"
 #include "../src/session.hpp"
 
-inline int batch_check(fnx::Model& m, fnx::Engine& e, const char* rt_dir, const char* vocab, int gen,
-                       const std::vector<std::vector<int>>& prompts) {
-    const fnx::Mtp mtp(m, rt_dir, vocab);
+inline int batch_check(const fnx::Model& m, fnx::Engine& e, const fnx::Mtp& mtp, int gen, const std::vector<std::vector<int>>& prompts) {
     e.mtp_attach(mtp);
     const std::vector<int> eos{248044, 248046};
     fnx::Sampling greedy;

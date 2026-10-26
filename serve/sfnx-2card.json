@@ -19,7 +19,6 @@
   "6"
  ],
  "cwd": ".",
- "env": {"FNX_EXPERT_RAM_GIB": "27"},
  "tokenizer": "data/tokenizer",
  "model_name": "qwen3.8-flash-next-unsloth-ud-q4_k_xl",
  "log": "serve/sfnx-2card.log",

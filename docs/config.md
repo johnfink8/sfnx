@@ -47,7 +47,7 @@ The ones that change results or are worth knowing. The rest are kernel-level tun
 | Setting | Effect |
 | --- | --- |
 | `FNX_ARENA=0` | turn the arena off: the pool is fixed and conversations park instead of borrowing expert memory. On unless set — prod sets nothing for it, `serve/sfnx-q8.json` sets 0 |
-| `FNX_ARENA_RESERVE_MIB=N` | VRAM held back for the engine's other buffers. Default 1,792 at 1,024 prompt rows a chunk, +600 per further 1,024, +320 with batched drafts (a verify graph per row total): 3,912 at prod's 4,096 |
+| `FNX_ARENA_RESERVE_MIB=N` | VRAM held back for what is allocated after the arena: the window graphs captured at first use, cuBLAS's workspaces, the lanes' page tables. The decode and prompt buffers and the draft layer are allocated before the arena is sized, so they need no share of it. Default 512: those took ~270 MiB a card on three cards and ~340 on two, through one to six lanes with batched drafts and a 114k prompt |
 | `FNX_ARENA_BASE_PAGES=N` | the pool's own pages, fixed — for the checks |
 | `FNX_EXPERT_RAM_GIB=N` | keep the coldest N GiB of experts in page-locked RAM. Needs `FNX_EXPERT_PROFILE` |
 | `FNX_EXPERT_PROFILE=FILE` | the routing profile ranking expert coldness (`data/expert-routes.bin`) |

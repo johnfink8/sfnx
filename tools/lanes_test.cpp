@@ -17,8 +17,8 @@
 int main(int argc, char** argv) {
     if (argc < 7) { std::fprintf(stderr, "lanes_test MODEL.gguf RT_DIR VOCAB.bin A.bin B.bin C.bin [GEN]\n"); return 2; }
     fnx::Model m(argv[1]);
-    fnx::Engine e(m, (int) fnx::env_int("FNX_MAX_CTX", 32768));
     const fnx::Mtp mtp(m, argv[2], argv[3]);
+    fnx::Engine e(m, (int) fnx::env_int("FNX_MAX_CTX", 32768));
     e.mtp_attach(mtp);
     const int gen = argc > 7 ? std::atoi(argv[7]) : 48;
     const std::vector<std::vector<int>> prompts{ref_tokens(argv[4]), ref_tokens(argv[5]), ref_tokens(argv[6])};

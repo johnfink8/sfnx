@@ -12,8 +12,9 @@ The arena is on unless something turns it off: `serve/sfnx.json` sets nothing fo
 - The 43 layers whose experts share the largest size keep their VRAM slots — 22,016 a card, 22.0 / 22.0 / 18.9 GiB — in
   one allocation with the K/V pool, right above the pool's own pages and ordered coldest first by a routing profile
   (`data/expert-routes.bin`).
-- The pool's own pages are as many as the cards' free VRAM holds beside the slots and a reserve for the engine's other
-  buffers — 3,912 MiB at prod's settings, whose arithmetic lives in [docs/config.md](config.md).
+- The pool's own pages are as many as the cards' free VRAM holds beside the slots and a reserve, sized after the
+  engine's decode and prompt buffers and the draft layer are allocated. The reserve covers only what comes later — the
+  window graphs, cuBLAS's workspaces — 512 MiB ([docs/config.md](config.md)).
 - A card short of even the smallest own pool (another process holding VRAM on it) does not stop the engine: it puts
   that many slots' worth more of the coldest experts in RAM, places them again and says so
   (`fnx: VRAM short by N MiB ...`). Measured with 2 GiB held on card 0: 1,612 more experts in RAM, logits byte for byte

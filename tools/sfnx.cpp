@@ -1003,8 +1003,8 @@ int main(int argc, char** argv) {
     }
     const auto t_load = std::chrono::steady_clock::now();
     fnx::Model m(a.gguf.c_str());
-    fnx::Engine e(m, a.max_ctx, a.batch);
     const fnx::Mtp mtp(m, a.mtp_dir, a.draft_vocab);
+    fnx::Engine e(m, a.max_ctx, a.batch);
     e.mtp_attach(mtp);
     Input in;
     // the engine state after a failure part way is unknown: say why and _exit at once (the front end starts it

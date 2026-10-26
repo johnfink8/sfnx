@@ -31,8 +31,8 @@ int main(int argc, char** argv) {
     const long long lanes_n = fnx::env_int("SAMPLE_TEST_LANES", 1);
     if (lanes_n < 1 || lanes_n > 6) { std::fprintf(stderr, "SAMPLE_TEST_LANES: 1 (Session::generate) or 2..6 (batched windows)\n"); return 2; }
     const int nl = (int) lanes_n;
-    fnx::Engine e(m, 32768, nl);
     const fnx::Mtp mtp(m, argv[2], argv[3]);
+    fnx::Engine e(m, 32768, nl);
     e.mtp_attach(mtp);
     const std::vector<int> prompt = ref_tokens(argv[4]);
     const int seeds = std::atoi(argv[5]), n = std::atoi(argv[6]);
