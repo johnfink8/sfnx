@@ -107,10 +107,16 @@ main { flex: 1; min-height: 0; display: flex; }
 .slot-note { min-height: 1.4em; margin: 0; font-size: var(--st-fs-xs); color: var(--st-ink-muted);
              font-variant-numeric: tabular-nums; }
 .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--st-s-4); }
-.metric-card { padding: var(--st-s-4) var(--st-s-5); }
+/* every caption keeps the same number of lines (a longer one ends in an ellipsis, the whole text in its tooltip) and
+   the graph sits at the card's foot, so the graphs line up across a row and none moves as a caption changes length */
+.metric-card { padding: var(--st-s-4) var(--st-s-5); display: flex; flex-direction: column; }
+.metric-card .st-metric { flex: 1; }
+.st-metric__value { white-space: nowrap; }
 .st-metric__value small { font-size: var(--st-fs-md); font-weight: var(--st-fw-medium); color: var(--st-ink-muted); margin-left: 4px; }
-.st-metric__sub { font-size: var(--st-fs-xs); color: var(--st-ink-muted); font-variant-numeric: tabular-nums; min-height: 1em; }
-.st-metric__spark { display: block; overflow: visible; }
+.st-metric__sub { --sub-lines: 2; font-size: var(--st-fs-xs); line-height: 1.4; height: calc(var(--sub-lines) * 1.4em);
+                  color: var(--st-ink-muted); font-variant-numeric: tabular-nums; overflow: hidden; display: -webkit-box;
+                  -webkit-box-orient: vertical; -webkit-line-clamp: var(--sub-lines); }
+.st-metric__spark { display: block; overflow: visible; margin-top: auto; }
 .speed-values { display: flex; justify-content: space-between; gap: var(--st-s-3); }
 .speed-values > div { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
 .speed-values > div:last-child { text-align: right; }
@@ -196,6 +202,9 @@ main { flex: 1; min-height: 0; display: flex; }
 @keyframes toast-in { from { opacity: 0; transform: translateY(6px); } }
 
 /* ---------------------------------------------------------------- narrow screens */
+@media (min-width: 1001px) and (max-width: 1300px) {
+  .st-metric__sub { --sub-lines: 3; }   /* four narrow cards a row: VRAM's per-card text and Speed's need a third line */
+}
 @media (max-width: 1000px) {
   .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .monitor-row { grid-template-columns: 1fr; }
@@ -214,6 +223,11 @@ main { flex: 1; min-height: 0; display: flex; }
   .monitor, .about { padding: var(--st-s-4); }
   .facts { grid-template-columns: 1fr; gap: 2px; }
   .facts dd { margin-bottom: var(--st-s-2); }
+  /* Speed's two numbers side by side need the whole row; the other captions get four lines, which VRAM's per-card
+     text needs at 390 px */
+  .metric-card:first-child { grid-column: 1 / -1; }
+  .st-metric__value { font-size: var(--st-fs-xl); }
+  .st-metric__sub { --sub-lines: 4; }
 }
 /* Images tab (POST /v1/images/generations) */
 .img-form{display:flex;flex-direction:column;gap:12px}

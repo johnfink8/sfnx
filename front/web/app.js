@@ -151,6 +151,7 @@ function spark(id, values, max) {
 function setMetric(key, value, unit, sub) {
   $(`mv-${key}`).innerHTML = value == null ? "–" : `${esc(value)}${unit ? `<small>${esc(unit)}</small>` : ""}`;
   $(`ms-${key}`).textContent = sub || "";
+  $(`ms-${key}`).title = sub || "";   // the card clamps the caption's lines; the tooltip has all of it
 }
 
 let lastMetrics = null, metricsFailures = 0, keyWarned = false, mcpTick = 0;
