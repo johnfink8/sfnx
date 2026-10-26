@@ -21,8 +21,21 @@ checkout, pointing at the folder holding `UD-Q4_K_XL/`, `Q8_0/` and `mmproj-F16.
 
 Engine arguments in the JSON: `--native` (the model's first shard), `--mtp` (the draft layer's runtime files),
 `--draft-vocab`, `--max-context`, `--spec` (draft tokens a round), `--lookup` (the longest n-gram draft), `--batch`
-(lanes), `--conversation-cache-mib`, `--vision`. `--layer-split` is accepted and ignored: the front end adds it for
-three cards, and sFNX splits every layer across them instead.
+(lanes), `--conversation-cache-mib`, `--vision`.
+
+The front end reads these keys and stops at start on any other, naming it: `exe`, `args`, `cwd`, `env`, `lib_dirs`,
+`log`, `gpu` (the cards, as `CUDA_VISIBLE_DEVICES`), `parallel`, `engine_silence_s`, `vision`, `tokenizer`,
+`model_name`, `host`, `port`, `api_key`, `allowed_hosts`, `api_monitor`, `sampling`, `reasoning_effort`,
+`reasoning_budget_tokens`, `reasoning_close_retry`, `answer_room`, `fit_max_tokens`, `repeat_stop_tokens`,
+`anthropic_thinking`. The `vision` section takes `exe`, `cpu_exe`, `mmproj`, `model`, `gpu`, `threads`, `max_tokens`,
+`min_tokens`, `cuda_device`, and needs `--vision` in `args`. Unknown `sampling` keys stop the start too.
+
+The front end's own environment (names kept from Strata): `STRATA_API_KEY` and `STRATA_ALLOWED_HOSTS` (as the config's
+keys), `STRATA_DEBUG=1` (each reply's raw text in the journal; the unit sets it), `STRATA_LITERAL_STOP=0` (a stop token
+quoted in a code span ends the reply after all), `STRATA_PARALLEL_SOLO=0` (a lane left alone stays in its batch slot),
+`STRATA_KEEP_EMPTY_TURNS=1` (keep empty assistant turns in the prompt), `STRATA_ENGINE_READY_S`,
+`STRATA_ENGINE_STALL_S`, `STRATA_VISION_READY_S`, `STRATA_VISION_ENCODE_S` (watchdogs, 0 = off),
+`STRATA_MAX_BODY_MIB` (default 256), `STRATA_HTTP_BACKLOG` (default 256), `STRATA_BATCH_TRACE=1` (batch-slot trace).
 
 ## Engine settings
 
@@ -78,9 +91,8 @@ refuses to run otherwise: *`the ring's writes between cards need identity domain
 ## Where this API differs from Strata's
 
 - `logit_bias` is refused — the engine does not offer it, so the front end refuses the request.
-- Disk sessions (`POST /slots/0?action=save|restore`, the engine's SAVE/RESTORE) and `POST /v1/vram` (the engine's
-  VRAM) are not supported: the front end refuses slot files with batch slots on, and the engine answers
-  `ERR ... not supported by sfnx`.
-- A request's `strata_prefix` — a pinned checkpoint at a shared prefix — is accepted and does nothing; the engine logs
-  that once.
-- Strata's per-request engine tuning (`strata_tune`) and `experimental_speed_projection` are ignored.
+- Not there: disk sessions (`POST /slots/0?action=save|restore`), `POST /v1/vram`, image generation, the MCP
+  endpoint, Prometheus metrics, load/unload and idle unloading, model aliases, CORS, the settings view (`/config`).
+  `GET /metrics` is the Monitor tab's JSON.
+- A request's `strata_prefix`, `strata_tune` and `experimental_speed_projection` are not read.
+- An engine that crashes is started again by the next request; there is no other loading or unloading.

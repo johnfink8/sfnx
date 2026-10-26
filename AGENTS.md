@@ -15,7 +15,7 @@ the verification and the settings.
 - **`tools/`**: `sfnx.cpp` is the engine process (a line protocol on stdin, `sfnx_input.hpp`); `fnx_run.cpp` is the
   lab harness; `fnx_hold` / `fnx_lab` + `lab.sh` are the lab; the `*_test` programs and `*_check.sh` scripts are the
   checks (they share `labenv.sh`); the `*_probe` / `*_bench` programs measured the hardware the design rests on.
-- **`front/`**: the Python serving layer (chat completions, responses, `/v1/messages`, tools, images) and the web UI
+- **`front/`**: the Python serving layer (chat completions, responses, `/v1/messages`, tools, pictures in) and the web UI
   (`front/web/`). Ported from Strata's `serve/` (MIT, `front/LICENSE`).
 - **`serve/`**: configs (`sfnx.json` is prod; `sfnx-q8.json`, `sfnx-gap.json`, `sfnx-pool.json` for the checks), the
   systemd unit, run scripts and served tests.
