@@ -46,7 +46,7 @@ NVCC := /usr/local/cuda/bin/nvcc
 # llama.cpp at a37cc46 (its ggml headers; its libraries for the picture encoder): a checkout in llama.cpp/, or LLAMA=path
 LLAMA ?= $(CURDIR)/llama.cpp
 GG := $(LLAMA)/ggml
-NVFLAGS := -DFNX_DIR='"$(CURDIR)"' -O3 --use_fast_math -std=c++17 -arch=sm_70 -ccbin g++-14 -Wno-deprecated-gpu-targets -I$(GG)/src/ggml-cuda -I$(GG)/src -I$(GG)/include --expt-relaxed-constexpr
+NVFLAGS := -DFNX_DIR='"$(CURDIR)"' -O3 --use_fast_math -std=c++17 -arch=sm_86 -ccbin g++-14 -Wno-deprecated-gpu-targets -I$(GG)/src/ggml-cuda -I$(GG)/src -I$(GG)/include --expt-relaxed-constexpr
 # the cards every layer is split across (src/model.hpp): 3 (prod), or 2, 4, 6 or 8 (make FNX_NCARD=4 ...; the counts
 # the model's shapes divide by, src/card_split.hpp; above three untested on hardware). build/ncard holds the count the
 # objects in build/ were made for; a different count rewrites it, which rebuilds them all. It is written while make
