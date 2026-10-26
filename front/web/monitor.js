@@ -1,14 +1,14 @@
 "use strict";
 const $ = id => document.getElementById(id);
-let selected = null, detail = null, pane = "input", records = [], state = null, operating = false, stamp = "", actionError = "";
+let selected = null, detail = null, pane = "input", records = [], state = null, stamp = "";
 let apiKey = sessionStorage.getItem("sfnx.monitor.key") || "";
 document.documentElement.dataset.theme = localStorage.getItem("sfnx.theme") || "dark";
 const seconds = n => typeof n === "number" ? `${n.toFixed(2)} s` : "—";
 const speed = n => typeof n === "number" ? n.toFixed(1) : "—";
 const active = r => !["completed", "error", "disconnected"].includes(r.state);
 function text(id, value) { const el = $(id); if (el.textContent !== String(value)) el.textContent = value; }
-async function api(path, body) {
-  const response = await fetch(path, {cache:"no-store", headers:{...(apiKey ? {Authorization:`Bearer ${apiKey}`} : {}), ...(body !== undefined ? {"Content-Type":"application/json"} : {})}, ...(body !== undefined ? {method:"POST", body:JSON.stringify(body)} : {})});
+async function api(path) {
+  const response = await fetch(path, {cache:"no-store", headers:apiKey ? {Authorization:`Bearer ${apiKey}`} : {}});
   const value = await response.json();
   if (!response.ok) {
     if (response.status === 401) $("auth").hidden = false;
@@ -74,33 +74,23 @@ async function refresh() {
   try {
     const [status, history] = await Promise.all([api("/v1/status"), api("/api/requests")]);
     state = status; records = history.requests;
-    status.loaded = history.loaded; status.auto_load = history.auto_load;
+    status.loaded = history.loaded;
     if (selected && !records.some(r => r.id === selected)) {
       selected = detail = null; $("selection").hidden = true; $("no-selection").hidden = false;
     }
     const inflight = Math.max(status.activity.in_flight, records.filter(active).length);
     const loading = records.some(r => r.state === "loading");
-    text("loaded", loading ? "Loading…" : inflight ? "In use" : status.loaded ? "Loaded" : "Unloaded");
+    text("loaded", loading ? "Restarting…" : inflight ? "In use" : status.loaded ? "Loaded" : "Stopped");
     $("model-state").className = `value ${inflight || loading ? "busy" : status.loaded ? "loaded" : ""}`;
     text("model", status.model); text("count", records.length);
-    text("active", inflight ? `${inflight} active / queued` : status.auto_load ? "Loads automatically on the next request" : "No active requests");
+    text("active", inflight ? `${inflight} active / queued` : status.loaded ? "No active requests" : "Starts again with the next request");
     const last = records.find(r => !active(r));
     text("wall", last ? seconds(last.wallclock_s) : "—"); text("speed", speed(last?.timings?.predicted_per_second));
-    $("load").disabled = operating || Boolean(inflight) || status.loaded; $("unload").disabled = operating || Boolean(inflight) || !status.loaded;
     list(); if (selected) await showDetail();
     text("updated", `Live · updated ${new Date().toLocaleTimeString()}`);
-    if (!operating) notice(actionError);
-  } catch (error) { notice(error.message); text("updated", "Disconnected · retrying"); $("load").disabled = $("unload").disabled = true; }
+    notice("");
+  } catch (error) { notice(error.message); text("updated", "Disconnected · retrying"); }
 }
-async function control(load) {
-  actionError = "";
-  operating = true; $("load").disabled = $("unload").disabled = true;
-  text("loaded", load ? "Loading…" : "Unloading…");
-  try { await api(load ? "/load" : "/unload", {}); notice(""); }
-  catch (error) { actionError = error.message; notice(actionError); }
-  finally { operating = false; await refresh(); }
-}
-$("load").onclick = () => control(true); $("unload").onclick = () => control(false);
 $("key").onclick = () => { $("auth").hidden = !$("auth").hidden; if (!$("auth").hidden) $("api-key").focus(); };
 $("auth").onsubmit = async event => { event.preventDefault(); apiKey = $("api-key").value.trim(); sessionStorage.setItem("sfnx.monitor.key", apiKey); $("auth").hidden = true; await refresh(); };
 $("theme").onclick = () => { const theme = document.documentElement.dataset.theme === "dark" ? "light" : "dark"; document.documentElement.dataset.theme = theme; localStorage.setItem("sfnx.theme", theme); };

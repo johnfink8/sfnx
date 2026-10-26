@@ -34,7 +34,7 @@ class WebSampling(unittest.TestCase):
         cls.body = slice_between(src, "  if (!(settings.temperature > 0)) {", "  if (settings.seed)")
 
     def run_js(self, settings: dict, pieces: str):
-        js = (self.defaults + "function projectionLoaded() { return false; }\n" + self.shared +
+        js = (self.defaults + self.shared +
               f"\nconst settings = {json.dumps(settings)};\nconst body = {{}};\n{pieces}\n"
               "console.log(JSON.stringify({body, shared: sharedDefaults(settings)}));")
         out = subprocess.run(["node", "-e", js], capture_output=True, text=True, timeout=30)
@@ -42,7 +42,7 @@ class WebSampling(unittest.TestCase):
         return json.loads(out.stdout)
 
     def sampling(self, **kw):
-        s = {"thinking": "high", "temperature": 1.0, "top_p": 0.95, "top_k": 20, "max": "", "seed": "", "esp": True}
+        s = {"thinking": "high", "temperature": 1.0, "top_p": 0.95, "top_k": 20, "max": "", "seed": ""}
         s.update(kw)
         r = self.run_js(s, self.body)
         return r["body"], r["shared"]

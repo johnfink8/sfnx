@@ -195,7 +195,7 @@ class Monitor(unittest.TestCase):
         with urllib.request.urlopen(self.base + "/metrics", timeout=10) as r:
             self.assertIsNone(json.loads(r.read())["requests"][0]["record"])
 
-    def test_queue_wait_and_loading_are_attributed_separately(self):
+    def test_queue_wait_and_an_engine_restart_are_attributed_separately(self):
         self.engine.close()
         entered, release = threading.Event(), threading.Event()
         original = self.engine.restart
@@ -214,7 +214,6 @@ class Monitor(unittest.TestCase):
             history = self.request("/api/requests")[1]
             self.assertEqual({r["state"] for r in history["requests"]}, {"queued", "loading"})
             self.assertFalse(history["loaded"])
-            self.assertTrue(history["auto_load"])
             time.sleep(0.03)
             release.set()
             self.assertEqual(first.result()[0], 200)

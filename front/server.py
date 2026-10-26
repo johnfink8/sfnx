@@ -3289,30 +3289,19 @@ class Service:
                         if st.get("busy"):
                             last = request_stats(segments)          # only this request's own DONEs count
                             started = st.get("started", time.time())
-
-                            hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
-                            # #588: the share the GPU read over PCIe (--pcie-frac) or another GPU computed - not in
-                            # the hit rate's lookups, which is the VRAM share of the rest (None: an older engine)
-                            routed = (last.get("lookups") or 0) + (last.get("offloaded") or 0)
-                            pcie_share = round(last["offloaded"] / routed, 3) \
-                                if last.get("offloaded") is not None and routed else None
                             seen = prompt_tokens_seen(len(ids), last)   # #471: < len(ids) when cancelled mid-read
                             self.history.append({
                                 "id": request_id,
                                 # the monitor's record of this request (prompt and answer), when it keeps one
                                 "record": trace["id"] if trace is not None else None,
-
                                 "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
                                 "prompt_tokens": seen, "reused": last.get("reused"), "output_tokens": n,
                                 "first_engine_token_s": first_engine_token_s,
-                                # the request's whole prompt, and the tokens read of it (None: an older engine)
-                                "prompt_total": len(ids), "prompt_read": last.get("prompt_read"),
+                                "prompt_total": len(ids),           # the request's whole prompt
                                 "engine_generated": last.get("generated"),
                                 "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
                                 "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                                 if n and last.get("generated") and last.get("decode_ms") else None,
-                                "hit_rate": hit_rate, "pcie_share": pcie_share, "ram_blobs": last.get("ram_blobs"),
-                                "file_blobs": last.get("file_blobs"), "file_mb": last.get("file_mb"),
                                 # #457: the speculative drafts from the DONE line (None: the engine did not say)
                                 "drafts_offered": last.get("drafts_offered"),
                                 "drafts_accepted": last.get("drafts_accepted")})
@@ -3336,12 +3325,9 @@ class Service:
                             el = now - st.get("started", now)
                             ft = st.get("first_token")
                             rate = answer_speed(last, n, now - ft if ft else None)
-                            hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
-                            if hit_msg and pcie_share:
-                                hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
                             rate_txt = f"{rate:.1f} tok/s" if rate is not None else "no speed"
                             print(f"[sfnx] done: {n} tokens in {el:.0f} s ({rate_txt}) "
-                                  f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
+                                  f"({finish}, cancel={cancel.is_set()})", flush=True)
                             if finish == "length" and parser.state in ("reasoning", "rcall"):   # #530
                                 print("[sfnx] the reply reached max tokens while still thinking, so it has no "
                                       "answer: a thinking budget (reasoning_budget_tokens, in the request or in "
@@ -4002,7 +3988,7 @@ def make_handler(svc: Service):
                     self._json(404 if records is None else 200,
                                {"error": {"message": "request no longer retained"}} if records is None else
                                records if request_id else {"requests": records, "retention": 100, "persistent": False,
-                                                          "loaded": svc.loaded(), "auto_load": hasattr(svc.engine, "restart")})
+                                                          "loaded": svc.loaded()})
                 return
             if path == "/settings":
                 if self._authorized():
