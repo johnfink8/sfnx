@@ -32,6 +32,12 @@ NVCC := /usr/local/cuda/bin/nvcc
 LLAMA ?= $(CURDIR)/llama.cpp
 GG := $(LLAMA)/ggml
 NVFLAGS := -DFNX_DIR='"$(CURDIR)"' -O3 --use_fast_math -std=c++17 -arch=sm_70 -ccbin g++-14 -Wno-deprecated-gpu-targets -I$(GG)/src/ggml-cuda -I$(GG)/src -I$(GG)/include --expt-relaxed-constexpr
+# the cards every layer is split across (src/model.hpp): 3, or 2 (make FNX_NCARD=2 ...: an experiment). build/ncard
+# holds the count the objects in build/ were made for; a different count rewrites it, which rebuilds them all
+FNX_NCARD ?= 3
+$(if $(filter 2 3,$(FNX_NCARD)),,$(error FNX_NCARD: 2 or 3, not '$(FNX_NCARD)'))
+NVFLAGS += -DFNX_NCARD=$(FNX_NCARD)
+$(shell mkdir -p build && { [ "$$(cat build/ncard 2>/dev/null)" = "$(FNX_NCARD)" ] || echo $(FNX_NCARD) > build/ncard; })
 
 bin/gguf_test: tools/gguf_test.cpp src/gguf.cpp src/gguf.hpp
 	mkdir -p bin && g++-14 -O2 -std=c++17 -o $@ tools/gguf_test.cpp src/gguf.cpp
@@ -50,19 +56,19 @@ KPARTS := 0 1 2 3 4 5 6 7 8
 KERN_OBJ := $(foreach p,$(KPARTS),build/kernels_p$(p).o)
 ENG_OBJ := build/gguf.o build/model.o build/store.o $(KERN_OBJ) build/moe_mma.o build/engine.o build/prefill.o build/session.o build/batch.o
 PIC := -Xcompiler -fPIC
-build/kernels_p%.o: src/kernels.cu
+build/kernels_p%.o: src/kernels.cu build/ncard
 	@mkdir -p build
 	$(NVCC) $(NVFLAGS) $(PIC) -DFNX_KPART=$* -MD -MF build/kernels_p$*.d -c -o $@ $<
-build/%.o: src/%.cu
+build/%.o: src/%.cu build/ncard
 	@mkdir -p build
 	$(NVCC) $(NVFLAGS) $(PIC) -MD -MF build/$*.d -c -o $@ $<
-build/%.o: src/%.cpp
+build/%.o: src/%.cpp build/ncard
 	@mkdir -p build
 	$(NVCC) $(NVFLAGS) $(PIC) -MD -MF build/$*.d -c -o $@ $<
-build/tool_%.o: tools/%.cpp
+build/tool_%.o: tools/%.cpp build/ncard
 	@mkdir -p build
 	$(NVCC) $(NVFLAGS) $(PIC) -MD -MF build/tool_$*.d -c -o $@ $<
-build/tool_%.o: tools/%.cu
+build/tool_%.o: tools/%.cu build/ncard
 	@mkdir -p build
 	$(NVCC) $(NVFLAGS) $(PIC) -MD -MF build/tool_$*.d -c -o $@ $<
 -include $(wildcard build/*.d)
@@ -84,7 +90,7 @@ bin/fnx_run bin/sample_test bin/cache_test bin/lanes_test bin/batch_test: bin/%:
 # which holds the engine and is reloaded after a rebuild; both use the shared CUDA runtime, and the lab exports the
 # model's code (gguf, model) to the library
 LAB_OBJ := $(KERN_OBJ) build/moe_mma.o build/engine.o build/prefill.o build/session.o build/batch.o build/pic/tool_fnx_run.o
-build/pic/tool_fnx_run.o: tools/fnx_run.cpp
+build/pic/tool_fnx_run.o: tools/fnx_run.cpp build/ncard
 	@mkdir -p build/pic
 	$(NVCC) $(NVFLAGS) -Xcompiler -fPIC -DFNX_LAB_LIB -MD -MF build/pic/tool_fnx_run.d -c -o $@ $<
 -include $(wildcard build/pic/*.d)
@@ -103,7 +109,7 @@ lab: bin/fnx_lab bin/fnx_hold build/libfnx_lab.so
 # (tools/lab_proto.hpp). A new hash names a new stamp file, which rebuilds both objects
 LOADER_SRC := src/model.cpp src/model.hpp src/gguf.cpp src/gguf.hpp src/store.cpp src/store.hpp tools/lab_proto.hpp
 $(if $(filter-out $(wildcard $(LOADER_SRC)),$(LOADER_SRC)),$(error loader sources missing: $(filter-out $(wildcard $(LOADER_SRC)),$(LOADER_SRC))))
-LOADER_REV := $(shell cat $(LOADER_SRC) | sha1sum | cut -c1-16)
+LOADER_REV := $(shell { cat $(LOADER_SRC); [ $(FNX_NCARD) = 3 ] || echo ncard $(FNX_NCARD); } | sha1sum | cut -c1-16)
 build/loader_rev.$(LOADER_REV):
 	@mkdir -p build && touch $@
 build/tool_fnx_hold.o build/tool_fnx_lab.o: build/loader_rev.$(LOADER_REV)

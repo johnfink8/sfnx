@@ -609,15 +609,16 @@ __device__ __forceinline__ void att_merge(float& m, float& z, float& a, float m2
     m = mn;
 }
 
-// the cards' partials reduced onto each head's card (chunk c: heads [8c, 8c + 8)) in two hops on the ring:
-// card g sends its partial of chunk g + 2 to g + 1; card g + 1 merges its own into it and sends it on to g + 2, the
-// chunk's card, which merges its own last and applies the gate: out[t][h - 8g] for its heads. fp32 LL words.
+// the cards' partials reduced onto each head's card (chunk c: heads [ATT_OWN c, ATT_OWN (c + 1))) in NCARD - 1 hops on
+// the ring: card g sends its partial of chunk g - 1 to g + 1; each card after merges its own into it and sends it on,
+// until the chunk's card, which merges its own last and applies the gate: out[t][h - ATT_OWN g] for its heads. fp32 LL
+// words, one receive slot per hop.
 __global__ void __launch_bounds__(HD) k_att_merge(AttRing r, const float* qg, const float* part, float* out, int T,
                                                   const unsigned* tagp, int call) {
     const unsigned tag = *tagp * 256u + (unsigned) call + 1u;
     const int g = r.card, i = threadIdx.x, hl = blockIdx.x, t = blockIdx.y;   // head hl of a chunk (0..7), row t
     constexpr int W = HD + 2;
-    const size_t slot_sz = (size_t) ATT_ROWS * ATT_OWN * W, set_sz = 2 * slot_sz;
+    const size_t slot_sz = (size_t) ATT_ROWS * ATT_OWN * W, set_sz = (NCARD - 1) * slot_sz;
     unsigned long long* in = (unsigned long long*) r.in + (tag & 1) * set_sz;
     unsigned long long* nin = (unsigned long long*) r.next_in + (tag & 1) * set_sz;
     auto word = [&](unsigned long long* b, int step, int k) { return b + step * slot_sz + ((size_t) t * ATT_OWN + hl) * W + k; };
@@ -635,29 +636,30 @@ __global__ void __launch_bounds__(HD) k_att_merge(AttRing r, const float* qg, co
         }
         return __uint_as_float((unsigned) w);
     };
-    // hop 1: my partial of chunk g + 2
+    // hop 1: my partial of chunk g - 1
     {
-        const int c = (g + 2) % 3;
+        const int c = (g + NCARD - 1) % NCARD;
         put(word(nin, 0, i), mine(c, i));
         if (i == 0) {
             put(word(nin, 0, HD), mine(c, HD));
             put(word(nin, 0, HD + 1), mine(c, HD + 1));
         }
     }
-    // hop 2: chunk g + 1 from g - 1, merged with mine, on to its card
-    {
-        const int c = (g + 1) % 3;
-        float m = take(word(in, 0, HD)), z = take(word(in, 0, HD + 1)), a = take(word(in, 0, i));
+    // hop s + 1: chunk g - 1 - s from g - 1, merged with mine, on towards its card
+#pragma unroll
+    for (int s = 1; s < NCARD - 1; ++s) {
+        const int c = (g + 2 * NCARD - 1 - s) % NCARD;
+        float m = take(word(in, s - 1, HD)), z = take(word(in, s - 1, HD + 1)), a = take(word(in, s - 1, i));
         att_merge(m, z, a, mine(c, HD), mine(c, HD + 1), mine(c, i));
-        put(word(nin, 1, i), a);
+        put(word(nin, s, i), a);
         if (i == 0) {
-            put(word(nin, 1, HD), m);
-            put(word(nin, 1, HD + 1), z);
+            put(word(nin, s, HD), m);
+            put(word(nin, s, HD + 1), z);
         }
     }
-    // my chunk: the two others' merged partial, then mine; the gate
+    // my chunk: the others' merged partial, then mine; the gate
     {
-        float m = take(word(in, 1, HD)), z = take(word(in, 1, HD + 1)), a = take(word(in, 1, i));
+        float m = take(word(in, NCARD - 2, HD)), z = take(word(in, NCARD - 2, HD + 1)), a = take(word(in, NCARD - 2, i));
         att_merge(m, z, a, mine(g, HD), mine(g, HD + 1), mine(g, i));
         const int hg = g * ATT_OWN + hl;
         out[((size_t) t * ATT_OWN + hl) * HD + i] = a / z * sigm(qg[((size_t) t * NQH + hg) * 2 * HD + HD + i]);
@@ -746,7 +748,8 @@ __global__ void k_ple_conv(float* R, const float* gated, const float* normd, con
 }
 
 // ---------------------------------------------------------------- ring sum (LL words: two fp16 values | tag << 32)
-constexpr int RCH = N / 3 + 1;     // words per slot row (more than a chunk's pairs)
+constexpr int RCH = N / NCARD + 1;     // words per slot row (more than a chunk's pairs)
+constexpr int RSTEPS = NCARD - 1;      // receive slots: the reduce hops
 constexpr int NP = N / 2;          // pairs per row
 constexpr float RING_MAX = 65504.0f;   // fp16's largest finite value
 // fp32 words: one value | tag per word, pair i at words 2i, 2i + 1
@@ -782,8 +785,8 @@ __device__ __forceinline__ float2 rtake(const unsigned long long* p, unsigned ta
     const unsigned lo = (unsigned) w;
     return __half22float2(*reinterpret_cast<const __half2*>(&lo));
 }
-__device__ __forceinline__ int clo(int k) { return k * NP / 3; }   // in pairs
-__device__ __forceinline__ int chi(int k) { return (k + 1) * NP / 3; }
+__device__ __forceinline__ int clo(int k) { return k * NP / NCARD; }   // in pairs
+__device__ __forceinline__ int chi(int k) { return (k + 1) * NP / NCARD; }
 __device__ __forceinline__ float2 add2(float2 a, float2 b) { return make_float2(a.x + b.x, a.y + b.y); }
 
 // this card's addend for element (t, i): x, or the routed experts' weighted rows plus the gated shared row
@@ -812,7 +815,7 @@ __global__ void k_ring(Ring r, float* x, int T, const unsigned* tagp, int call, 
     const unsigned tag = *tagp * 256u + (unsigned) call + 1u;
     const int n = gridDim.x * blockDim.x, tid = blockIdx.x * blockDim.x + threadIdx.x, g = r.card;
     // two buffer sets, alternating by tag: a card can start sum k+1 before a peer has drained sum k, never k+2
-    const size_t in_set = (size_t) 2 * r.rows * RCH * W, ag_set = (size_t) r.rows * N * W;
+    const size_t in_set = (size_t) RSTEPS * r.rows * RCH * W, ag_set = (size_t) r.rows * N * W;
     unsigned long long* in = (unsigned long long*) r.in + (tag & 1) * in_set;
     unsigned long long* nin = (unsigned long long*) r.next_in + (tag & 1) * in_set;
     unsigned long long* ag = (unsigned long long*) r.ag + (tag & 1) * ag_set;
@@ -825,26 +828,28 @@ __global__ void k_ring(Ring r, float* x, int T, const unsigned* tagp, int call, 
             put(slot(nin, 0, t, i), ring_x2(x, m, T, t, lo + i), tag);
         }
     }
-    {   // step 1: chunk g-1 arrived; add mine, on to g+1
-        const int c = (g + 2) % 3, lo = clo(c), len = chi(c) - lo;
+#pragma unroll
+    for (int s = 1; s < RSTEPS; ++s) {   // step s: chunk g-s arrived with s parts; add mine, on to g+1
+        const int c = (g + NCARD - s) % NCARD, lo = clo(c), len = chi(c) - lo;
         for (int e = tid; e < T * len; e += n) {
             const int t = e / len, i = e % len;
-            const float2 a = take(slot(in, 0, t, i), tag);
-            put(slot(nin, 1, t, i), add2(a, ring_x2(x, m, T, t, lo + i)), tag);
+            const float2 a = take(slot(in, s - 1, t, i), tag);
+            put(slot(nin, s, t, i), add2(a, ring_x2(x, m, T, t, lo + i)), tag);
         }
     }
-    {   // step 2: chunk g+1 with two parts; add mine: finished. Keep it, send it on
-        const int c = (g + 1) % 3, lo = clo(c), len = chi(c) - lo;
+    {   // step NCARD - 1: chunk g+1 with the other cards' parts; add mine: finished. Keep it, send it on
+        const int c = (g + 1) % NCARD, lo = clo(c), len = chi(c) - lo;
         for (int e = tid; e < T * len; e += n) {
             const int t = e / len, i = e % len;
-            const float2 a = take(slot(in, 1, t, i), tag);
+            const float2 a = take(slot(in, RSTEPS - 1, t, i), tag);
             const float2 v = add2(a, ring_x2(x, m, T, t, lo + i));
             put(ag + ((size_t) t * NP + lo + i) * W, v, tag);
             put(nag + ((size_t) t * NP + lo + i) * W, v, tag);
         }
     }
-    {   // step 3: chunk g arrived finished from g-1: forward it
-        const int c = g, lo = clo(c), len = chi(c) - lo;
+#pragma unroll
+    for (int f = 1; f < RSTEPS; ++f) {   // chunk g-f+1 arrived finished from g-1: forward it (none on two cards)
+        const int c = (g + NCARD - f + 1) % NCARD, lo = clo(c), len = chi(c) - lo;
         for (int e = tid; e < T * len; e += n) {
             const int t = e / len, i = e % len;
             put(nag + ((size_t) t * NP + lo + i) * W, take(ag + ((size_t) t * NP + lo + i) * W, tag), tag);
@@ -1193,9 +1198,9 @@ void qsa(const uint16_t* wq, const uint16_t* wk, const float* x, float* y, const
 }
 
 size_t attn_scratch_floats(int) { return (size_t) ATT_ROWS * NQH * ATT_SPLITS * (HD + 2) + (size_t) ATT_ROWS * NQH * (HD + 2); }
-size_t att_ring_words() { return (size_t) 2 * 2 * ATT_ROWS * ATT_OWN * (HD + 2); }
+size_t att_ring_words() { return (size_t) 2 * (NCARD - 1) * ATT_ROWS * ATT_OWN * (HD + 2); }
 int attn_rows() { return ATT_ROWS; }
-int kv_rows_per_card(int n_ctx) { return (n_ctx / 4 + 2) / 3 * 4 + 4; }
+int kv_rows_per_card(int n_ctx) { return (n_ctx / 4 + NCARD - 1) / NCARD * 4 + 4; }
 
 void attn(const float* qg, const uint16_t* kc16, const uint16_t* vc16, const KvPages& g, float* out, const AttRing& ar, const unsigned* tag,
           int call, const int* pos0, int T, float* scratch, void* st, const int* cells, const int* n_cells) {
@@ -1261,7 +1266,9 @@ void ple_post(float* R, const float* key, const float* value, const float* nk, c
     ck_launch("ple_post");
 }
 
-constexpr int RB_BLOCKS = 240, RB_KINDS = 4;   // flags: [2 sets][kind: in step 0, in step 1, ag step 2, ag step 3][block]
+// flags: [2 sets][kind: the reduce steps' (in), then the finished chunks' (ag)][block]; three cards: in step 0, in
+// step 1, ag step 2, ag step 3
+constexpr int RB_BLOCKS = 240, RB_KINDS = 2 * NCARD - 2;
 size_t ring_flag_words() { return (size_t) 2 * RB_KINDS * RB_BLOCKS; }
 
 // block b's segment of a hop's chunk c: pairs [s0, s1) of the T * len (row, pair) elements, row-major
@@ -1301,7 +1308,7 @@ __device__ __forceinline__ float2 rb_load(const __half2* p) {
 __global__ void k_ring_big(Ring r, float* x, int T, const unsigned* tagp, int call, RingMoe m) {
     const unsigned tag = *tagp * 256u + (unsigned) call + 1u;
     const int g = r.card, set = tag & 1, b = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
-    const size_t in_set = (size_t) 2 * r.rows * RCH, ag_set = (size_t) r.rows * NP;   // in half2 words
+    const size_t in_set = (size_t) RSTEPS * r.rows * RCH, ag_set = (size_t) r.rows * NP;   // in half2 words
     __half2* in = reinterpret_cast<__half2*>(r.in) + set * 2 * in_set;
     __half2* nin = reinterpret_cast<__half2*>(r.next_in) + set * 2 * in_set;
     __half2* ag = reinterpret_cast<__half2*>(r.ag) + set * ag_set;
@@ -1318,44 +1325,45 @@ __global__ void k_ring_big(Ring r, float* x, int T, const unsigned* tagp, int ca
         }
         rb_signal(nfl + 0 * RB_BLOCKS + b, tag);
     }
-    {   // step 1: chunk g-1 arrived; add mine, on to g+1
-        rb_seg(T, (g + 2) % 3, lo, len, s0, s1);
-        rb_wait(fl + 0 * RB_BLOCKS + b, tag, r.err);
+    for (int s = 1; s < RSTEPS; ++s) {   // step s: chunk g-s arrived; add mine, on to g+1
+        rb_seg(T, (g + NCARD - s) % NCARD, lo, len, s0, s1);
+        rb_wait(fl + (s - 1) * RB_BLOCKS + b, tag, r.err);
         for (int e = s0 + tid; e < s1; e += nt) {
             const int t = e / len, i = e % len;
-            *slot(nin, 1, t, i) = rb_pack(add2(rb_load(slot(in, 0, t, i)), ring_x2(x, m, T, t, lo + i)), r.err);
+            *slot(nin, s, t, i) = rb_pack(add2(rb_load(slot(in, s - 1, t, i)), ring_x2(x, m, T, t, lo + i)), r.err);
         }
-        rb_signal(nfl + 1 * RB_BLOCKS + b, tag);
+        rb_signal(nfl + s * RB_BLOCKS + b, tag);
     }
-    {   // step 2: chunk g+1 with two parts; add mine: finished. Keep it, send it on
-        rb_seg(T, (g + 1) % 3, lo, len, s0, s1);
-        rb_wait(fl + 1 * RB_BLOCKS + b, tag, r.err);
+    {   // step NCARD - 1: chunk g+1 with the other cards' parts; add mine: finished. Keep it, send it on
+        rb_seg(T, (g + 1) % NCARD, lo, len, s0, s1);
+        rb_wait(fl + (RSTEPS - 1) * RB_BLOCKS + b, tag, r.err);
         for (int e = s0 + tid; e < s1; e += nt) {
             const int t = e / len, i = e % len;
-            const __half2 v = rb_pack(add2(rb_load(slot(in, 1, t, i)), ring_x2(x, m, T, t, lo + i)), r.err);
+            const __half2 v = rb_pack(add2(rb_load(slot(in, RSTEPS - 1, t, i)), ring_x2(x, m, T, t, lo + i)), r.err);
             ag[(size_t) t * NP + lo + i] = v;
             nag[(size_t) t * NP + lo + i] = v;
         }
-        rb_signal(nfl + 2 * RB_BLOCKS + b, tag);
+        rb_signal(nfl + RSTEPS * RB_BLOCKS + b, tag);
     }
-    {   // step 3: chunk g arrived finished from g-1: forward it
-        rb_seg(T, g, lo, len, s0, s1);
-        rb_wait(fl + 2 * RB_BLOCKS + b, tag, r.err);
+    for (int f = 1; f < RSTEPS; ++f) {   // step NCARD - 1 + f: chunk g-f+1 arrived finished from g-1: forward it
+        rb_seg(T, (g + NCARD - f + 1) % NCARD, lo, len, s0, s1);
+        rb_wait(fl + (RSTEPS - 1 + f) * RB_BLOCKS + b, tag, r.err);
         for (int e = s0 + tid; e < s1; e += nt) {
             const int t = e / len, i = e % len;
             const unsigned w = __ldcg(reinterpret_cast<const unsigned*>(ag + (size_t) t * NP + lo + i));
             nag[(size_t) t * NP + lo + i] = *reinterpret_cast<const __half2*>(&w);
         }
-        rb_signal(nfl + 3 * RB_BLOCKS + b, tag);
+        rb_signal(nfl + (RSTEPS + f) * RB_BLOCKS + b, tag);
     }
-    // chunk g + 2 arrives forwarded (the previous card's step 3); then everything into x. Each block waits for its
-    // own segments: every block must see every chunk, so it waits on the flags of the blocks that wrote them
-    rb_wait(fl + 3 * RB_BLOCKS + b, tag, r.err);
+    // the last chunk arrives (finished on two cards, forwarded on three: the previous card's last step); then
+    // everything into x. Each block waits for its own segments: every block must see every chunk, so it waits on the
+    // flags of the blocks that wrote them
+    rb_wait(fl + (RB_KINDS - 1) * RB_BLOCKS + b, tag, r.err);
     __syncthreads();
 }
 
-// after k_ring_big on every block: all chunks are in ag (this card's own chunk g+1, chunk g from step 2's sender and
-// chunk g+2 forwarded at step 3); a second launch reads them once every block of the first has passed its waits
+// after k_ring_big on every block: all chunks are in ag (this card's own chunk g+1, chunk g from the finishing step's
+// sender and the rest forwarded); a second launch reads them once every block of the first has passed its waits
 __global__ void k_ring_big_out(Ring r, float* x, int T, const unsigned* tagp, int call) {
     const unsigned tag = *tagp * 256u + (unsigned) call + 1u;
     const int set = tag & 1;
@@ -1367,7 +1375,7 @@ __global__ void k_ring_big_out(Ring r, float* x, int T, const unsigned* tagp, in
     }
 }
 
-size_t ring_in_words(int rows) { return (size_t) 2 * 2 * rows * RCH * 2; }
+size_t ring_in_words(int rows) { return (size_t) 2 * RSTEPS * rows * RCH * 2; }
 size_t ring_ag_words(int rows) { return (size_t) 2 * rows * N * 2; }
 
 void ring_sum(const Ring& r, float* x, int T, const unsigned* tag, int call, void* st, const RingMoe& m) {
@@ -1375,13 +1383,13 @@ void ring_sum(const Ring& r, float* x, int T, const unsigned* tag, int call, voi
     if (T > r.rows) throw std::runtime_error("ring_sum: more rows than the ring's buffers hold");
     if (r.flags && T > MAXT) {
         if (r.f32) throw std::runtime_error("ring_sum: the chunk ring carries fp16 only");
-        const int grid = std::min(RB_BLOCKS, std::max(4, (T * NP / 3 + 255) / 256));
+        const int grid = std::min(RB_BLOCKS, std::max(4, (T * NP / NCARD + 255) / 256));
         k_ring_big<<<grid, 256, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
         k_ring_big_out<<<grid, 256, 0, (cudaStream_t) st>>>(r, x, T, tag, call);
         ck_launch("ring_sum (chunk)");
         return;
     }
-    const int grid = std::max(4, std::min(T > MAXT ? 240 : 40, (T * NP / 3 + 255) / 256));
+    const int grid = std::max(4, std::min(T > MAXT ? 240 : 40, (T * NP / NCARD + 255) / 256));
     if (r.f32) k_ring<true><<<grid, 256, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
     else k_ring<false><<<grid, 256, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
     ck_launch("ring_sum");

@@ -2,7 +2,7 @@
 // walks the row's attended positions on this card, APC at a time, for the KV head's ATT_QPK query heads (rows of a
 // 16-row tile) on the tensor cores: S = q k^T and O += p v as f16 x f16 with f32 accumulation, q and p rounded to f16
 // as llama.cpp's CUDA attention takes them. Online softmax per head.
-// The partial (acc, max, sum) of every head goes to part[owner card][row][head of 8][HD + 2]; the merge across cards
+// The partial (acc, max, sum) of every head goes to part[owner card][row][head of ATT_OWN][HD + 2]; the merge across cards
 // (k_pf_attn_merge, after the exchange) applies the gate.
 namespace {
 
@@ -186,15 +186,17 @@ __global__ void __launch_bounds__(AP_THREADS) k_pf_attn(const float* __restrict_
     }
 }
 
-// this card's heads: its own partial and the two others' (from card g + 1 in slot 0, g + 2 in slot 1), merged; the gate
+// this card's heads: its own partial and the others' (from card g + 1 in slot 0, g + 2 in slot 1, ...), merged; the gate
 __global__ void __launch_bounds__(HD) k_pf_attn_merge(const float* __restrict__ own, const float* __restrict__ recv,
                                                       const float* __restrict__ qg, float* __restrict__ out, int C, int card) {
     const int t = blockIdx.x, hl = blockIdx.y, i = threadIdx.x;
     const size_t at = ((size_t) t * ATT_OWN + hl) * AP_W;
-    const float* src[3] = {own + at, recv + at, recv + (size_t) C * ATT_OWN * AP_W + at};
-    float m = src[0][HD], z = src[0][HD + 1], a = src[0][i];
+    float m = own[at + HD], z = own[at + HD + 1], a = own[at + i];
 #pragma unroll
-    for (int k = 1; k < 3; ++k) att_merge(m, z, a, src[k][HD], src[k][HD + 1], src[k][i]);
+    for (int k = 0; k < NCARD - 1; ++k) {
+        const float* src = recv + (size_t) k * C * ATT_OWN * AP_W + at;
+        att_merge(m, z, a, src[HD], src[HD + 1], src[i]);
+    }
     const int hg = card * ATT_OWN + hl;
     out[((size_t) t * ATT_OWN + hl) * HD + i] = a / z * sigm(qg[((size_t) t * NQH + hg) * 2 * HD + HD + i]);
 }

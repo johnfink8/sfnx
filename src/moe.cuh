@@ -274,7 +274,7 @@ __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu(MoeW w, const Job* __re
 // down: one block per (job, rows_per_block rows). The block first makes its tokens' h = silu(gate) * up (gu rows
 // jb.y[j] of [gate (ffs) | up (ffs)]) as q8_1 in shared memory; thread (row, u) then dots its 32-column unit u of the
 // row with each token's h, and the block sums a row's units into out row jb.out[j]
-constexpr int DN_THREADS = 256, DN_U = 32, DN_MAXB = 8;   // DN_MAXB: ffs / 32 on any card
+constexpr int DN_THREADS = 256, DN_U = 32, DN_MAXB = FF_CARD_MAX / 32 > 8 ? FF_CARD_MAX / 32 : 8;   // DN_MAXB: ffs / 32 on any card
 
 // every pair's h for k_moe_down, made once by k_moe_h (each of the ~70 down blocks of a job made its own). One MoE runs at
 // a time on a card (its window's stream), so one buffer per card

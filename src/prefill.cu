@@ -541,13 +541,15 @@ void cud(CUresult e, const char* what) {
 // one direction's sum of x (C rows of N) over the cards, on stream s; this card is at position g of the direction's
 // ring (its next card: g + 1 there). Thirds of the rows: card g sends third g to g + 1, which adds its own and sends it
 // on to g + 2, which adds its own: finished there (card g finishes third g + 1). The finished thirds go round twice.
+// Two cards: halves, card g sends half g to the other, which adds its own: finished, and sent back.
 // Each step: a copy into the next card, then a flag there; the step after waits on this card's flag (stream memory
 // operations: no SM time, no host)
+static_assert(2 * NCARD - 2 <= 4, "the copy-engine ring's flags hold 4 steps a set");
 void pf_ring_dir(Engine::PfRing& r, int dev, int g, float* x, int C, unsigned seq, unsigned* err, cudaStream_t s) {
     const int set = (int) (seq & 1u);
-    auto r0 = [&](int k) { return k * C / 3; };
+    auto r0 = [&](int k) { return k * C / NCARD; };
     auto rows = [&](int k) { return r0(k + 1) - r0(k); };
-    const int a = g, b = (g + 2) % 3, c = (g + 1) % 3;
+    const int a = g, b = (g + NCARD - 1) % NCARD, c = (g + 1) % NCARD;
     CUstream cs = (CUstream) s;
     auto signal = [&](int step) {
         cud(cuStreamWriteValue32(cs, (CUdeviceptr) (r.nflags + set * 4 + step), seq, 0), "ring flag");
@@ -570,6 +572,16 @@ void pf_ring_dir(Engine::PfRing& r, int dev, int g, float* x, int C, unsigned se
                                                                       (__half2*) r.send, err);
     copy(r.nin0[set], r.send, rows(a));
     signal(0);
+    if constexpr (NCARD == 2) {
+        wait(0);   // half c (= b) from the other card: add mine, finished; keep it, send it back
+        __half* fin = r.ag[set] + (size_t) r0(c) * N;
+        add(r.in0[set], c, fin);
+        copy(r.nag[set] + (size_t) r0(c) * N, fin, rows(c));
+        signal(1);
+        wait(1);   // half a arrived finished: both here
+        k_pfr_out<<<grid_for((size_t) C * N / 2), 256, 0, s>>>((const __half2*) r.ag[set], (float2*) x, C * N / 2);
+        return;
+    }
     wait(0);   // third b from card g - 1: add mine, on to g + 1
     add(r.in0[set], b, r.send);
     copy(r.nin1[set], r.send, rows(b));
@@ -785,7 +797,7 @@ void Engine::prefill_alloc() {
         }
         {
             PfRing& r = p->ring_ce;
-            const size_t third = (size_t) (pf_c_ + 2) / 3 * N;
+            const size_t third = (size_t) (pf_c_ + NCARD - 1) / NCARD * N;   // a card's share of the rows (a half on two)
             r.send = palloc<__half>(third);
             for (int k = 0; k < 2; ++k) {
                 r.in0[k] = palloc<__half>(third);
@@ -798,7 +810,7 @@ void Engine::prefill_alloc() {
         p->attn_dec = env_flag("FNX_PF_ATTN_DEC");
         p->apart[1] = palloc<float>(NCARD * attn_prompt_block_floats(pf_c_));   // set 0 is in the attention phase's region
         for (int s = 0; s < 2; ++s) {
-            p->arecv[s] = palloc<float>(2 * attn_prompt_block_floats(pf_c_));
+            p->arecv[s] = palloc<float>((NCARD - 1) * attn_prompt_block_floats(pf_c_));
             p->aflags[s] = palloc<unsigned>(2 * ATT_PIECES_MAX);   // [slot][piece]
         }
         if (const char* ap = std::getenv("FNX_PF_ATT_PIECES")) {

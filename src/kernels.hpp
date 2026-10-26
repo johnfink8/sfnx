@@ -126,12 +126,12 @@ __device__ __forceinline__ int rope_pos(const Rope& r, int cell, int pair) { ret
 void attn_prep(float* qg, float* k, const float* q_norm, const float* k_norm, int nq, int nkv, const int* pos0, int T,
                float eps, Rope base, void* st);
 size_t attn_scratch_floats(int nq);
-// The K/V cache is split by position: blocks of 4 positions dealt in turn to cards 0, 1, 2 (block j on card j % 3), so
-// every card attends over a third of the positions. A card's local block of block j: its place among the card's
-// blocks (j / 3); a position's local row: its local block * 4 + its place in the block.
+// The K/V cache is split by position: blocks of 4 positions dealt in turn to the cards (block j on card j % NCARD), so
+// every card attends over 1 / NCARD of the positions. A card's local block of block j: its place among the card's
+// blocks (j / NCARD); a position's local row: its local block * 4 + its place in the block.
 __host__ __device__ inline int kv_card(int j) { return j % NCARD; }
 __host__ __device__ inline int kv_local_block(int j) { return j / NCARD; }
-// The paged K/V pool (per card): a page holds 192 positions (48 blocks, 16 on each card: this card's kvp_rows local rows)
+// The paged K/V pool (per card): a page holds 192 positions (48 blocks, 48 / NCARD on each card: this card's kvp_rows local rows)
 // for every attention layer and the draft layer: per layer its K rows, V rows (NKVH * HD f16 each) and the 48 pooled
 // QSA keys (128 f16 each; every card holds every block's). A sequence's page table maps its logical pages to
 // physical ones; a layer's K, V and pooled pointers are the pool plus their offsets in a page, and an index is placed
@@ -209,7 +209,7 @@ void qsa_select_lanes(const float* q, const uint16_t* pooled, const KvPages& g, 
 void qsa(const uint16_t* wq, const uint16_t* wk, const float* x, float* y, const float* qn, const float* kn, uint16_t* ring,
          uint16_t* pooled, const KvPages& g, float* q, float* scores, int* cells, int* n_cells, int max_pools, const int* pos0, int T, float eps,
          Rope base, int card, void* st);
-// the merge of the cards' attention partials: this card's receive slots ([2 sets][2 steps][MAXT][8 heads][HD + 2] fp32
+// the merge of the cards' attention partials: this card's receive slots ([2 sets][NCARD - 1 steps][ATT_ROWS][ATT_OWN heads][HD + 2] fp32
 // words) and the next card's
 struct AttRing {
     int card = 0;
@@ -219,10 +219,10 @@ struct AttRing {
 };
 size_t att_ring_words();
 int attn_rows();   // the most rows one attn call takes
-// attention over this card's positions (the K/V cache split by position: block j on card j % 3, local index
-// (j / 3) * 4 + p % 4), every head (qg: [T][NQH][q | gate]); cells/n_cells: QSA's selection as this card's local
+// attention over this card's positions (the K/V cache split by position: block j on card j % NCARD, local index
+// (j / NCARD) * 4 + p % 4), every head (qg: [T][NQH][q | gate]); cells/n_cells: QSA's selection as this card's local
 // indices (n_cells[t] = -1: every owned position up to the row's). The cards' partials are merged on the ring: out
-// gets this card's NQH / 3 heads (heads card * 8 ..), gated
+// gets this card's NQH / NCARD heads (heads card * NQH / NCARD ..), gated
 void attn(const float* qg, const uint16_t* kc, const uint16_t* vc, const KvPages& g, float* out, const AttRing& ar, const unsigned* tag, int call,
           const int* pos0, int T, float* scratch, void* st, const int* cells = nullptr, const int* n_cells = nullptr);
 // attn in two parts, for a window of several sequences: attn_part_lanes the partials of its T rows, each at its lane's
@@ -233,14 +233,14 @@ void attn_finish(const float* qg, float* out, const AttRing& ar, const unsigned*
 // the indexer's projection alone (qsa with wq set does it first)
 void qsa_proj(const uint16_t* wq, const uint16_t* wk, const float* x, float* y, int T, void* st);
 // the same over a prompt chunk of C rows at positions *pos0 + t, in two parts around an exchange the caller makes:
-// attn_prompt leaves every head's partial in part, in blocks per owner card ([3][C][8 heads][HD + 2]: block k for card
-// k); attn_prompt_merge merges this card's block with the two others' (recv: [2][C][8][HD + 2], from card + 1 then
-// card + 2) and gates them into out ([C][8][HD])
+// attn_prompt leaves every head's partial in part, in blocks per owner card ([NCARD][C][NQH / NCARD heads][HD + 2]: block k for card
+// k); attn_prompt_merge merges this card's block with the others' (recv: [NCARD - 1][C][NQH / NCARD][HD + 2], from card + 1,
+// card + 2, ...) and gates them into out ([C][NQH / NCARD][HD])
 size_t attn_prompt_block_floats(int C);   // one block of part (one slot of recv)
 void attn_prompt(const float* qg, const uint16_t* kc, const uint16_t* vc, const KvPages& g, const int* pos0, const int* cells, const int* n_cells,
                  int card, int C, int r0, int T, float* part, void* st);   // rows r0 .. r0 + T - 1 of the C
 void attn_prompt_merge(const float* own, const float* recv, const float* qg, float* out, int C, int card, void* st);
-// the rows of the window's positions this card owns (block j on card j % 3) = k/v (both KV heads) rounded to f16, or
+// the rows of the window's positions this card owns (block j on card j % NCARD) = k/v (both KV heads) rounded to f16, or
 // quantized to int8 (g.q8)
 void kv_append(const float* k, const float* v, uint16_t* kc, uint16_t* vc, const KvPages& g, int card, int T, const int* pos0, void* st);
 // attn_prep (NQH, NKVH) and kv_append in one launch, the same values
@@ -312,9 +312,9 @@ struct RingMoe {
 // via P2P
 struct Ring {
     int card;
-    void* in;            // this card: [2 sets][2 steps][MAXT][N / 3 + 1] u64
+    void* in;            // this card: [2 sets][NCARD - 1 steps][MAXT][N / NCARD + 1] u64
     void* ag;            // this card: [2 sets][MAXT][N] u64
-    void* next_in;       // card (card + 1) % 3's
+    void* next_in;       // card (card + 1) % NCARD's
     void* next_ag;
     unsigned* err;       // bit 1: a peer's value never came; bit 2: a NaN or inf (on the fp16 ring: a value past its
                          // range); bit 4: an hc read's grid barrier timed out; bit 16: a NaN or inf among the head's

@@ -11,13 +11,22 @@
 
 namespace fnx {
 
-constexpr int NCARD = 3;
+// the cards every layer is split across: 3 (the box), or 2 (make FNX_NCARD=2: an experiment). The splits by card
+// (key and value heads, FF width) are tables in Model::Model, one per count
+#ifndef FNX_NCARD
+#define FNX_NCARD 3
+#endif
+constexpr int NCARD = FNX_NCARD;
+static_assert(NCARD == 2 || NCARD == 3, "FNX_NCARD: 2 or 3 cards");
 constexpr int N = 2560, HC = 4, D = N * HC, LR = 320;
 constexpr int NL = 48, NEXP = 512, TOPK = 10, FF = 640, FF_SH = 640;
 constexpr int NKH = 16, NVH = 48, HS = 128;            // recurrent: key heads, value heads, head size
 constexpr int NQH = 24, NKVH = 2, HD = 256, NROT = 64; // attention
 constexpr int MAXT = 16;                               // rows per window
 constexpr int PLE_LAYER = 1, PLE_HEADS = 16, PLE_DIM = 160;
+// the widest FF slice a card gets (Model::Model's ffparts): what the down kernels' per-card buffers are sized for
+constexpr int FF_CARD_MAX = NCARD == 3 ? 224 : FF / 2;
+static_assert(NQH % NCARD == 0, "the attention's query heads split evenly over the cards");
 
 inline bool is_attn(int l) { return (l + 1) % 4 == 0; }
 

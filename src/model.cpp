@@ -879,6 +879,7 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
     ple_eos = g.i(p + "ple.eos_token_id");
     ple_image = g.i(p + "ple.image_token_id");
     cards.resize(NCARD);
+#if FNX_NCARD == 3
     // key heads per card (their q and k) and value heads (s * NKH + k): 16 value heads each; key heads 5 and 10 have
     // value heads on two cards
     const int kparts[NCARD][2] = {{0, 6}, {5, 6}, {10, 6}};
@@ -887,6 +888,28 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
         {6, 7, 8, 9, 10, 21, 22, 23, 24, 25, 26, 37, 38, 39, 40, 41},
         {11, 12, 13, 14, 15, 27, 28, 29, 30, 31, 42, 43, 44, 45, 46, 47}};
     const int ffparts[NCARD][2] = {{0, 224}, {224, 448}, {448, 640}};
+#else
+    // two cards: key heads 0-7 and 8-15, each with all three of its value heads (s * NKH + k): 24 value heads a card,
+    // no key head on both; half the FF width each (10 blocks of 32)
+    const int kparts[NCARD][2] = {{0, 8}, {8, 8}};
+    const std::vector<std::vector<int>> vparts = {
+        {0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 32, 33, 34, 35, 36, 37, 38, 39},
+        {8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31, 40, 41, 42, 43, 44, 45, 46, 47}};
+    const int ffparts[NCARD][2] = {{0, 320}, {320, 640}};
+#endif
+    for (int c = 0; c < NCARD; ++c)
+        if (ffparts[c][0] % 32 || ffparts[c][1] % 32 || ffparts[c][1] - ffparts[c][0] > FF_CARD_MAX ||
+            ffparts[c][0] != (c ? ffparts[c - 1][1] : 0))
+            throw std::runtime_error("fnx: card " + std::to_string(c) + "'s FF slice is not whole 32-value blocks after the last, within FF_CARD_MAX");
+    if (ffparts[NCARD - 1][1] != FF) throw std::runtime_error("fnx: the cards' FF slices do not cover the FF width");
+    {
+        int ndev = 0;
+        ck(cudaGetDeviceCount(&ndev), "cudaGetDeviceCount");
+        if (ndev < NCARD)
+            throw std::runtime_error("fnx: built for " + std::to_string(NCARD) + " cards (FNX_NCARD), " + std::to_string(ndev) + " visible");
+        if (ndev > NCARD)
+            std::fprintf(stderr, "fnx: built for %d cards (FNX_NCARD): %d visible, using devices 0..%d\n", NCARD, ndev, NCARD - 1);
+    }
     const int vstep = (vocab + NCARD - 1) / NCARD;
     for (int c = 0; c < NCARD; ++c) {
         CardW& cw = cards[c];

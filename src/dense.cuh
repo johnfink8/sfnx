@@ -162,7 +162,7 @@ __global__ void __launch_bounds__(Q8S_THREADS) k_q8s(const Q8Segs g, int rows, i
 // The shared expert inside the routed experts' launches (no second stream): its gate|up as extra blocks of the router's
 // launch, its swiglu and down as an extra row of blocks of the routed down's. Both matrices have fewer than 4096 rows:
 // q8s with one row a warp, as q8s_gemv runs them alone.
-constexpr int SH_MAXF = 256;   // the shared expert's FF slice on a card, at most
+constexpr int SH_MAXF = FF_CARD_MAX > 256 ? FF_CARD_MAX : 256;   // the shared expert's FF slice on a card, at most
 struct ShexpUp {               // gate|up: rows 2 * ffs over the hc read's q8_1 rows y (and its split twin tq / td)
     Q8Segs w;
     int rows = 0, cols = 0, blocks = 0;   // blocks: the launch's last `blocks` blocks (0: none)
