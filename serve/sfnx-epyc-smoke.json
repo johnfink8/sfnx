@@ -21,7 +21,7 @@
  "cwd": ".",
  "env": {
   "FNX_MTP_EXPERTS": "q2_0",
-  "FNX_EXPERT_RAM_GIB": "58",
+  "FNX_EXPERT_RAM_GIB": "28",
   "FNX_EXPERT_PROFILE": "data/expert-routes.bin",
   "FNX_KV8": "1"
  },
