@@ -4,7 +4,8 @@ sFNX is a from-scratch CUDA inference engine for one model (Qwen3.8-Flash-Next) 
 V100-32GB cards on PCIe Gen3 with no NVLink (sm_70, CUDA 12.9, gcc 14). It splits **every layer** across all three
 cards (experts by FF width, recurrent heads, K/V by position, the vocabulary) so one request uses all three cards'
 memory bandwidth at once, with a PCIe ring in place of NVLink, and serves the model through its own OpenAI/Anthropic
-front end. `README.md` is the design and the measurements.
+front end. `README.md` is the short version; `docs/` holds the design, the memory layout, the measurements,
+the verification and the settings.
 
 ## Layout
 
@@ -30,7 +31,7 @@ the GGUFs, configs and prompts all come from the operator. Missing authenticatio
 finding; a hidden *failure* is.
 
 The bar is correctness first: logits match llama.cpp to the same tolerance as llama.cpp's own CPU backend, on text and
-pictures, at temperature 0, and in distribution when sampled with drafts. The README's numbers are the contract; a
+pictures, at temperature 0, and in distribution when sampled with drafts. `docs/benchmarks.md` is the contract; a
 change that silently moves them is a regression. Prod's settings are the code's defaults; environment settings exist
 to try better ones, and a new behaviour lands off by default until the GPU checks below pass.
 
@@ -74,7 +75,7 @@ Measure speed with `lab.sh decode` (edit1 and code1 greedy, prose2 and code1s wi
 utilization and power in every speed run. Mid perf push, measure speed only; run the exactness checks once the push is
 done.
 
-## The checks (on the GPU, before merging engine changes)
+## The checks (on the GPU, before merging engine changes; the full inventory: `docs/verification.md`)
 
 | Check | What it proves | How it fails |
 | --- | --- | --- |
