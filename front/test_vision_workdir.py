@@ -1,4 +1,4 @@
-"""#3370: the encoder's work folder is made again when a temp cleaner removed it while the encoder was unloaded.
+"""#3370: the encoder's work folder is made again when a temp cleaner (systemd-tmpfiles) removed it.
 
     python -m front.test_vision_workdir
 """
@@ -24,7 +24,7 @@ class WorkDir(unittest.TestCase):
             seen = []
 
             def fake_popen(*a, **k):
-                seen.append(Path(k["cwd"]).is_dir())      # the real popen raises WinError 267 when it is not
+                seen.append(Path(k["cwd"]).is_dir())      # the real popen raises FileNotFoundError when it is not
                 return proc
 
             with mock.patch.object(server, "popen", fake_popen):

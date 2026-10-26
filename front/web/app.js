@@ -385,12 +385,12 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, lastR
   const multi = (hw.gpus || []).length > 1;
   const tight = tightFree(hw);
   setMetric("gpu", hw.gpu_util == null ? null : fmt(hw.gpu_util), "%",
-            multi ? per((g) => (g.util == null ? "–" : `${fmt(g.util)}%`)) : st.gpu_name || (st.gpu_note ? "not available" : ""));
+            multi ? per((g) => (g.util == null ? "–" : `${fmt(g.util)}%`)) : st.gpu_name || "");
   spark("sp-gpu", h.gpu_util, 100);
   setMetric("vram", hw.gpu_mem_used == null ? null : gb(hw.gpu_mem_used), hw.gpu_mem_total ? `/ ${gb(hw.gpu_mem_total, 0)} GB` : "GB",
             multi ? per((g) => (g.mem_used == null ? "–" : `${gb(g.mem_used)}/${gb(g.mem_total, 0)} GB`)) +
                     (tight == null ? "" : ` · ${gb(tight)} GB free left`)
-                  : eng.expert_slots ? `${fmt(eng.expert_slots)} experts cached` : (st.gpu_note ? "not available on Windows AMD yet" : ""));
+                  : "");
   spark("sp-vram", h.gpu_mem_used, hw.gpu_mem_total);
   setMetric("temp", hw.gpu_temp == null ? null : fmt(hw.gpu_temp), "°C",
             multi ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`)) : "");
@@ -407,7 +407,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, lastR
   setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : "");
   spark("sp-cpu", h.cpu, 100);
   if (hw.disk_read_mb == null) {
-    setMetric("disk", null, "", st.psutil ? "" : "needs psutil (setup installs it)");
+    setMetric("disk", null, "", "no disk counters");
   } else {
     const big = hw.disk_read_mb >= 1000;
     setMetric("disk", big ? fmt(hw.disk_read_mb / 1024, 2) : fmt(hw.disk_read_mb, hw.disk_read_mb < 10 ? 1 : 0), big ? "GB/s" : "MB/s",
@@ -509,7 +509,7 @@ function renderAbout(eng, hw, st) {
     ["Experimental speed projection", projectionText(eng.cvec)],
   ]);
   facts($("facts-hw"), [
-    ["GPU", st.gpu_name ? `${st.gpu_name}${hw.gpu_mem_total ? `, ${gb(hw.gpu_mem_total, 0)} GB` : ""}` : (st.gpu_note || "not readable (NVML)")],
+    ["GPU", st.gpu_name ? `${st.gpu_name}${hw.gpu_mem_total ? `, ${gb(hw.gpu_mem_total, 0)} GB` : ""}` : "not readable (NVML)"],
     ["CPU", st.cpu_name ? `${st.cpu_name}${st.threads ? `, ${st.threads} threads` : ""}` : null],
     ["RAM", hw.ram_total ? `${gb(hw.ram_total, 0)} GB` : null],
   ]);

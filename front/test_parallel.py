@@ -17,7 +17,6 @@ from unittest import mock
 
 from front.frontend import ChatTemplate
 from front.server import PARALLEL_MAX, ByteTokenizer, Service, StrataEngine, engine_args, parallel_args, serve
-from strata_cli.client import Endpoint
 
 # The fake engine: one token every STEP seconds per active slot (a "window" serves every active slot at once);
 # GEN (solo) streams T lines; BGEN reads the prompt (one T line, DONE), answers BADM and continues in the slot.
@@ -42,9 +41,6 @@ def reader():
 threading.Thread(target=reader, daemon=True).start()
 print("INFO engine=0.1.39" + (f" batch_slots={fit}" if fit >= 2 else "") +
       (" slot_cache=1" if "--slotcache" in args else "") + (f" batch_groups={groups}" if groups > 1 else ""), flush=True)
-if "--fake-stage-plan" in args:
-    print("strata serve: layer split: layers 0-11 (CUDA0), 12-23 (CUDA1), 24-35 (CUDA2), "
-          "36-47 (CUDA3), one hand-off per window", file=sys.stderr, flush=True)
 print("READY 4096 stop", flush=True)
 LONG = list(b"LONGREPLY")
 def continued(ids):        # (the whole reply, how much of it the prompt already ends with: a request continued)
@@ -64,7 +60,6 @@ def window():        # one batch window: every active slot one token
     if fail and len(active) >= 2:     # as the engine: the reason on stdout, then exit code 1
         print("ERR verify batch: layer 34 never rang (graph finished)", flush=True)
         sys.exit(1)
-    processed = len(active)
     for b in sorted(active):
         left, max_new, produced = active[b]
         if b in nf_slots and produced >= 2:
@@ -82,10 +77,6 @@ def window():        # one batch window: every active slot one token
             del active[b]
         else:
             active[b] = [left, max_new, produced]
-    if "--fake-batch-sample" in args and processed and not active:
-        print(f"BSTAT 1 {processed} {processed} 20", flush=True)
-    if "--fake-stage-sample" in args and processed and not active:
-        print("PSTAT 4 20000 16000 14000 12000 10000", flush=True)
 log = open(args[args.index("--log") + 1], "a") if "--log" in args else None
 PPK = int(args[args.index("--pp-every") + 1]) if "--pp-every" in args else 1
 REUSE = "--reuse" in args     # DONE's reused field as the engine gives it: a continued prompt is all held but its last
@@ -298,8 +289,7 @@ class PickSlot(unittest.TestCase):
 class FakeEngineCase(unittest.TestCase):
     """The real StrataEngine and Service over HTTP, the fake engine behind them."""
 
-    def start(self, slots, fit=None, slot_cache=False, fail=False, reuse=False, says_groups=0,
-              more=(), stage_plan=False, batch_sample=False, stage_sample=False):
+    def start(self, slots, fit=None, slot_cache=False, fail=False, reuse=False, says_groups=0, more=()):
         import front.server as server
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_strata.py"
@@ -311,13 +301,10 @@ class FakeEngineCase(unittest.TestCase):
         extra += ["--fail-window"] if fail else []
         extra += ["--reuse"] if reuse else []
         extra += ["--says-groups", str(says_groups)] if says_groups else []
-        extra += ["--fake-stage-plan"] if stage_plan else []
-        extra += ["--fake-batch-sample"] if batch_sample else []
-        extra += ["--fake-stage-sample"] if stage_sample else []
         extra += list(more)
         with mock.patch.object(server.subprocess, "Popen",
                                lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
-            self.engine = StrataEngine("strata", extra, log=str(Path(self.tmp.name) / "engine.log") if stage_plan else None)
+            self.engine = StrataEngine("strata", extra)
         tok = ByteTokenizer()
         self.svc = Service(self.engine, tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
         self.httpd = serve(self.svc, port=0)
@@ -383,7 +370,7 @@ class FakeEngineCase(unittest.TestCase):
 
 
 class ParallelService(FakeEngineCase):
-    """The real StrataEngine and Service over HTTP, the fake engine behind them: slots, queues, telemetry.
+    """The real StrataEngine and Service over HTTP, the fake engine behind them: slots and queues.
     The yielding, restart and failure tests are in front/test_parallel_yield.py (this file alone ran past 100 s)."""
 
     def test_bgen_refused_by_the_engine_is_retried_not_a_400(self):
@@ -415,138 +402,10 @@ class ParallelService(FakeEngineCase):
         self.assertEqual(self.engine.batch, 2)
         self.assertEqual(self.get("/v1/status")["concurrency"]["serving"], 2)
 
-    def test_admission_cap_uses_effective_slots_and_rejects_before_stream(self):
-        self.start(4, fit=2)
-        self.svc.max_queue = 1
-        self.assertEqual(self.svc.admission_limit(), 3)
-        self.assertTrue(all(self.svc.reserve_inference() for _ in range(3)))
-        cases = (
-            ("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "stream": True}),
-            ("/v1/messages", {"model": "m", "max_tokens": 8,
-                              "messages": [{"role": "user", "content": "hi"}], "stream": True}),
-            ("/v1/responses", {"model": "m", "input": "hi", "stream": True}),
-        )
-        try:
-            for path, body in cases:
-                req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
-                                             headers={"Content-Type": "application/json"})
-                with self.assertRaises(urllib.error.HTTPError) as caught:
-                    urllib.request.urlopen(req, timeout=10)
-                err = caught.exception
-                self.assertEqual(err.code, 429)
-                self.assertEqual(err.headers.get("Retry-After"), "1")
-                self.assertIn("admission_full", err.read().decode())
-            snapshot = self.get("/v1/telemetry")["work"]
-            self.assertEqual((snapshot["admission_reserved"], snapshot["admission_limit"],
-                              snapshot["max_queue"], snapshot["admission_rejected"]), (3, 3, 1, 3))
-        finally:
-            for _ in range(3):
-                self.svc.release_inference()
-        self.assertEqual(self.chat("capacity freed")["choices"][0]["message"]["content"], "ok, done.")
-        self.assertEqual(self.get("/v1/telemetry")["work"]["admission_reserved"], 0)
 
-    def test_queue_timeout_serial_fifo_returns_429_and_recovers(self):
-        self.start(1)
-        self.svc.queue_timeout_s = 0.12
-        self.svc.max_queue = 1
-        self.svc.fifo.acquire()
-        try:
-            with self.assertRaises(urllib.error.HTTPError) as caught:
-                self.chat("waiting for serial turn")
-            self.assertEqual(caught.exception.code, 429)
-            self.assertEqual(caught.exception.headers.get("Retry-After"), "1")
-            self.assertEqual(json.loads(caught.exception.read())["error"]["code"], "queue_wait_timeout")
-            work = self.get("/v1/telemetry")["work"]
-            self.assertEqual((work["queue_timeout_s"], work["queue_timeouts"], work["queued"]),
-                             (0.12, 1, 0))
-        finally:
-            self.svc.fifo.release()
-        self.assertEqual(self.chat("next turn")["choices"][0]["message"]["content"], "ok, done.")
-        self.assertEqual(self.get("/v1/telemetry")["work"]["admission_reserved"], 0)
 
-    def test_queue_timeout_parallel_control_and_stream_formats(self):
-        self.start(2)
-        self.svc.queue_timeout_s = 0.12
-        self.svc.max_queue = 1
-        self.engine.ctl.acquire()
-        cases = (
-            ("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}, "data: "),
-            ("/v1/messages", {"model": "m", "max_tokens": 8,
-                              "messages": [{"role": "user", "content": "hi"}]}, "event: error"),
-            ("/v1/responses", {"model": "m", "input": "hi"}, "event: response.failed"),
-        )
-        try:
-            for path, body, marker in cases:
-                for stream in (False, True):
-                    req = urllib.request.Request(self.base + path,
-                                                 data=json.dumps({**body, "stream": stream}).encode(),
-                                                 headers={"Content-Type": "application/json"})
-                    if stream:
-                        with urllib.request.urlopen(req, timeout=10) as response:
-                            data = response.read().decode()
-                        self.assertIn(marker, data)
-                        self.assertIn("queue_wait_timeout", data)
-                    else:
-                        with self.assertRaises(urllib.error.HTTPError) as caught:
-                            urllib.request.urlopen(req, timeout=10)
-                        self.assertEqual(caught.exception.code, 429)
-                        self.assertIn("queue_wait_timeout", caught.exception.read().decode())
-            work = self.get("/v1/telemetry")["work"]
-            self.assertEqual(work["queue_timeouts"], 6)
-            self.assertEqual((work["admission_reserved"], work["waiting"]), (0, 0))
-        finally:
-            self.engine.ctl.release()
-        self.assertEqual(self.chat("healthy")["choices"][0]["message"]["content"], "ok, done.")
 
-    def test_queue_timeout_parallel_slot_wait_releases_control(self):
-        self.start(2)
-        self.svc.queue_timeout_s = 0.12
-        with self.engine.slot_cv:
-            self.engine.slot_busy[:] = [True, True]
-        try:
-            with self.assertRaises(urllib.error.HTTPError) as caught:
-                self.chat("waiting for a batch slot")
-            self.assertEqual(caught.exception.code, 429)
-            self.assertIn("queue_wait_timeout", caught.exception.read().decode())
-            self.assertFalse(self.engine.ctl.locked())
-            self.assertEqual(self.engine.waiting, 0)
-        finally:
-            with self.engine.slot_cv:
-                self.engine.slot_busy[:] = [False, False]
-                self.engine.slot_cv.notify_all()
-        self.assertEqual(self.chat("slot freed")["choices"][0]["message"]["content"], "ok, done.")
 
-    def test_telemetry_keeps_engine_waiting_age_visible(self):
-        self.start(2)
-        self.svc.max_queue = 1
-        self.svc.queue_timeout_s = 0.5
-        self.engine.ctl.acquire()
-        outcome = []
-        def request():
-            try:
-                self.chat("waiting")
-            except urllib.error.HTTPError as error:
-                outcome.append(error.code)
-                error.read()
-        worker = threading.Thread(target=request)
-        try:
-            worker.start()
-            cutoff = time.monotonic() + 2
-            while time.monotonic() < cutoff:
-                work = self.get("/v1/telemetry")["work"]
-                if any(row["state"] == "waiting" for row in work["requests"]):
-                    break
-                time.sleep(0.01)
-            else:
-                self.fail("engine wait was not visible in telemetry")
-            time.sleep(0.04)
-            work = self.get("/v1/telemetry")["work"]
-            self.assertGreater(work["oldest_queue_s"], 0.03)
-            self.assertTrue(any(row["state"] == "waiting" for row in work["requests"]))
-        finally:
-            self.engine.ctl.release()
-            worker.join(timeout=3)
-        self.assertEqual(outcome, [])
 
     def test_batch_groups_auto_follows_the_engine(self):
         """--batch-groups auto: the engine picks the groups and says so (INFO batch_groups=G); the server spreads the
@@ -556,8 +415,6 @@ class ParallelService(FakeEngineCase):
         self.assertEqual((e.batch, e.slot_groups), (8, 4))
         self.assertEqual(e.slot_group, [0, 0, 1, 1, 2, 2, 3, 3])
         self.assertEqual(e.slot_order[:4], [0, 2, 4, 6])
-        telemetry = self.get("/v1/telemetry")
-        self.assertEqual([s["group"] for s in telemetry["work"]["slots"]], [0, 0, 1, 1, 2, 2, 3, 3])
         self.tearDown(); self.httpd = self.engine = self.tmp = None
         self.start(8, more=["--batch-groups", "auto"])          # an engine that reports none: one group
         self.assertEqual(self.engine.slot_groups, 1)
@@ -571,79 +428,8 @@ class ParallelService(FakeEngineCase):
         self.start(8, says_groups=4, more=["--batch-groups", "1"])   # the opt-out
         self.assertEqual(self.engine.slot_groups, 1)
 
-    def test_engine_log_resolves_four_stage_layer_and_device_mapping(self):
-        self.start(8, says_groups=4, stage_plan=True)
-        self.svc.terminal_visibility_order = [2, 0, 3, 1]
-        self.svc.gpu_indices = [2, 0, 3, 1]
-        telemetry = self.get("/v1/telemetry")
-        topology = telemetry["topology"]
-        self.assertEqual(topology["source"], "engine_start_log")
-        self.assertTrue(topology["resolved"])
-        self.assertEqual(telemetry["quality"]["placement"], "reported")
-        self.assertEqual([(row["stage"], row["device_index"], row["layer_start"], row["layer_end"])
-                          for row in topology["stages"]],
-                         [(0, 2, 0, 11), (1, 0, 12, 23), (2, 3, 24, 35), (3, 1, 36, 47)])
-        clean = Endpoint(self.base).snapshot()
-        self.assertEqual(clean["topology"]["stages"], topology["stages"])
-        self.svc.terminal_visibility_order = []
-        partial = self.get("/v1/telemetry")
-        self.assertFalse(partial["topology"]["resolved"])
-        self.assertEqual(len(partial["topology"]["stages"]), 4)
-        self.assertIsNone(partial["topology"]["stages"][0]["device_index"])
-        self.assertEqual(partial["quality"]["placement"], "partial")
-        self.engine.unload()
-        unloaded = self.get("/v1/telemetry")["topology"]
-        self.assertFalse(unloaded["resolved"])
-        self.assertEqual(unloaded["stages"], [])
 
-    def test_engine_batch_window_sample_reaches_telemetry_without_entering_reply(self):
-        self.start(2, batch_sample=True)
-        replies = self.race("first LONGREPLY", "second LONGREPLY", delay=0.05, max_tokens=64)
-        self.assertTrue(all("ok, " in reply for reply, _ in replies.values()))
-        self.assertTrue(any(line.startswith("BGEN") for line in self.log.read_text().splitlines()))
-        deadline = time.monotonic() + 2
-        while True:
-            telemetry = self.get("/v1/telemetry")
-            if telemetry["quality"]["batch_window_rows"] == "measured":
-                break
-            if time.monotonic() >= deadline:
-                self.fail("fake engine's BSTAT sample did not reach telemetry")
-            time.sleep(0.02)
-        work = telemetry["work"]
-        self.assertGreaterEqual(work["effective_rows_window"], 1.0)
-        self.assertLessEqual(work["effective_rows_window"], 2.0)
-        self.assertEqual(work["batch_active_rows_window"], work["effective_rows_window"])
-        self.assertEqual(work["batch_sample_windows"], 1)
-        self.assertEqual(work["batch_sample_span_s"], 0.02)
-        self.assertGreaterEqual(work["batch_sample_age_s"], 0)
-        clean = Endpoint(self.base).snapshot()
-        self.assertEqual(clean["quality"]["batch_window_rows"], "measured")
-        self.assertGreaterEqual(clean["work"]["batch_sample_rows"], 1)
-        self.engine.unload()
-        unloaded = self.get("/v1/telemetry")
-        self.assertIsNone(unloaded["work"]["effective_rows_window"])
-        self.assertEqual(unloaded["quality"]["batch_window_rows"], "unavailable")
 
-    def test_pipeline_stage_host_spans_reach_telemetry_without_entering_reply(self):
-        self.start(2, says_groups=2, stage_plan=True, stage_sample=True)
-        replies = self.race("first LONGREPLY", "second LONGREPLY", delay=0.05, max_tokens=64)
-        self.assertTrue(all("ok, " in reply for reply, _ in replies.values()))
-        deadline = time.monotonic() + 2
-        while True:
-            telemetry = self.get("/v1/telemetry")
-            if telemetry["quality"].get("stage_in_flight_source") == "engine_pstat_host_span":
-                break
-            if time.monotonic() >= deadline:
-                self.fail("fake engine's PSTAT sample did not reach telemetry")
-            time.sleep(0.02)
-        self.assertEqual(telemetry["work"]["stage_in_flight_us"], [16000, 14000, 12000, 10000])
-        clean = Endpoint(self.base).snapshot()
-        self.assertEqual(clean["quality"]["stage_in_flight"], "measured_host_span")
-        self.assertEqual([row["percent"] for row in clean["work"]["stage_in_flight"]],
-                         [80.0, 70.0, 60.0, 50.0])
-        self.engine.unload()
-        unloaded = self.get("/v1/telemetry")
-        self.assertNotIn("stage_in_flight_us", unloaded["work"])
 
     def test_a_burst_of_connections_is_not_reset(self):
         """30-40 clients at once got "connection reset by peer" with the listen backlog of 5 (4 x R9700 burst): the
@@ -685,7 +471,7 @@ class ParallelService(FakeEngineCase):
         # the first one decodes long enough for the others to arrive while it runs (also on a busy PC)
         texts = ["first question LONGREPLY", "second question, longer", "a third one waits for a slot"]
         reply = {t: "ok, " + "la " * 15 + "done." if "LONGREPLY" in t else "ok, done." for t in texts}
-        out, errors, seen, terminal_seen = {}, [], [], []
+        out, errors, seen = {}, [], []
 
         def go(t):
             try:
@@ -701,7 +487,6 @@ class ParallelService(FakeEngineCase):
         while any(th.is_alive() for th in threads) and time.time() < deadline:
             m = self.get("/metrics")["live"]
             seen.append(m)
-            terminal_seen.append(self.get("/v1/telemetry"))
             time.sleep(0.01)
         for th in threads:
             th.join(30)
@@ -711,15 +496,7 @@ class ParallelService(FakeEngineCase):
         # the slots were reported, and a request was admitted while another decoded in a slot (the fake logs how many
         # slots were active at each admission)
         self.assertTrue(any(m.get("parallel") == 2 and len(m.get("slots", [])) == 2 for m in seen))
-        self.assertTrue(any(t["work"]["requests"] for t in terminal_seen))
-        self.assertTrue(any(s.get("request_id") for t in terminal_seen for s in t["work"]["slots"]))
-        self.assertTrue(any(isinstance(r.get("first_engine_token_s"), (int, float)) and
-                            r["first_engine_token_s"] > 0
-                            for t in terminal_seen for r in t["work"]["requests"]
-                            if r["state"] == "decoding"), "live per-request first engine token was not observed")
-        for t in terminal_seen:
-            self.assertEqual(t["quality"]["request_correlation"], "reported")
-            self.assertNotIn("input", json.dumps(t))
+        self.assertTrue(any(s.get("request_id") for m in seen for s in m.get("slots", [])))
         admitted = [int(x.split()[3]) for x in self.log.read_text().splitlines() if x.startswith("BGEN")]
         self.assertIn(1, admitted)
         # every request recorded its own row; nothing is left running
@@ -731,9 +508,6 @@ class ParallelService(FakeEngineCase):
                          sorted(len(reply[t]) + 1 for t in texts))
         self.assertTrue(all(isinstance(r.get("first_engine_token_s"), (int, float)) and
                             r["first_engine_token_s"] > 0 for r in self.svc.history))
-        clean = Endpoint(self.base).snapshot()
-        self.assertTrue(all(isinstance(r.get("first_engine_token_s"), (int, float))
-                            for r in clean["recent"][:3]))
         # never more than two in the slots at once (the fake logs how many were active at each admission)
         active = [int(x.split()[3]) for x in self.log.read_text().splitlines() if x.startswith("BGEN")]
         self.assertTrue(all(a <= 1 for a in active), active)

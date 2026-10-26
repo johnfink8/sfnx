@@ -1,11 +1,9 @@
-"""front/lifeline.py: a process Strata starts ends when the process that started it ends, however that ends.
+"""front/lifeline.py: a process the server starts ends when the server ends, however that ends.
 
     python -m unittest front.test_lifeline
 
 Each case runs a small "server" process (a fresh interpreter) that starts a sleeping child through
-`lifeline.popen`, then ends that server the hard way (kill -9 / TerminateProcess), and checks that the child
-is gone. The mechanism under test is Windows' job object, Linux's PR_SET_PDEATHSIG, or the portable watcher
-(forced with STRATA_LIFELINE=watcher so it is proven on every POSIX box, not only on macOS).
+`lifeline.popen`, then ends that server the hard way (kill -9), and checks that the child is gone (PR_SET_PDEATHSIG).
 """
 import json
 import os
@@ -19,7 +17,6 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-POSIX = os.name == "posix"
 
 SERVER = textwrap.dedent("""
     import os, sys, time, threading, subprocess
@@ -27,7 +24,6 @@ SERVER = textwrap.dedent("""
     from front import lifeline
     mode = sys.argv[1]
     sleeper = [sys.executable, "-c", "import time; time.sleep(600)"]
-    out = {{"mechanism": lifeline.mechanism()}}
     if mode == "thread":                       # started on a request thread that ends at once
         box = []
         t = threading.Thread(target=lambda: box.append(lifeline.popen(sleeper, "engine")))
@@ -35,9 +31,7 @@ SERVER = textwrap.dedent("""
         child = box[0]
     else:
         child = lifeline.popen(sleeper, "engine")
-    out["child"] = child.pid
-    out["server"] = os.getpid()
-    print(__import__("json").dumps(out), flush=True)
+    print(__import__("json").dumps({{"child": child.pid, "server": os.getpid()}}), flush=True)
     if mode == "exit":                         # ends normally, the child still running
         sys.exit(0)
     time.sleep(600)
@@ -45,16 +39,19 @@ SERVER = textwrap.dedent("""
 
 
 def alive(pid: int) -> bool:
-    from strata_control import procs
-    return procs.start_token(pid) is not None
+    """The process runs (a zombie, ended but not yet reaped by its parent, does not count)."""
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except OSError:
+        return False
+    return state != "Z"
 
 
 class Lifeline(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="strata-lifeline-")
+        self.temp = tempfile.TemporaryDirectory(prefix="lifeline-")
         self.addCleanup(self.temp.cleanup)
-        self.env = {**os.environ, "LOCALAPPDATA": self.temp.name, "XDG_STATE_HOME": self.temp.name,
-                    "PYTHONPATH": str(ROOT)}
+        self.env = {**os.environ, "PYTHONPATH": str(ROOT)}
         self.script = Path(self.temp.name) / "server.py"
         self.script.write_text(SERVER.format(root=str(ROOT)), encoding="utf-8")
         self.spawned = []
@@ -68,9 +65,9 @@ class Lifeline(unittest.TestCase):
                 except OSError:
                     pass
 
-    def launch(self, mode, **env):
+    def launch(self, mode):
         proc = subprocess.Popen([sys.executable, str(self.script), mode], stdout=subprocess.PIPE, text=True,
-                                env={**self.env, **env})
+                                env=self.env)
         info = json.loads(proc.stdout.readline())
         self.spawned.append(info["child"])
         self.addCleanup(lambda: proc.poll() is None and proc.kill())
@@ -85,30 +82,17 @@ class Lifeline(unittest.TestCase):
         return not alive(pid)
 
     def hard_kill(self, proc):
-        if POSIX:
-            os.kill(proc.pid, signal.SIGKILL)
-        else:
-            proc.kill()
+        os.kill(proc.pid, signal.SIGKILL)
         proc.wait(timeout=10)
 
-    def _killed_parent_takes_the_child(self, **env):
-        proc, info = self.launch("sleep", **env)
+    def test_a_child_ends_when_its_server_is_killed(self):
+        proc, info = self.launch("sleep")
         self.assertTrue(alive(info["child"]))
         self.hard_kill(proc)
-        self.assertTrue(self.wait_gone(info["child"]), f"the child outlived a killed server ({info['mechanism']})")
-        return info["mechanism"]
+        self.assertTrue(self.wait_gone(info["child"]), "the child outlived a killed server")
 
-    def test_a_child_ends_when_its_server_is_killed(self):
-        self.assertIn(self._killed_parent_takes_the_child(), ("job", "pdeathsig", "watcher"))
-
-    @unittest.skipUnless(POSIX, "the portable watcher is the POSIX path")
-    def test_the_portable_watcher_ends_the_child_when_the_server_is_killed(self):
-        self.assertEqual(self._killed_parent_takes_the_child(STRATA_LIFELINE="watcher"), "watcher")
-
-    @unittest.skipUnless(sys.platform.startswith("linux"), "PR_SET_PDEATHSIG is Linux")
     def test_a_child_started_on_a_request_thread_outlives_that_thread_but_not_the_server(self):
         proc, info = self.launch("thread")
-        self.assertEqual(info["mechanism"], "pdeathsig")
         time.sleep(1.0)
         self.assertTrue(alive(info["child"]), "the request thread ended and took the child with it")
         self.hard_kill(proc)
@@ -119,28 +103,10 @@ class Lifeline(unittest.TestCase):
         proc.wait(timeout=15)
         self.assertTrue(self.wait_gone(info["child"]), "end_children at exit must stop what is still running")
 
-    def test_the_child_is_recorded_while_it_runs_and_forgotten_after(self):
-        from strata_control import procs
-        proc, info = self.launch("sleep")
-        base = Path(self.temp.name) / "Strata" / "procs" if not POSIX else Path(self.temp.name) / "strata" / "procs"
-        record = base / f"{info['child']}.json"
-        deadline = time.monotonic() + 5
-        while not record.exists() and time.monotonic() < deadline:
-            time.sleep(0.05)
-        data = json.loads(record.read_text(encoding="utf-8"))
-        self.assertEqual((data["pid"], data["role"], data["parent"]["pid"]), (info["child"], "engine", info["server"]))
-        self.assertEqual(data["token"], procs.start_token(info["child"]))
-        self.hard_kill(proc)
-        self.assertTrue(self.wait_gone(info["child"]))
-
-
-if __name__ == "__main__":
-    unittest.main()
-
 
 STUBBORN = (
     "import signal, sys, time\n"
-    "if hasattr(signal, 'SIGTERM'): signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
     "print('READY 4096 stop', flush=True)\n"
     "time.sleep(600)\n"          # never reads QUIT, never answers STOP, ignores SIGTERM
 )
@@ -154,7 +120,7 @@ class HardFallback(unittest.TestCase):
         from front import server
         engine = server.StrataEngine("missing-executable", [], lazy=True)
         engine.proc = subprocess.Popen([sys.executable, "-c", STUBBORN], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                       text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                                       text=True)
         engine.proc.stdout.readline()
         victim = engine.proc
         t0 = time.monotonic()
@@ -164,5 +130,8 @@ class HardFallback(unittest.TestCase):
         self.assertLess(time.monotonic() - t0, 12)
         self.assertIsNotNone(victim.poll(), "the engine is still running after close()")
         self.assertIsNone(engine.proc)
-        if os.name == "posix":
-            self.assertEqual(victim.returncode, -signal.SIGKILL, "it ignored SIGTERM, so only the kill ended it")
+        self.assertEqual(victim.returncode, -signal.SIGKILL, "it ignored SIGTERM, so only the kill ended it")
+
+
+if __name__ == "__main__":
+    unittest.main()

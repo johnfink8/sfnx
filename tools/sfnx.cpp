@@ -86,7 +86,7 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--lookup") a.lookup = std::stoi(val());
         else if (k == "--conversation-cache-mib") a.cache_mib = std::stol(val());
         else if (k == "--batch") a.batch = std::stoi(val());
-        else if (k == "--layer-split") val();   // the front end adds it for three cards; sFNX splits every layer across them
+        else if (k == "--layer-split") val();   // Strata's layer split; sFNX splits every layer across the cards
         else if (k == "--vision") a.vision = true;
         else throw std::runtime_error("unknown argument " + k);
     }
