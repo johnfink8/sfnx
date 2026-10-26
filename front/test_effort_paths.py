@@ -168,7 +168,6 @@ class EffortPaths(unittest.TestCase):
             with self.subTest(given=given):
                 self.assertEqual(self.level("/v1/chat/completions", {"messages": history, "reasoning_effort": given}), want)
 
-
     def test_the_agents_request_shape_with_thinking_off(self):
         """The app's agent (Harness) sends no reasoning_effort when Thinking is Off, only chat_template_kwargs {enable_thinking: false}, with tools, a
         system message, earlier reasoning and a token cap. That one flag must reach the template as the empty think block, whatever else is in the

@@ -279,7 +279,7 @@ class FakeEngineCase(unittest.TestCase):
             self.httpd.shutdown()
             self.httpd.server_close()
         if getattr(self, "engine", None):
-            self.engine.unload()
+            self.engine.close()
         if getattr(self, "tmp", None):
             self.tmp.cleanup()
 

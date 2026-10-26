@@ -17,7 +17,7 @@ def events_without_ids(events):
 
 
 class CallScanTests(unittest.TestCase):
-    def test_chunk_boundaries_literal_tags_multiple_calls_and_recovery(self):
+    def test_chunk_boundaries_literal_tags_and_multiple_calls(self):
         def call(value):
             return "<tool_call><function=write><parameter=text>" + value + "</parameter></function></tool_call>"
         bodies = [call("ordinary"), call("literal </tool_call> text </function> here"),
@@ -29,11 +29,11 @@ class CallScanTests(unittest.TestCase):
                   "<parameter=write><parameter=text>b</parameter></function></tool_call>"]
         tools = [{"name": "write", "parameters": {"properties": {"text": {"type": "string"}}}}]
         rng = random.Random(1030)
-        for text, stream, recover in itertools.product(bodies, (False, True), (False, True)):
+        for text, stream in itertools.product(bodies, (False, True)):
             # Every fixed chunk width, plus random partitions; compare after EACH feed.
             for width in range(1, 16):
-                a = frontend.OutputParser(thinking=False, tools=tools, stream_tools=stream, recover=recover)
-                b = ReferenceParser(thinking=False, tools=tools, stream_tools=stream, recover=recover)
+                a = frontend.OutputParser(thinking=False, tools=tools, stream_tools=stream)
+                b = ReferenceParser(thinking=False, tools=tools, stream_tools=stream)
                 pos = 0
                 while pos < len(text):
                     end = pos + (rng.randint(1, 20) if width == 15 else width)

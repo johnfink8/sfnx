@@ -14,18 +14,20 @@ from front.server import ByteTokenizer, EngineDied, MockEngine, Service, serve
 
 
 class ReloadableEngine(MockEngine):
+    """An engine that can stop (close) and be started again (restart), as one that died is."""
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.running, self.unloaded = True, False
+        self.running = True
 
     def alive(self):
         return self.running
 
-    def unload(self):
-        self.running, self.unloaded = False, True
+    def close(self):
+        self.running = False
 
     def restart(self):
-        self.running, self.unloaded = True, False
+        self.running = True
 
 
 class MonitorOff(unittest.TestCase):
@@ -194,7 +196,7 @@ class Monitor(unittest.TestCase):
             self.assertIsNone(json.loads(r.read())["requests"][0]["record"])
 
     def test_queue_wait_and_loading_are_attributed_separately(self):
-        self.engine.unload()
+        self.engine.close()
         entered, release = threading.Event(), threading.Event()
         original = self.engine.restart
         def restart():

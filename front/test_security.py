@@ -52,8 +52,8 @@ class HostNames(unittest.TestCase):
             self.assertIn(socket.gethostname().lower() + ".local", names)
             self.assertIn("192.168.1.20", names)
             self.assertIn("10.0.0.7", host_names_for("10.0.0.7"))
-            names = host_names_for("127.0.0.1", ["strata.example.com", "*"], ["https://chat.example.net"])
-            self.assertTrue({"strata.example.com", "chat.example.net"} <= names)
+            names = host_names_for("127.0.0.1", ["sfnx.example.com", "*"])
+            self.assertIn("sfnx.example.com", names)
             self.assertNotIn("*", names)
 
 
@@ -76,13 +76,11 @@ class HostCheck(unittest.TestCase):
 class OriginCheck(unittest.TestCase):
     def test_accepted(self):
         names = LOCAL | {"box"}
-        self.assertTrue(origin_allowed("http://127.0.0.1:8095", "127.0.0.1:8095", names))      # Strata's own page
+        self.assertTrue(origin_allowed("http://127.0.0.1:8095", "127.0.0.1:8095", names))      # the server's own page
         self.assertTrue(origin_allowed("http://192.168.1.20:8095", "192.168.1.20:8095", names))  # ... by LAN IP
         self.assertTrue(origin_allowed("http://localhost:3000", "127.0.0.1:8095", names))      # a local app
         self.assertTrue(origin_allowed("http://[::1]:3000/", "127.0.0.1:8095", names))
         self.assertTrue(origin_allowed("https://box", "127.0.0.1:8095", names))
-        self.assertTrue(origin_allowed("https://chat.example.com", "x", names, ["https://chat.example.com"]))
-        self.assertTrue(origin_allowed("https://any.example.com", "x", names, ["*"]))           # cors_origins ["*"]
         # browser extensions and desktop apps: no web site can send another scheme than http(s) (or "null")
         for origin in ("chrome-extension://abcdef", "moz-extension://1234-5678", "app://."):
             self.assertTrue(origin_allowed(origin, "127.0.0.1:8095", names), origin)
@@ -91,7 +89,7 @@ class OriginCheck(unittest.TestCase):
         names = LOCAL | {"box"}
         for origin in ("http://evil.example.com", "http://1.2.3.4", "http://192.168.1.99:8095", "null", "",
                        "http://localhost.evil.com", "https://box.evil.com", "://x"):
-            self.assertFalse(origin_allowed(origin, "127.0.0.1:8095", names, ["https://chat.example.com"]), origin)
+            self.assertFalse(origin_allowed(origin, "127.0.0.1:8095", names), origin)
 
 
 class OverHttp(unittest.TestCase):
@@ -188,10 +186,6 @@ class OverHttp(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertNotIn("refused", log)
 
-    def test_a_trusted_origin_s_host_is_allowed(self):
-        self.start(trusted_origins=["https://strata.example.com"])
-        self.assertEqual(self.req("GET", "/status", host="strata.example.com")[0], 200)
-
     # --- Origin on /v1 without an API key
     def test_curl_and_sdks_without_origin(self):
         self.start()
@@ -223,12 +217,12 @@ class OverHttp(unittest.TestCase):
         self.assertEqual(self.req("POST", "/v1/chat/completions", self.chat_body(),
                                   {"Content-Type": "text/plain", "Origin": f"http://127.0.0.1:{self.port}"})[0], 415)
 
-    def test_configured_origins_pass(self):
-        self.start(cors_origins=["https://chat.example.com"], trusted_origins=["https://strata.example.com"],
-                   allowed_hosts=["webui.lan"])
-        for origin in ("https://chat.example.com", "https://strata.example.com", "http://webui.lan:3000"):
-            self.assertEqual(self.req("POST", "/v1/chat/completions", self.chat_body(),
-                                      {"Content-Type": "application/json", "Origin": origin})[0], 200, origin)
+    def test_pages_on_allowed_hosts_pass(self):
+        self.start(allowed_hosts=["webui.lan"])
+        self.assertEqual(self.req("POST", "/v1/chat/completions", self.chat_body(),
+                                  {"Content-Type": "application/json", "Origin": "http://webui.lan:3000"})[0], 200)
+        self.assertEqual(self.req("POST", "/v1/chat/completions", self.chat_body(),
+                                  {"Content-Type": "application/json", "Origin": "https://chat.example.com"})[0], 403)
 
     def test_with_a_key_the_key_decides(self):
         self.start(api_key="s3cret")
@@ -236,44 +230,6 @@ class OverHttp(unittest.TestCase):
         self.assertEqual(self.req("POST", "/v1/chat/completions", self.chat_body(), headers)[0], 401)
         self.assertEqual(self.req("POST", "/v1/chat/completions", self.chat_body(),
                                   {**headers, "Authorization": "Bearer s3cret"})[0], 200)
-
-    # --- /unload and /load
-    def test_control_body_arrives_before_the_operation_and_reply(self):
-        self.start()
-        for body, expected in ((b"{}", 200), (b"{", 400)):
-            c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-            try:
-                with mock.patch.object(self.svc, "unload", return_value="unloaded") as unload:
-                    c.putrequest("POST", "/unload")
-                    c.putheader("Content-Type", "application/json")
-                    c.putheader("Content-Length", "2")
-                    c.endheaders()
-                    c.sock.settimeout(0.1)
-                    with self.assertRaises(socket.timeout):
-                        c.sock.recv(1)
-                    unload.assert_not_called()
-                    c.sock.settimeout(5)
-                    c.send(body)
-                    if len(body) < 2:
-                        c.sock.shutdown(socket.SHUT_WR)
-                    r = c.getresponse()
-                    self.assertEqual(r.status, expected)
-                    r.read()
-                    self.assertEqual(unload.call_count, int(expected == 200))
-            finally:
-                c.close()
-
-    def test_unload_and_load_need_json_from_the_own_page(self):
-        self.start()
-        form = {"Content-Type": "application/x-www-form-urlencoded"}
-        for path in ("/unload", "/load"):
-            self.assertEqual(self.req("POST", path, b"a=1", form)[0], 415, path)
-            self.assertEqual(self.req("POST", path, b"", {})[0], 415, path)
-            self.assertEqual(self.req("POST", path, {}, {"Content-Type": "application/json",
-                                                         "Origin": "http://evil.example.com"})[0], 403, path)
-        self.assertEqual(self.req("POST", "/unload", {}, {"Content-Type": "application/json"})[0], 200)
-        self.assertEqual(self.req("POST", "/load", {}, {"Content-Type": "application/json",
-                                                        "Origin": f"http://127.0.0.1:{self.port}"})[0], 200)
 
 
 class NoApiKey(unittest.TestCase):
@@ -290,9 +246,6 @@ class NoApiKey(unittest.TestCase):
         from front.server import open_server_warning
         w = open_server_warning(8080)
         self.assertIn("anyone who can reach port 8080 can use the model", w)
-        self.assertNotIn("tools", w)
-        self.assertIn("and its tools", open_server_warning(8080, tools=True))
-        self.assertIn("public internet", open_server_warning(8080, public=True))
 
 
 if __name__ == "__main__":

@@ -73,8 +73,9 @@ class TrackTests(unittest.TestCase):
         self.assert_state(actual, expected)
         for parser in (actual, expected):
             saved = (parser.fence, parser.line, parser.ticks)
-            parser.buf = "\n```python\nignored"
-            parser._ok_at(len(parser.buf))
+            parser._track("\n```python\nignored")                 # a look ahead, then the snapshot put back
+            parser._opener_ok()
+            parser.fence, parser.line, parser.ticks = saved
             self.assertEqual((parser.fence, parser.line, parser.ticks), saved)
             parser._track("more text")
             self.assertEqual(saved[1] + "more text", parser.line)
@@ -85,8 +86,8 @@ class TrackTests(unittest.TestCase):
         text = ("prefix " * 1024 + "`<tool_call>`\n\n```xml\n" + "x" * 16384
                 + "<tool_call><function=quoted></function></tool_call>\n```\n"
                 + "<tool_call><function=write><parameter=text>ok</parameter></function></tool_call>\nDone")
-        for recover, stream in itertools.product((False, True), repeat=2):
-            kwargs = dict(thinking=False, tools=[{"name": "write"}], recover=recover, stream_tools=stream)
+        for stream in (False, True):
+            kwargs = dict(thinking=False, tools=[{"name": "write"}], stream_tools=stream)
             actual, expected = OutputParser(**kwargs), ReferenceParser(**kwargs)
             def normalized(events):
                 return [(e.kind, e.text, (e.call.name, e.call.arguments) if e.call else None) for e in events]

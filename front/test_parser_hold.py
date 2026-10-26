@@ -40,9 +40,9 @@ class HoldTests(unittest.TestCase):
                  "<tool_call><function=lookup><parameter=q>abc</parameter></function></tool_call>\nDone",
                  "<tool_call><function=lookup><parameter=q>abc</parameter></function></tool_call></think>Done"]
         rng = random.Random(1028)
-        for text, thinking, recover, stream_tools in itertools.product(texts, (False, True), (False, True), (False, True)):
+        for text, thinking, stream_tools in itertools.product(texts, (False, True), (False, True)):
             for _ in range(5):
-                args = dict(thinking=thinking, tools=[{"name": "lookup"}], recover=recover, stream_tools=stream_tools)
+                args = dict(thinking=thinking, tools=[{"name": "lookup"}], stream_tools=stream_tools)
                 actual, expected = OutputParser(**args), ReferenceParser(**args)
                 def normalized(events):
                     # Tool call IDs are deliberately random; compare their semantic contents.

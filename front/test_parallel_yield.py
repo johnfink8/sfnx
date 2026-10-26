@@ -2,7 +2,6 @@
 
 The same fake engine and helpers as front/test_parallel.py (FakeEngineCase); split out because the whole file took
 about two minutes in one piece."""
-import json
 import sys
 import threading
 import time
@@ -189,7 +188,6 @@ class ParallelServiceYield(tp.FakeEngineCase):
         self.assertIn("exited (code 1)", note)
         self.assertIn("verify batch: layer 34 never rang (graph finished)", note)
 
-
     def test_a_continued_request_reports_its_own_prompt_reuse(self):
         """A request STOPped on the solo path and continued in a slot (or back on the solo path) is sent again as its
         prompt + what it generated, and the engine holds all of that: the usage must still split the request's OWN
@@ -324,7 +322,7 @@ class ParallelServiceYield(tp.FakeEngineCase):
                                   lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw))
         patch.start()
         self.addCleanup(patch.stop)
-        self.engine.unload()
+        self.engine.close()
         self.svc.fifo.acquire()
         res = {}
         t = threading.Thread(target=lambda: res.setdefault("r", self.chat("reloads", max_tokens=16)))
@@ -344,8 +342,6 @@ class ParallelServiceYield(tp.FakeEngineCase):
         t.join(60)
         self.assertEqual(res["r"]["choices"][0]["message"]["content"], "ok, done.")
         self.assertEqual(self.get("/metrics")["live"]["queued"], 0)
-
-
 
 
 if __name__ == "__main__":

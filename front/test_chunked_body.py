@@ -143,11 +143,11 @@ class ChunkedBody(unittest.TestCase):
                 status, got = self.send(head, framed)
                 self.assertEqual((status, self.svc.shared), (200, {"temperature": 0.5}), got)
 
-    def test_a_chunked_control_body_is_consumed(self):
-        head = (b"/unload HTTP/1.1" + CRLF + b"Content-Type: application/json" + CRLF +
+    def test_a_chunked_settings_body_is_read(self):
+        head = (b"/settings HTTP/1.1" + CRLF + b"Content-Type: application/json" + CRLF +
                 b"Transfer-Encoding: chunked" + CRLF)
-        status, got = self.send(head, chunked(b"{}"))
-        self.assertIn(status, (200, 409), got)
+        status, got = self.send(head, chunked(b'{"defaults": {}}'))
+        self.assertEqual(status, 200, got)
 
 
 if __name__ == "__main__":

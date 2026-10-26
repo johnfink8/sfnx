@@ -22,7 +22,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from front.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
-from front.server import (ANSWER_RESERVE_MIN, CTX_SLACK, ByteTokenizer, EngineDied, GpuBusy, MockEngine,  # noqa: E402
+from front.server import (ANSWER_RESERVE_MIN, CTX_SLACK, ByteTokenizer, EngineDied, MockEngine,  # noqa: E402
                           Service, StrataEngine, api_key_of, engine_args, key_matches, prompt_tokens_seen,
                           request_timings, serve)
 from types import SimpleNamespace  # noqa: E402
@@ -978,133 +978,6 @@ class ToolCallTagInProse(unittest.TestCase):
                                  ([], "The format starts with <tool_call>"))
 
 
-class ToolCallRecovery(unittest.TestCase):
-    """Opt-in ("tool_call_recovery": true): the model sometimes writes a call in a form next to the template's.  These
-    shapes are from a corpus of 1,462 agent turns (Qwen3.8 under Claude Code, signalnine/q27): with the switch on, a
-    declared tool's call in one of them is the call; anything else stays content, verbatim."""
-    SCHEMA = ToolCallTerminators.SCHEMA
-    PARAMS = "<parameter=path>\na.md\n</parameter>\n<parameter=content>\nhi\n</parameter>\n</function>"
-    CALL = {"path": "a.md", "content": "hi"}
-    RECOVER = True
-
-    def parse(self, text, stream_tools, step):
-        from front.frontend import OutputParser
-        p = OutputParser(thinking=True, tools=self.SCHEMA, stream_tools=stream_tools, recover=self.RECOVER)
-        evs = []
-        for i in range(0, len(text), step):
-            evs += p.feed(text[i:i + step])
-        evs += p.finish()
-        calls = [(e.call.name, e.call.arguments) for e in evs if e.kind == "tool_call"]
-        if stream_tools:      # every announced call's streamed JSON is its final arguments
-            for c in [e for e in evs if e.kind == "tool_call"]:
-                streamed = "".join(e.text for e in evs if e.kind == "tool_args" and e.call is not None
-                                   and e.call.id == c.call.id)
-                if streamed:
-                    self.assertEqual(json.loads(streamed), c.call.arguments)
-        return calls, "".join(e.text for e in evs if e.kind == "content").strip()
-
-    def check(self, text, calls, content):
-        for stream_tools in (False, True):
-            for step in (1, 7, 10_000):
-                with self.subTest(stream_tools=stream_tools, step=step):
-                    self.assertEqual(self.parse("</think>\n\n" + text, stream_tools, step), (calls, content))
-
-    def test_parameter_as_the_opener(self):
-        # corpus 300dfba2 (x11): the tool's name written as a parameter tag
-        self.check(f"<tool_call>\n<parameter=write>\n{self.PARAMS}\n</tool_call>", [("write", self.CALL)], "")
-
-    def test_parameter_opener_that_is_not_a_tool_is_content(self):
-        text = "<tool_call>\n<parameter=path>\na.md\n</parameter>\n</function>\n</tool_call>"
-        self.check(text, [], text)
-
-    def test_json_in_the_wrapper(self):
-        # corpus 5e847539 (x6): the JSON form inside the XML wrapper
-        for key in ("arguments", "parameters"):
-            with self.subTest(key=key):
-                self.check('<tool_call>\n{"name": "write", "%s": {"path": "a.md", "content": "hi"}}\n</tool_call>'
-                           % key, [("write", self.CALL)], "")
-        self.check('<tool_call>\n{"name": "write", "arguments": "{\\"path\\": \\"a.md\\", \\"content\\": \\"hi\\"}"}'
-                   '\n</tool_call>', [("write", self.CALL)], "")
-
-    def test_json_of_an_unknown_tool_is_content(self):
-        text = '<tool_call>\n{"name": "format_disk", "arguments": {}}\n</tool_call>'
-        self.check(text, [], text)
-
-    def test_broken_json_is_content_not_an_error(self):
-        text = '<tool_call>\n{"name": "write", "arguments": {"path": \n</tool_call>'
-        self.check(text, [], text)
-
-    def test_json_never_closed_is_content(self):
-        text = '<tool_call>\n{"name": "write", "arguments": {"path": "a.md"}}'
-        self.check(text, [], text)
-
-    def test_bare_function_without_the_wrapper(self):
-        # corpus 395efd4c / 6e71eed4 (x5 each): <function=...> with no <tool_call> around it
-        self.check(f"Writing it now.\n\n<function=write>\n{self.PARAMS}", [("write", self.CALL)], "Writing it now.")
-        self.check(f"<function=write>\n{self.PARAMS}\n</tool_call>", [("write", self.CALL)], "")   # stray closer
-        self.check(f"<function=write>\n{self.PARAMS}\nDone.", [("write", self.CALL)], "Done.")
-
-    def test_two_calls_in_one_wrapper(self):
-        # corpus 0912870b / 51b155c9: a batch inside one <tool_call> - the second call's parameters were merged into
-        # the first (wrong arguments, one call); also with the second opened as <parameter=NAME> (03a8a851)
-        two = {"path": "b.md", "content": "yo"}
-        second = "<parameter=path>\nb.md\n</parameter>\n<parameter=content>\nyo\n</parameter>\n</function>"
-        for opener in ("<function=write>", "<parameter=write>"):
-            with self.subTest(opener=opener):
-                self.check(f"<tool_call>\n<function=write>\n{self.PARAMS}\n{opener}\n{second}\n</tool_call>",
-                           [("write", self.CALL), ("write", two)], "")
-
-    def test_bare_function_stays_text_where_it_is_not_a_call(self):
-        fenced = f"Example:\n```\n<function=write>\n{self.PARAMS}\n```"
-        self.check(fenced, [], fenced)
-        inline = "Call it as <function=write> with a path."
-        self.check(inline, [], inline)
-        unknown = "<function=format_disk>\n<parameter=x>\n1\n</parameter>\n</function>"
-        self.check(unknown, [], unknown)
-
-
-class ToolCallRecoveryOff(unittest.TestCase):
-    """Without the switch the parser returns what it always did for the same shapes (the default stays as it is)."""
-
-    def parse(self, text):
-        from front.frontend import OutputParser
-        p = OutputParser(thinking=True, tools=ToolCallRecovery.SCHEMA, stream_tools=True)
-        evs = p.feed("</think>\n\n" + text) + p.finish()
-        return ([e.call.name for e in evs if e.kind == "tool_call"],
-                "".join(e.text for e in evs if e.kind == "content").strip())
-
-    def test_drifted_forms_stay_text(self):
-        P = ToolCallRecovery.PARAMS
-        for text in (f"<tool_call>\n<parameter=write>\n{P}\n</tool_call>",
-                     '<tool_call>\n{"name": "write", "arguments": {"path": "a.md", "content": "hi"}}\n</tool_call>',
-                     f"<function=write>\n{P}"):
-            with self.subTest(text=text[:30]):
-                self.assertEqual(self.parse(text), ([], text))
-
-    def test_a_batch_is_one_call(self):
-        P = ToolCallRecovery.PARAMS
-        calls, _ = self.parse(f"<tool_call>\n<function=write>\n{P}\n<function=write>\n{P}\n</tool_call>")
-        self.assertEqual(calls, ["write"])
-
-
-class ToolCallRecoverySwitch(unittest.TestCase):
-    """The config's "tool_call_recovery" reaches the parser of every reply."""
-
-    def run_reply(self, on):
-        tok = ByteTokenizer()
-        script = "</think>\n\n<function=write>\n" + ToolCallRecovery.PARAMS
-        svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(ROOT / "front/chat_template.jinja"))
-        svc.tool_call_recovery = on
-        with contextlib.redirect_stdout(io.StringIO()):
-            evs = [x for kind, x in svc.run(tok.encode("hi"), True, ToolCallRecovery.SCHEMA, 3000, {},
-                                            threading.Event()) if kind == "event"]
-        return [e.call.arguments for e in evs if e.kind == "tool_call"]
-
-    def test_switch(self):
-        self.assertEqual(self.run_reply(False), [])
-        self.assertEqual(self.run_reply(True), [ToolCallRecovery.CALL])
-
-
 class UnfinishedToolCall(unittest.TestCase):
     """#211: a call the output ends inside is not reported as a whole one - its streamed JSON is not closed and the
     finish reason is not "tool_calls" / "tool_use" - so a client can tell it from a call to run."""
@@ -1777,75 +1650,6 @@ class DraftCounts(unittest.TestCase):
         self.assertEqual((m["totals"]["drafts_offered"], m["totals"]["drafts_accepted"]), (17, 10))
 
 
-class PrometheusMetrics(unittest.TestCase):
-    """GET /metrics/prometheus: the totals in Prometheus' text format, under llama-server's names."""
-
-    def test_totals(self):
-        tok = ByteTokenizer()
-        engine = DoneLineEngine(tok, "</think>\n\nok", max_context=CTX, done_lines=[
-            "DONE 4 20 400.0 200.0 stop 7 12 5",                # 5 of the prompt's tokens reused
-            "DONE 4 20 400.0 200.0 stop 3 5 0"])
-        svc = Service(engine, tok, ChatTemplate(ROOT / "front/chat_template.jinja"))
-        httpd = serve(svc, port=0)
-        base = f"http://127.0.0.1:{httpd.server_address[1]}"
-        try:
-            for _ in range(2):
-                body = json.dumps({"model": "m", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]})
-                with urllib.request.urlopen(urllib.request.Request(base + "/v1/chat/completions", data=body.encode(),
-                                                                   headers={"Content-Type": "application/json"}),
-                                            timeout=30) as r:
-                    self.assertEqual(r.status, 200)
-            with urllib.request.urlopen(base + "/metrics/prometheus", timeout=10) as r:
-                self.assertTrue(r.headers["Content-Type"].startswith("text/plain"))
-                text = r.read().decode()
-        finally:
-            httpd.shutdown()
-            httpd.server_close()
-        m = {line.split()[0]: float(line.split()[1]) for line in text.splitlines() if not line.startswith("#")}
-        t = svc.totals
-        self.assertEqual(m["llamacpp:prompt_tokens_total"], t["prompt_tokens"] - 5)
-        self.assertEqual(m["llamacpp:prompt_tokens_cached_total"], 5)
-        self.assertEqual(m["llamacpp:prompt_seconds_total"], 0.8)
-        self.assertEqual(m["llamacpp:tokens_predicted_total"], t["output_tokens"])
-        self.assertEqual(m["llamacpp:tokens_predicted_seconds_total"], 0.4)
-        self.assertEqual((m["llamacpp:requests_processing"], m["llamacpp:requests_deferred"]), (0, 0))
-        self.assertEqual((m["strata:requests_total"], m["strata:drafts_offered_total"],
-                          m["strata:drafts_accepted_total"]), (2, 17, 10))
-
-    def test_throughput_gauges_cover_the_window_between_scrapes(self):
-        """#2341: llama.cpp reads these two from a bucket it resets on every scrape, so a scrape that saw no
-        traffic reports 0 - not the lifetime average, which froze at the last request's speed."""
-        tok = ByteTokenizer()
-        engine = DoneLineEngine(tok, "</think>\n\nok", max_context=CTX,
-                                done_lines=["DONE 4 20 400.0 200.0 stop 7 12 5"])
-        svc = Service(engine, tok, ChatTemplate(ROOT / "front/chat_template.jinja"))
-        httpd = serve(svc, port=0)
-        base = f"http://127.0.0.1:{httpd.server_address[1]}"
-
-        def scrape():
-            with urllib.request.urlopen(base + "/metrics/prometheus", timeout=10) as r:
-                return {line.split()[0]: float(line.split()[1])
-                        for line in r.read().decode().splitlines() if not line.startswith("#")}
-
-        try:
-            body = json.dumps({"model": "m", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]})
-            with urllib.request.urlopen(urllib.request.Request(base + "/v1/chat/completions", data=body.encode(),
-                                                               headers={"Content-Type": "application/json"}),
-                                        timeout=30) as r:
-                self.assertEqual(r.status, 200)
-            first = scrape()
-            self.assertGreater(first["llamacpp:prompt_tokens_seconds"], 0)
-            self.assertGreater(first["llamacpp:predicted_tokens_seconds"], 0)
-            idle = scrape()                       # nothing ran since the scrape above, so the window is empty
-            self.assertEqual((idle["llamacpp:prompt_tokens_seconds"],
-                              idle["llamacpp:predicted_tokens_seconds"]), (0, 0))
-            self.assertEqual(idle["llamacpp:tokens_predicted_total"],         # counters stay cumulative
-                             first["llamacpp:tokens_predicted_total"])
-        finally:
-            httpd.shutdown()
-            httpd.server_close()
-
-
 class RepeatStop(unittest.TestCase):
     """#606: one token repeated repeat_stop_tokens times in a row ends the reply as "length"; 0 turns it off."""
 
@@ -2367,17 +2171,6 @@ class SharedSettings(unittest.TestCase):
         code, _ = self.req("/settings", {"defaults": {"temperature": 1}}, {"Origin": "http://127.0.0.1:1"})
         self.assertEqual(code, 403)
 
-    def test_a_trusted_origin_is_strata_s_own_page(self):
-        # the web app behind a reverse proxy or tunnel: the config's trusted_origins
-        self.svc.trusted_origins = ["https://strata.example.com"]
-        try:
-            code, _ = self.req("/settings", {"defaults": {}}, {"Origin": "https://strata.example.com"})
-            self.assertEqual(code, 200)
-            code, _ = self.req("/settings", {"defaults": {}}, {"Origin": "https://evil.example.com"})
-            self.assertEqual(code, 403)
-        finally:
-            self.svc.trusted_origins = []
-
 
 class TemplateCaps(unittest.TestCase):
     def test_probe_errors_are_logged_and_swallowed(self):
@@ -2699,41 +2492,6 @@ class UsageAndStatus(unittest.TestCase):
         return [json.loads(line[6:]) for line in raw.decode().splitlines()
                 if line.startswith("data: {")]
 
-    def preflight(self, path, origin="https://chat.example.com"):
-        req = urllib.request.Request(self.base + path, method="OPTIONS",
-                                     headers={"Origin": origin, "Access-Control-Request-Method": "POST",
-                                              "Access-Control-Request-Headers": "authorization, content-type"})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return r.status, r.headers
-
-    def test_cors_is_off_by_default(self):
-        # #321: OPTIONS is answered, but without cors_origins no page of another origin is let in
-        status, h = self.preflight("/v1/chat/completions")
-        self.assertEqual(status, 204)
-        self.assertIsNone(h.get("Access-Control-Allow-Origin"))
-        with urllib.request.urlopen(self.base + "/health", timeout=10) as r:
-            self.assertIsNone(r.headers.get("Access-Control-Allow-Origin"))
-
-    def test_cors_for_the_configured_origins_on_the_api_only(self):
-        self.svc.cors_origins = ["https://chat.example.com"]
-        try:
-            status, h = self.preflight("/v1/chat/completions")
-            self.assertEqual((status, h.get("Access-Control-Allow-Origin")), (204, "https://chat.example.com"))
-            self.assertIn("OPTIONS", h.get("Access-Control-Allow-Methods", ""))
-            self.assertIn("authorization", h.get("Access-Control-Allow-Headers", ""))
-            self.assertIsNone(self.preflight("/v1/chat/completions", "https://evil.example.com")[1]
-                              .get("Access-Control-Allow-Origin"))
-            # never on the app's own endpoints (/settings, /unload, ...)
-            self.assertIsNone(self.preflight("/settings")[1].get("Access-Control-Allow-Origin"))
-            req = urllib.request.Request(self.base + "/v1/models", headers={"Origin": "https://chat.example.com"})
-            with urllib.request.urlopen(req, timeout=10) as r:
-                self.assertEqual(r.headers.get("Access-Control-Allow-Origin"), "https://chat.example.com")
-            self.svc.cors_origins = ["*"]
-            self.assertEqual(self.preflight("/v1/messages", "https://any.example.com")[1]
-                             .get("Access-Control-Allow-Origin"), "*")
-        finally:
-            self.svc.cors_origins = []
-
     def test_sse_is_not_buffered_by_proxies(self):
         req = urllib.request.Request(self.base + "/v1/chat/completions", headers={"Content-Type": "application/json"},
                                      data=json.dumps({"model": "m", "stream": True,
@@ -2741,15 +2499,6 @@ class UsageAndStatus(unittest.TestCase):
         with urllib.request.urlopen(req, timeout=30) as r:
             self.assertEqual(r.headers.get("X-Accel-Buffering"), "no")
             r.read()
-
-    def test_origin_lists_are_checked(self):
-        from front.server import origins_of
-        self.assertEqual(origins_of(None, "k", True), [])
-        self.assertEqual(origins_of("https://a.example.com/", "k", False), ["https://a.example.com"])
-        self.assertEqual(origins_of(["*", "http://localhost:3000"], "k", True), ["*", "http://localhost:3000"])
-        for bad in ("*", "a.example.com", "https://a.example.com/path", "https://*.example.com", 5):
-            with self.assertRaises(SystemExit):
-                origins_of(bad, "k", False)
 
     def test_openai(self):
         b = self.chat("/v1/chat/completions")
@@ -2818,234 +2567,6 @@ class TimingsDrafts(unittest.TestCase):
         self.assertEqual((t["prompt_n"], t["cache_n"]), (20, 4))
         self.assertNotIn("draft_n", request_timings(24, 20, base))
         self.assertIsNone(request_timings(24, 20, {}))
-
-
-class UnloadableEngine(MockEngine):
-    """A mock engine that can be stopped and started again like StrataEngine (alive / unload / restart)."""
-
-    def __init__(self, *a, **kw):
-        super().__init__(*a, **kw)
-        self.running, self.unloaded, self.starts = True, False, 0
-
-    def alive(self):
-        return self.running
-
-    def unload(self):
-        self.running, self.unloaded = False, True
-
-    def restart(self):
-        self.running, self.unloaded = True, False
-        self.starts += 1
-
-
-class SharingTheGpu(unittest.TestCase):
-    """Idle unload, POST /unload and /load, the free-VRAM guard and the before_load hook (all off by default)."""
-
-    def setUp(self):
-        tok = ByteTokenizer()
-        self.engine = UnloadableEngine(tok, "</think>\n\nok", max_context=CTX)
-        self.svc = Service(self.engine, tok, ChatTemplate(ROOT / "front/chat_template.jinja"))
-        self.httpd = serve(self.svc, port=0)
-        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
-
-    def tearDown(self):
-        self.httpd.shutdown()
-        self.httpd.server_close()
-
-    def req(self, path, body=None):
-        r = urllib.request.Request(self.base + path, data=None if body is None else json.dumps(body).encode(),
-                                   headers={"Content-Type": "application/json"}, method="GET" if body is None else "POST")
-        try:
-            with urllib.request.urlopen(r, timeout=30) as resp:
-                return resp.status, json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            with e:
-                return e.code, json.loads(e.read())
-
-    def chat(self):
-        return self.req("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}]})
-
-    def test_unload_then_the_next_request_loads(self):
-        self.assertEqual(self.req("/unload", {}), (200, {"status": "unloaded"}))
-        self.assertFalse(self.engine.alive())
-        self.assertEqual(self.req("/health")[1]["loaded"], False)
-        self.assertEqual(self.req("/v1/models")[1]["data"][0]["status"]["value"], "unloaded")
-        self.assertEqual(self.req("/unload", {}), (200, {"status": "not loaded"}))
-        s, b = self.chat()
-        self.assertEqual(s, 200)
-        self.assertEqual(b["choices"][0]["message"]["content"], "ok")
-        self.assertEqual(self.engine.starts, 1)
-        self.assertEqual(self.req("/health")[1]["loaded"], True)
-
-    def test_load_endpoint(self):
-        self.svc.unload()
-        self.assertEqual(self.req("/load", {}), (200, {"status": "loaded"}))
-        self.assertTrue(self.engine.alive())
-        self.assertEqual(self.req("/load", {}), (200, {"status": "loaded"}))
-        self.assertEqual(self.engine.starts, 1)
-
-    def test_unload_refused_while_a_request_runs(self):
-        with self.svc.fifo:
-            self.assertEqual(self.svc.unload(), "busy")
-        self.assertTrue(self.engine.alive())
-
-    def test_idle_unload(self):
-        self.svc.idle_unload_s = 1
-        self.svc.last_request_at = time.time()
-        self.assertEqual(self.svc.unload(idle_for=1), "busy")       # a request just now: not idle yet
-        self.svc.start_idle_unload()
-        deadline = time.time() + 10
-        while self.engine.alive() and time.time() < deadline:
-            time.sleep(0.1)
-        self.assertFalse(self.engine.alive())
-        self.assertEqual(self.chat()[0], 200)
-
-    def test_min_free_vram_refuses_to_load(self):
-        self.svc.min_free_vram_mib = 8000
-        self.svc.free_vram_mib = lambda: 2000
-        self.svc.unload()
-        t0 = time.time()
-        s, b = self.chat()
-        self.assertEqual(s, 503)
-        self.assertIn("in use by another program", b["error"]["message"])
-        self.assertFalse(self.engine.alive())
-        self.assertGreater(time.time() - t0, 10)                    # waited for memory being given back first
-        self.svc.free_vram_mib = lambda: 9000
-        self.assertEqual(self.chat()[0], 200)
-
-    def test_min_free_vram_unreadable_loads(self):
-        self.svc.min_free_vram_mib = 8000
-        self.svc.free_vram_mib = lambda: None                       # no NVML: never refuse
-        self.svc.unload()
-        self.assertEqual(self.chat()[0], 200)
-
-    def test_before_load_runs_first(self):
-        mark = Path(tempfile.mkdtemp()) / "ran"
-        self.svc.before_load = [sys.executable, "-c", f"open({str(mark)!r}, 'w').close()"]
-        self.svc.unload()
-        self.assertFalse(mark.exists())
-        self.assertEqual(self.chat()[0], 200)
-        self.assertTrue(mark.exists())
-
-    def _raw_chat(self):
-        r = urllib.request.Request(self.base + "/v1/chat/completions",
-                                   data=json.dumps({"model": "m", "messages": [{"role": "user", "content": "hi"}]}).encode(),
-                                   headers={"Content-Type": "application/json"}, method="POST")
-        try:
-            with urllib.request.urlopen(r, timeout=30) as resp:
-                return resp.status, dict(resp.headers), json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            with e:
-                return e.code, dict(e.headers), json.loads(e.read())
-
-    def test_failing_before_load_with_free_vram_still_loads(self):
-        """#1997: a peer that is not running makes `curl` exit 7; the card has room, so the model loads."""
-        self.svc.before_load = [sys.executable, "-c", "import sys; sys.exit(7)"]
-        self.svc.min_free_vram_mib = 8000
-        self.svc.free_vram_mib = lambda: 20000
-        self.svc.unload()
-        self.assertEqual(self._raw_chat()[0], 200)
-        self.assertEqual(self.engine.starts, 1)
-
-    def test_failing_before_load_with_full_vram_refuses_with_503_and_retry_after(self):
-        self.svc.before_load = [sys.executable, "-c", "import sys; sys.exit(3)"]
-        self.svc.min_free_vram_mib = 8000
-        self.svc.free_vram_mib = lambda: 2000
-        self.svc.unload()
-        self.svc.vram_free_wait_s = 0.2                              # (not the 15 s wait for memory)
-        status, headers, body = self._raw_chat()
-        self.assertEqual(status, 503)
-        self.assertIn("exited with code 3", body["error"]["message"])
-        self.assertTrue(int(headers["Retry-After"]) > 0)
-        self.assertFalse(self.engine.alive())
-        self.assertEqual(self.engine.starts, 0)
-        self.svc.free_vram_mib = lambda: 20000                      # the peer let go: the next try loads
-        self.assertEqual(self._raw_chat()[0], 200)
-
-    def test_before_load_strict_refuses_even_with_free_vram(self):
-        self.svc.before_load = [sys.executable, "-c", "import sys; sys.exit(7)"]
-        self.svc.before_load_strict = True
-        self.svc.min_free_vram_mib = 8000
-        self.svc.free_vram_mib = lambda: 20000
-        self.svc.unload()
-        status, headers, body = self._raw_chat()
-        self.assertEqual(status, 503)
-        self.assertTrue(int(headers["Retry-After"]) > 0)
-        self.assertEqual(self.engine.starts, 0)
-
-    def test_failing_before_load_without_a_vram_limit_loads(self):
-        self.svc.before_load = [sys.executable, "-c", "import sys; sys.exit(7)"]
-        self.svc.unload()
-        self.assertEqual(self._raw_chat()[0], 200)
-
-    def test_before_load_timeout_is_configurable_and_a_timeout_refuses(self):
-        self.svc.before_load = [sys.executable, "-c", "import time; time.sleep(30)"]
-        self.svc.before_load_timeout_s = 0.5
-        self.svc.before_load_strict = True
-        self.svc.unload()
-        t0 = time.time()
-        status, headers, body = self._raw_chat()
-        self.assertEqual(status, 503)
-        self.assertLess(time.time() - t0, 10)
-        self.assertIn("before_load_timeout_s", body["error"]["message"])
-        self.assertFalse(self.engine.alive())
-
-    def test_before_load_failure_can_be_ignored_by_config(self):
-        self.svc.before_load = [sys.executable, "-c", "import sys; sys.exit(1)"]
-        self.svc.before_load_ignore_failure = True
-        self.svc.min_free_vram_mib = 8000
-        self.svc.free_vram_mib = lambda: 2000                       # full, but ignore means load
-        self.svc.unload()
-        self.assertEqual(self._raw_chat()[0], 200)
-
-    def test_unload_wait_waits_for_the_running_turn(self):
-        """#1997: POST /unload answers busy at once (409); with ?wait=1 it waits for the turn and then unloads."""
-        self.svc.fifo.acquire()
-        threading.Timer(1.0, self.svc.fifo.release).start()
-        t0 = time.time()
-        self.assertEqual(self.req("/unload", {}), (409, {"status": "busy"}))
-        self.assertLess(time.time() - t0, 0.9)
-        status, body = self.req("/unload?wait=1", {})
-        self.assertEqual((status, body), (200, {"status": "unloaded"}))
-        self.assertGreaterEqual(time.time() - t0, 0.9)
-        self.assertFalse(self.engine.alive())
-
-    def test_unload_wait_gives_up_after_the_given_seconds(self):
-        with self.svc.fifo:
-            t0 = time.time()
-            self.assertEqual(self.req("/unload?wait=0.6", {}),
-                             (409, {"status": "busy"}))
-            self.assertLess(time.time() - t0, 5)
-        self.assertTrue(self.engine.alive())
-
-    def test_vision_encoder_unloads_and_starts_first(self):
-        order = []
-
-        class FakeVision:
-            running = True
-
-            def alive(self):
-                return self.running
-
-            def unload(self):
-                self.running = False
-
-            def restart(self):
-                order.append("vision")
-                self.running = True
-
-        engine_restart = self.engine.restart
-        self.engine.restart = lambda: (order.append("engine"), engine_restart())
-        self.svc.vision = FakeVision()
-        self.assertEqual(self.svc.unload(), "unloaded")
-        self.assertFalse(self.svc.vision.alive())
-        self.assertEqual(self.chat()[0], 200)
-        self.assertEqual(order, ["vision", "engine"])             # the encoder first, as at a start
-        self.assertTrue(self.svc.vision.alive())
-
-    def test_off_by_default(self):
-        self.assertEqual((self.svc.idle_unload_s, self.svc.min_free_vram_mib, self.svc.before_load), (0, 0, None))
-        self.assertEqual(self.req("/health")[1]["loaded"], True)
 
 
 class ThinkingEngine(MockEngine):
@@ -3753,7 +3274,7 @@ class RestartWindow(unittest.TestCase):
                     self.assertEqual(eng.max_context, 4096)
                 finally:
                     gate.touch()
-                    eng.unload()
+                    eng.close()
 
     def test_restart_retries_a_start_that_fails(self):
         """A dead engine's VRAM is freed only when its process is gone, so a new engine started at once can exit
@@ -3782,7 +3303,7 @@ class RestartWindow(unittest.TestCase):
                     self.assertFalse(eng.starting)
                 finally:
                     gate.touch()
-                    eng.unload()
+                    eng.close()
 
     def test_failed_restart_keeps_the_known_context(self):
         """After a restart that failed, max_context is 0 but the engine is not starting: a request is checked against
@@ -3826,105 +3347,6 @@ class RestartWindow(unittest.TestCase):
         finally:
             httpd.shutdown()
             httpd.server_close()
-
-
-class ModelAliases(unittest.TestCase):
-    """#297: the config's `aliases` are listed by /v1/models and accepted as model names (answered under that name)."""
-
-    @classmethod
-    def setUpClass(cls):
-        tok = ByteTokenizer()
-        cls.svc = Service(MockEngine(tok, "</think>\n\nok", max_context=CTX), tok,
-                          ChatTemplate(ROOT / "front/chat_template.jinja"), model_name="qwen3.8-flash-next-iq3_xxs")
-        cls.svc.set_aliases(["qwen", "local-model", "qwen", " ", "qwen3.8-flash-next-iq3_xxs"])
-        cls.httpd = serve(cls.svc, port=0)
-        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-
-    def get(self, path):
-        with urllib.request.urlopen(self.base + path, timeout=30) as r:
-            return json.loads(r.read())
-
-    def post(self, path, body):
-        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
-                                     headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return r.read().decode()
-
-    def test_set_aliases(self):
-        self.assertEqual(self.svc.aliases, ["qwen", "local-model"])        # duplicates, blanks and the name itself
-        tok = ByteTokenizer()
-        svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "front/chat_template.jinja"))
-        svc.set_aliases("a, b")
-        self.assertEqual(svc.aliases, ["a", "b"])
-        svc.set_aliases(None)
-        self.assertEqual(svc.aliases, [])
-        for bad in (3, ["a", 1], {"a": 1}):
-            with self.assertRaises(ValueError):
-                svc.set_aliases(bad)
-
-    def test_models_lists_them(self):
-        data = self.get("/v1/models")["data"]
-        self.assertEqual([m["id"] for m in data], ["qwen3.8-flash-next-iq3_xxs", "qwen", "local-model"])
-        self.assertEqual(data[0]["aliases"], ["qwen", "local-model"])
-        self.assertEqual(data[1]["alias_of"], "qwen3.8-flash-next-iq3_xxs")
-        self.assertEqual(self.get("/props?model=local-model")["model_alias"], "qwen3.8-flash-next-iq3_xxs")
-
-    def test_requests_are_answered_under_the_alias(self):
-        msgs = [{"role": "user", "content": "hi"}]
-        for asked, want in (("qwen", "qwen"), ("local-model", "local-model"),
-                            ("qwen3.8-flash-next-iq3_xxs", "qwen3.8-flash-next-iq3_xxs"),
-                            ("something-else", "qwen3.8-flash-next-iq3_xxs")):    # still served, as before
-            with self.subTest(asked=asked):
-                out = json.loads(self.post("/v1/chat/completions", {"model": asked, "messages": msgs, "max_tokens": 8}))
-                self.assertEqual(out["model"], want)
-                text = self.post("/v1/chat/completions", {"model": asked, "messages": msgs, "max_tokens": 8,
-                                                          "stream": True})
-                first = json.loads(text.split("data: ", 2)[1].strip())
-                self.assertEqual(first["model"], want)
-                out = json.loads(self.post("/v1/messages", {"model": asked, "messages": msgs, "max_tokens": 8}))
-                self.assertEqual(out["model"], want)
-
-    def test_without_aliases_nothing_changes(self):
-        tok = ByteTokenizer()
-        svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "front/chat_template.jinja"))
-        httpd = serve(svc, port=0)
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{httpd.server_address[1]}/v1/models", timeout=30) as r:
-                data = json.loads(r.read())["data"]
-            self.assertEqual(len(data), 1)
-            self.assertNotIn("aliases", data[0])
-            self.assertEqual(svc.model_for({"model": "x"}), svc.model)
-        finally:
-            httpd.shutdown()
-            httpd.server_close()
-
-
-IOREG_FIXTURE = '''
-  +-o AGXAcceleratorG13X  <class AGXAcceleratorG13X, id 0x100000428, registered, matched, active, busy 0 (0 ms), retain 41>
-    {
-      "IOClass" = "AGXAcceleratorG13X"
-      "model" = "Apple M1 Max"
-      "PerformanceStatistics" = {"In use system memory (driver)"=0,"Alloc system memory"=22991831040,"Tiler Utilization %"=36,"recoveryCount"=44,"lastRecoveryTime"=216970984728,"Renderer Utilization %"=35,"TiledSceneBytes"=1671168,"Device Utilization %"=76,"SplitSceneCount"=0,"Allocated PB Size"=76152832,"In use system memory"=13384105984}
-      +-o IOUserClientCreator  <class IOUserClientCreator, id 0x100000429, registered, matched, active, busy 0 (0 ms), retain 5>
-        {
-          "IOUserClientCreator" = "pid 402, WindowServer"
-        }
-    }
-
-  +-o AGXAccelerator  <class AGXAccelerator, id 0x10000042a, registered, matched, active, busy 0 (0 ms), retain 12>
-    {
-      "IOClass" = "AGXAccelerator"
-      "model" = "Apple M2 Ultra"
-      "PerformanceStatistics" = {"Renderer Utilization %"=3,"Tiler Utilization %"=2,"In use system memory"=1234567890}
-    }
-'''
-
-WORKING_SET = 26800603136          # bytes; the M1 Max's device in the fixture above
 
 
 class TelemetryNoDisks(unittest.TestCase):
@@ -4164,7 +3586,7 @@ class LostStep(unittest.TestCase):
                 finally:
                     httpd.shutdown()
                     httpd.server_close()
-                    eng.unload()
+                    eng.close()
 
     def test_silent_mid_answer(self):
         self.run_mode("silent", stream=False)
@@ -4303,9 +3725,10 @@ class ImageSources(unittest.TestCase):
                 page = {"Content-Type": "text/plain;charset=UTF-8", "Origin": "https://evil.example"}
                 status, b = post("/v1/chat/completions", f, page)
                 self.assertEqual(status, 403, b)
-                # a page cors_origins lets in (here every page) may send JSON, and still cannot name a file
-                svc.cors_origins = ["*"]
-                page = {"Content-Type": "application/json", "Origin": "https://evil.example"}
+                # a page with the API key may send JSON, and still cannot name a file
+                svc.api_key = "k"
+                page = {"Content-Type": "application/json", "Origin": "https://evil.example",
+                        "Authorization": "Bearer k"}
                 for path in ("/v1/chat/completions", "/v1/messages"):
                     for src in (f, "file://" + f):
                         with self.subTest(path=path, src=src):
@@ -4313,16 +3736,15 @@ class ImageSources(unittest.TestCase):
                             self.assertEqual(status, 400, b)
                             self.assertIn("another origin", b["error"]["message"])
                 self.assertEqual(vision.got, [])                    # nothing was read
-                svc.trusted_origins = ["https://app.example"]
                 data = "data:image/png;base64,iVBORw0KGgo="
+                key = {"Authorization": "Bearer k"}
                 for src, headers in ((data, page),                  # the page's own picture
-                                     (f, {"Content-Type": "application/json"}),           # curl, SDKs, agents
-                                     (f, {"Content-Type": "application/json", "Origin": "http://" + host}),
-                                     (f, {"Content-Type": "application/json", "Origin": "https://app.example"})):
+                                     (f, {"Content-Type": "application/json", **key}),    # curl, SDKs, agents
+                                     (f, {"Content-Type": "application/json", "Origin": "http://" + host, **key})):
                     with self.subTest(src=src[:20], headers=headers):
                         status, b = post("/v1/chat/completions", src, headers)
                         self.assertEqual(status, 200, b)
-                self.assertEqual(vision.got, [data, f, f, f])
+                self.assertEqual(vision.got, [data, f, f])
             finally:
                 httpd.shutdown()
                 httpd.server_close()
@@ -4493,7 +3915,7 @@ class AnswerBeforeTheBody(unittest.TestCase):
 
     def setUp(self):
         tok = ByteTokenizer()
-        self.engine = UnloadableEngine(tok, "</think>\n\nok", max_context=CTX)
+        self.engine = MockEngine(tok, "</think>\n\nok", max_context=CTX)
         self.svc = Service(self.engine, tok, ChatTemplate(ROOT / "front/chat_template.jinja"))
         self.httpd = serve(self.svc, port=0)
         self.port = self.httpd.server_address[1]
@@ -4561,20 +3983,15 @@ class AnswerBeforeTheBody(unittest.TestCase):
         finally:
             self.svc.api_key = ""
 
-    def test_load_and_unload(self):
-        self.assertEqual(self.status("POST", "/unload"), "HTTP/1.0 200 OK")
-        self.assertEqual(self.status("POST", "/load"), "HTTP/1.0 200 OK")
-
     def test_not_the_apps_own_page(self):
-        self.assertEqual(self.status("POST", "/load", {"Origin": "https://example.com"}), "HTTP/1.0 403 Forbidden")
+        self.assertEqual(self.status("POST", "/settings", {"Origin": "https://example.com"}, b'{"defaults": {}}'),
+                         "HTTP/1.0 403 Forbidden")
 
     def test_a_body_a_handler_read_is_not_waited_for(self):
-        """#594: /config and /load read their body themselves: the close must not wait for the drain's 5 s."""
-        for path in ("/config", "/load", "/unload"):
-            with self.subTest(path=path):
-                t0 = time.monotonic()
-                self.status("POST", path)
-                self.assertLess(time.monotonic() - t0, 1.5)       # the status() helper itself pauses 0.5 s
+        """#594: /settings reads its body itself: the close must not wait for the drain's 5 s."""
+        t0 = time.monotonic()
+        self.status("POST", "/settings", body=b'{"defaults": {}}')
+        self.assertLess(time.monotonic() - t0, 1.5)               # the status() helper itself pauses 0.5 s
 
     def test_a_host_the_server_does_not_answer_to(self):
         self.assertEqual(self.status("POST", "/v1/chat/completions", {"Host": "rebind.example.com"}),
@@ -4665,7 +4082,7 @@ class VisionCacheEviction(unittest.TestCase):
 
 
 class LazyVision(unittest.TestCase):
-    """#673: with --lazy the image encoder is not started either; it starts with the model, and an encoder that fails
+    """#673: an encoder built without starting (lazy) runs from its first restart(), and an encoder that fails
     to start leaves nothing running."""
 
     def make(self, ready=True):

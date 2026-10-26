@@ -1,15 +1,12 @@
-"""front/server.py - plan v0.3 P8: OpenAI and Anthropic endpoints over any engine that maps token ids to tokens.
+"""front/server.py - sFNX's OpenAI, Anthropic and Responses endpoints over an engine that maps token ids to tokens.
 
-    python -m front.server --engine mock --port 8095            (a scripted engine, for clients and tests)
-    python -m front.server --engine sfnx --config ../serve/sfnx.json   (sFNX, resident)
+    python -m front.server --engine mock --port 8095                       (a scripted engine, for clients and tests)
+    python -m front.server --engine sfnx --config serve/sfnx.json          (sFNX, resident)
 
 Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
-non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /mcp. One sequence at a time behind a FIFO (plan: one resident sequence).
-Image generation (optional, when the config has an "images" section): POST /v1/images/generations (OpenAI's shape,
-plus seed and steps) runs stable-diffusion.cpp's sd-cli for Qwen-Image-2.1-Turbo, one job at a time on the GPU the
-text engine uses (front/images.py).
-Tools from MCP servers (front/mcp.py, `"mcp_servers"` in the config or --mcp-config) are offered only to requests that
-ask for them with `"strata_mcp": true` - the web app does; other clients see exactly the API they always saw.
+non-stream), POST /v1/messages/count_tokens, POST /v1/responses, GET /v1/models, GET /models, GET /props, GET /slots,
+GET /health, GET /v1/status, GET /metrics, and the web app.  With --batch N in the engine's args up to N requests
+decode at once in its batch slots; more wait their turn.
 Images (optional, when the config has a "vision" entry): OpenAI image_url parts and Anthropic image blocks (base64
 data, http(s) URLs or local file paths) go through `bin/sfnx-vision` (the model's mmproj file) and reach the engine as
 embeddings (`GENI`).  JPEG/PNG/BMP/GIF go straight in; WebP, TIFF, AVIF, ... (agents like omp send WebP) are
@@ -63,7 +60,7 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a
 from front.frontend import (LATE_NOTE, THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
                             tool_choice_of, unmark_think_literals)
-from front.mcp import McpCancelled, hub_from_config  # noqa: E402
+
 
 from front.bounded_text import BoundedText  # noqa: E402
 from front.engine_limits import (CTX_SLACK, EOS_IDS, PARALLEL_MAX, PENALTY_LAST_N_DEFAULT,  # noqa: E402
@@ -75,7 +72,7 @@ from front.lifeline import popen  # noqa: E402
 from front.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 from front import responses as responses_api  # noqa: E402
 from front.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
-from front import images as images_api  # noqa: E402
+
 
 IM_START = "<|im_start|>"
 IM_END = "<|im_end|>"
@@ -126,14 +123,6 @@ def write_temporary(path: Path, parts: list) -> None:
             f.write(Path(part).read_bytes())
 
 
-EFFORT_TEXT = {"low": "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the "
-                      "conclusion without unnecessary elaboration.",
-               "medium": "Reasoning effort is set to medium. Think as much as the task needs, without unnecessary "
-                         "elaboration.",
-               # the template's own xhigh sentence (chat_template.jinja), which #728's recovery swaps for the low one
-               "xhigh": "Reasoning effort is set to xhigh. Please think carefully through the task, validate key "
-                        "assumptions, consider plausible alternatives, and prioritize correctness, consistency, and "
-                        "clarity in the final answer."}
 VISION_START = "<|vision_start|>"
 # #606: a reply that repeats one token this many times in a row is ended there ("length"): a model in a loop, or a
 # broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
@@ -158,63 +147,6 @@ def in_open_code(text: str) -> bool:
         return True
     line = text.rsplit("\n", 1)[-1].replace("```", "")
     return line.count("`") % 2 == 1
-
-
-# #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
-# "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
-# low-effort instruction in place of the xhigh one.  Both off by default.
-HIGH_EFFORT = EFFORT_TEXT["xhigh"]
-LOW_EFFORT = EFFORT_TEXT["low"]
-LOOP_CHECK_EVERY = 512           # output tokens between two looks at the reasoning (at a clean parser boundary)
-LOOP_COVERAGE = 0.25             # the share of the last 2,000 words inside 12-word passages seen three times
-LOOP_HISTORY_WORDS = 30000       # how far back the passages are counted (bounds the cost of a look)
-LOOP_TAIL_CHARS = 2048           # chars at the end of the reasoning also checked for a short period (#1753)
-LOOP_TAIL_PERIOD = 64            # a period at most this long in that tail reads as a fully repeated window
-
-
-def reasoning_repeat_coverage(text):
-    """Coverage of recent words by 12-word passages seen at least three times.
-
-    Only reasoning is supplied. The history (the last LOOP_HISTORY_WORDS words) detects repeated verification passes
-    separated by long code drafts; the recent window excludes old repetitions.  #1753: a loop can also be one long
-    word (a 24k-digit string cycling an 11-digit pattern): the word split makes it a single word and no word count
-    grows, and #606's token run never grows either (the tokenizer has no multi-digit tokens), so before the word
-    count the last LOOP_TAIL_CHARS chars are checked for a period of at most LOOP_TAIL_PERIOD, and a periodic tail
-    reads as full coverage: it is all of the recent output, repeated.
-    """
-    tail = text[-LOOP_TAIL_CHARS:].lower()
-    if len(tail) == LOOP_TAIL_CHARS and any(tail[p:] == tail[:-p] for p in range(1, LOOP_TAIL_PERIOD + 1)):
-        return 1.0
-    words = re.findall(r"\w+|[^\w\s]", text.lower())[-LOOP_HISTORY_WORDS:]
-    width, window = 12, 2000
-    if len(words) < window:
-        return 0.0
-    grams = [tuple(words[i:i + width]) for i in range(len(words) - width + 1)]
-    counts = collections.Counter(grams)
-    start = max(0, len(words) - window)
-    covered = set()
-    for i in range(start, len(grams)):
-        if counts[grams[i]] >= 3:
-            covered.update(range(i, i + width))
-    return len(covered) / (len(words) - start)
-
-
-def focused_recovery_prompt(tok, ids, generated):
-    """The prompt's ids with the xhigh effort sentence of the first system message replaced by the low one, then
-    every token generated so far.  A splice of token ids: the prompt is never decoded and encoded again, so a literal
-    `</think>` or vision marker in it (#537, #554) stays what it was.  None when the sentence is not there as whole
-    tokens in the first system message (a user's text never counts).  No answer or end-of-thinking is inserted."""
-    end = tok.encode(IM_END, parse_special=True)
-    if len(end) != 1 or end[0] not in ids:
-        return None
-    head = ids[:ids.index(end[0])]
-    if not tok.decode(head).startswith("<|im_start|>system\n"):
-        return None
-    old, new = tok.encode(HIGH_EFFORT, parse_special=False), tok.encode(LOW_EFFORT, parse_special=False)
-    for i in range(len(head) - len(old) + 1):
-        if head[i:i + len(old)] == old:
-            return ids[:i] + new + ids[i + len(old):] + list(generated)
-    return None
 
 
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
@@ -339,10 +271,6 @@ class ClientGone(Exception):
     waiting for its turn): nothing is left to answer."""
 
 
-class ModelBusy(RuntimeError):
-    """Explicit model controls must not interrupt active or queued requests."""
-
-
 class QueueCancelled(RuntimeError):
     """The client left before its first serial engine turn."""
 
@@ -433,29 +361,12 @@ class EngineStuck(RuntimeError):
 
 
 class GpuBusy(RuntimeError):
-    """The model is unloaded and the GPU has less free VRAM than min_free_vram_mib: something else (a game, another
-    model server) is using it, so the engine is not started into the little that is left.  `retry_after`: seconds
-    for the Retry-After header of the 503."""
+    """#1994: the engine's batch slots stayed refused: a 503 worth retrying.  `retry_after`: seconds for the
+    Retry-After header."""
 
     def __init__(self, message="", retry_after=None):
         super().__init__(message)
         self.retry_after = retry_after
-
-
-def unload_wait(value, default: float) -> float:
-    """#1997: the `wait` of POST /unload?wait=...: absent / 0 / false: 0 (answer "busy" at once, as before); 1 / true /
-    yes: `default` seconds; a number of seconds above 1: that long (at most an hour)."""
-    if value is None:
-        return 0.0
-    v = str(value).strip().lower()
-    if v in ("", "0", "false", "no", "off"):
-        return 0.0
-    if v in ("1", "true", "yes", "on"):
-        return default
-    try:
-        return min(3600.0, max(0.0, float(v)))
-    except ValueError:
-        return default
 
 
 def start_log_tail(log: str | None, offset: int, n: int = 20) -> str:
@@ -673,13 +584,12 @@ class StrataEngine:
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False):
+        """`lazy`: the object only, the process not started (tests; restart() starts it)."""
         self.spawn = (exe, list(args), cwd, log, env, False)   # to start it again after it died (issue #27)
-
-        paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
-        self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
+        self.model_path = args[args.index("--native") + 1] if "--native" in args[:-1] else None
         self.log_path = log
         self.proc, self.pump, self.log = None, None, None
-        self.ended, self.unloaded = True, True
+        self.ended = True
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
@@ -692,7 +602,7 @@ class StrataEngine:
         self.last_err = None
         if lazy:
             return
-        self.unloaded = False            # `ended` stays True until READY (below): not alive while starting (#344)
+        # `ended` stays True until READY (below): not alive while starting (#344)
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
         loading = threading.Event()                     # set once READY: the narrator below stops
         log_start = os.path.getsize(log) if log else 0  # where this start's lines begin (start_log_tail)
@@ -869,11 +779,6 @@ class StrataEngine:
         except subprocess.TimeoutExpired:
             return None
 
-    def unload(self):
-        """Release GPU/RAM between requests, retaining the spawn config for automatic reloading."""
-        self.close()
-        self.unloaded = True
-
     RESTART_RETRY_S = 15.0   # between the tries of restart(): a dying engine's VRAM may take a while to come back
 
     @staticmethod
@@ -920,7 +825,7 @@ class StrataEngine:
                     time.sleep(self.RESTART_RETRY_S)
         finally:
             self.starting = False
-            # a lazy first start never reached the post-READY __init__ where slot_cv is made (#1527)
+            # a start that failed never reached the post-READY __init__ where slot_cv is made (#1527)
             if "slot_cv" in self.__dict__:
                 with self.slot_cv:               # #1012: wake the requests that waited through it: they go on with the
                     self.slot_cv.notify_all()    # new engine, or (it did not start) end with a clean EngineDied
@@ -1873,7 +1778,8 @@ class StrataEngine:
             try:
                 self.proc.wait(timeout=ENGINE_KILL_WAIT_S)
             except subprocess.TimeoutExpired:
-                raise EngineStuck("Strata is still releasing GPU/RAM; retry unloading after it exits") from None
+                raise EngineStuck("the engine is still releasing its GPU memory and RAM; it did not exit after "
+                                  "STOP, QUIT, terminate and kill") from None
         except OSError:
             pass
         finally:
@@ -1941,7 +1847,7 @@ class Vision:
     def __init__(self, cfg: dict, log=None, env: dict | None = None, lazy: bool = False):
         args = self.reader_args(cfg)
         self.dir = self.work_dir()
-        self.spawn = (args, log, env)                   # to start it again after an unload
+        self.spawn = (args, log, env)                   # to start it again after it died (restart)
         # the config's "cpu_exe": the CPU reader the GPU one falls back on when it does not start (the card is full or
         # busy); _start switches to it by itself
         if cfg.get("gpu") and cfg.get("cpu_exe"):
@@ -2415,11 +2321,10 @@ class Service:
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # default: clamp the output cap to the room left; False (--no-fit-max-tokens) = 400
-        self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
+
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
-        self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
-        self.codex_thread_titles = False              # #923 (opt-in): answer Codex's thread-title turns without the engine
+
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.model_arch = None                        # "qwen4exp" with the engine; None (the mock) = no model-card defaults
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
@@ -2430,13 +2335,6 @@ class Service:
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
-
-        # #321: browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
-        # matters); empty = no CORS headers at all, as before
-        self.cors_origins: list[str] = []
-        # #321: origins that count as Strata's own page for /settings and MCP tools, e.g. the web app reached through a
-        # reverse proxy or tunnel whose Host differs ("https://strata.example.com"); never a wildcard
-        self.trusted_origins: list[str] = []
         # DNS rebinding: extra Host names this server answers to (the config's allowed_hosts, $STRATA_ALLOWED_HOSTS;
         # "*" = any), and every name it answers to, which serve() works out from the address it listens on
         self.allowed_hosts: list[str] = []
@@ -2459,33 +2357,15 @@ class Service:
                        "prompt_ms": 0.0, "decode_ms": 0.0,
                        "drafts_offered": 0, "drafts_accepted": 0}   # #457: the MTP drafts, summed where reported
         self.last_timings = None                         # the last finished request's, llama.cpp's names (/v1/status)
-        # /metrics/prometheus' two throughput gauges need the totals as they stood at the last scrape, because
-        # llama.cpp averages them over the window between two scrapes (#2341).
-        self.scrape_bucket = (0, 0.0, 0, 0.0)
-        from front.prometheus import Latencies
-        self.latencies = Latencies()                     # GET /metrics in Prometheus text: the latency histograms
+
         self.last_request_at = None                      # when a request last started or finished
         self.started_at = time.time()
         self.status_lock = threading.Lock()
-        self.mcp = None                                  # front/mcp.py's McpHub when MCP servers are configured
-        # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
-        # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
-        # server's model); the next request after an unload starts the engine again
-        self.idle_unload_s = 0
-        self.min_free_vram_mib = 0
-        self.before_load = None
-        self.before_load_timeout_s = 120.0               # #1997: how long the before_load command may run
-        self.before_load_ignore_failure = False          # #1997: load even when it fails, without a VRAM check
-        self.vram_free_wait_s = 15.0                     # how long a full card is waited on (memory given back)
-        self.before_load_strict = False                  # #1997: refuse (503) whenever it fails
 
-        self.reasoning_loop_recovery = False
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
-        self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
-        self.images = None                                # front/images.py's ImageGen when the config has "images"
-        self.restore_after_load = None                    # a session file an image job saved before it unloaded
+
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
         # a stop token's own spelling, encoded as plain text (see LITERAL_STOPS_PER_REPLY)
@@ -2501,30 +2381,6 @@ class Service:
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
-
-    def set_aliases(self, aliases) -> None:
-        """#297: the config's `aliases` - a list of names (or one comma-separated string), like llama-server's --alias.
-        ValueError for anything else."""
-        if aliases is None:
-            aliases = []
-        if isinstance(aliases, str):
-            aliases = aliases.split(",")
-        if not isinstance(aliases, list) or not all(isinstance(x, str) for x in aliases):
-            raise ValueError(f"aliases={aliases!r}: expected a list of model names")
-        names = []
-        for x in (x.strip() for x in aliases):
-            if x and x != self.model and x not in names:
-                names.append(x)
-        self.aliases = names
-
-    def model_names(self) -> list[str]:
-        return [self.model, *self.aliases]
-
-    def model_for(self, req) -> str:
-        """The name to answer with: the request's own when it is the model's name or an alias (#297), else the model's.
-        Other names are still served, as before."""
-        asked = req.get("model") if isinstance(req, dict) else None
-        return asked if isinstance(asked, str) and asked in self.aliases else self.model
 
     def reported_ctx(self) -> int:
         """The context the endpoints report (/v1/status, /v1/models, /props, /health, /slots, /metrics): the engine's,
@@ -2552,74 +2408,11 @@ class Service:
         """The encoder should run and does not (the engine's load starts it again)."""
         return self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
 
-    def free_vram_mib(self) -> int | None:
-        """Free VRAM on the engine's (first) GPU, from NVML; None when it can't be read (then nothing is refused)."""
-        try:
-            from front.telemetry import gpu_reader
-            g = gpu_reader(int(getattr(self, "gpu_index", 0) or 0))
-            if not g.ok():
-                return None
-            r = g.read()
-            if r.get("mem_total") is None or r.get("mem_used") is None:
-                return None
-            return int((r["mem_total"] - r["mem_used"]) >> 20)
-        except Exception:
-            return None
-
     def ensure_loaded(self):
-        """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
-        the free-VRAM check.  The caller holds self.fifo."""
+        """Start the engine (and the picture encoder) again when it is not running: it died (issue #27), or a restart
+        failed.  The caller holds self.fifo."""
         if self.loaded() and not self._vision_down():
             return
-        hook_failed = None
-        if self.before_load:
-            cmd = self.before_load
-            print(f"[sfnx] before loading: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)
-            why = None
-            try:
-                r = subprocess.run(cmd, shell=isinstance(cmd, str), timeout=self.before_load_timeout_s,
-                                   stdin=subprocess.DEVNULL)
-                if r.returncode != 0:
-                    why = f"it exited with code {r.returncode}"
-            except subprocess.TimeoutExpired:
-                why = f"it did not finish in {self.before_load_timeout_s:g} s (before_load_timeout_s)"
-            except (OSError, subprocess.SubprocessError) as e:
-                why = f"it could not run ({e})"
-            if why is not None:
-                # #1997: a failing hook (e.g. the other server's /unload that is still busy) may mean the GPU was not
-                # given back.  A peer that is simply not running also makes `curl` fail (exit 7), so the exit code alone
-                # does not refuse: the card's free VRAM decides (min_free_vram_mib, checked just below); "strict" always
-                # refuses, "ignore" always loads.
-                if self.before_load_strict and not self.before_load_ignore_failure:
-                    print(f"[sfnx] the before_load command failed ({why}); the model stays unloaded and this "
-                          "request is answered 503 - try again (before_load_strict)", flush=True)
-                    raise GpuBusy(f"the before_load command failed ({why}): the GPU was not given back, so the "
-                                  "model was not loaded; try again in a moment", retry_after=15)
-                hook_failed = why
-                if self.before_load_ignore_failure or not self.min_free_vram_mib:
-                    print(f"[sfnx] the before_load command failed ({why}); loading anyway"
-                          + ("" if self.before_load_ignore_failure else
-                             " (set min_free_vram_mib to have the free VRAM checked, or before_load_strict to refuse)"),
-                          flush=True)
-                else:
-                    print(f"[sfnx] the before_load command failed ({why}); checking the free VRAM", flush=True)
-        if self.min_free_vram_mib and not (hook_failed and self.before_load_ignore_failure):
-            free = self.free_vram_mib()
-            deadline = time.time() + self.vram_free_wait_s   # memory another process just gave back can take a moment
-            while free is not None and free < self.min_free_vram_mib and time.time() < deadline:
-                time.sleep(0.5)
-                free = self.free_vram_mib()
-            if free is not None and free < self.min_free_vram_mib:
-                if hook_failed and not self.before_load_ignore_failure:
-                    print(f"[sfnx] the before_load command failed ({hook_failed}) and only {free} MiB of VRAM is "
-                          f"free (the model needs {self.min_free_vram_mib}): not loading; 503", flush=True)
-                raise GpuBusy(f"the GPU is in use by another program: {free} MiB of VRAM free, the model needs "
-                              f"{self.min_free_vram_mib} (min_free_vram_mib) - it stays unloaded until that is free"
-                              + (f"; the before_load command failed ({hook_failed})" if hook_failed else ""),
-                              retry_after=15)
-            if hook_failed and not self.before_load_ignore_failure:
-                print(f"[sfnx] the before_load command failed ({hook_failed}), but {free} MiB of VRAM is free: "
-                      "loading", flush=True)
         vision_started = False
         if self._vision_down():                         # first, as at a start: a GPU encoder takes its VRAM before
             print("[sfnx] starting the vision encoder ...", flush=True)   # the engine sizes its cache
@@ -2630,24 +2423,19 @@ class Service:
             vision_started = True
         if self.loaded():
             return
-        if getattr(self.engine, "unloaded", False):
-            print("[sfnx] loading the model again (it was unloaded) ...", flush=True)
-        else:
-            code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
-            print(f"[sfnx] the engine had stopped (exit code {code}); starting it again "
-                  "(a minute or two) ...", flush=True)
+        code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
+        print(f"[sfnx] the engine had stopped (exit code {code}); starting it again (a minute or two) ...", flush=True)
         try:
             self.engine.restart()
         except Exception as e:
             if vision_started:
                 self.vision.unload()
-            # the program could not be started at all (missing, not executable - #735): the request path answers EngineDied with a 503, but takes a bare OSError for a client that went away (#2496)
+            # the program could not be started at all (missing, not executable - #735): the request path answers
+            # EngineDied with a 503, but takes a bare OSError for a client that went away (#2496)
             if isinstance(e, OSError):
                 raise EngineDied(f"the engine could not be started: {e}") from e
             raise
         print("[sfnx] the engine is running again", flush=True)
-        if self.restore_after_load:                      # an image job unloaded it: its conversation comes back
-            images_api.restore_session(self)
 
     def _say_died(self, e: Exception) -> None:
         """The server window's line for an engine that died (or was ended, #481) in the middle of a request."""
@@ -2657,8 +2445,7 @@ class Service:
               f"{' Its log: ' + log if log else ''}", flush=True)
 
     def load(self):
-        """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
-        # a request is on its way: the idle thread must not unload between this and the request's own start
+        """Every generation request, before its prompt is planned: start the engine again if it died."""
         self.last_request_at = time.time()
         if self.loaded() and not self._vision_down():
             return
@@ -2688,56 +2475,6 @@ class Service:
             if counted:
                 with self.status_lock:
                     self.status["queued"] -= 1
-
-    UNLOAD_WAIT_S = 300.0       # #1997: POST /unload?wait=1 waits this long for the running turn (wait=<s> to choose)
-
-    def unload_waiting(self, wait_s: float) -> str:
-        """#1997: unload(), but a running or queued request is waited for (up to wait_s) instead of answering "busy":
-        a peer server that needs this GPU can then free the card on the server's terms.  "busy" after wait_s."""
-        deadline = time.monotonic() + max(0.0, wait_s)
-        while True:
-            r = self.unload()
-            if r != "busy" or time.monotonic() >= deadline:
-                return r
-            time.sleep(0.25)
-
-    def unload(self, idle_for: float | None = None) -> str:
-        """Stop the engine between requests: "unloaded", "not loaded", "busy" (a request is running or waiting, or
-        with idle_for: one ran more recently than that) or "unsupported"."""
-        if not hasattr(self.engine, "unload"):
-            return "unsupported"
-        if not self.fifo.acquire(blocking=False):
-            return "busy"
-        try:
-            if not self.engine.alive():
-                return "not loaded"
-            with self.status_lock:
-                if self.status.get("busy") or self.status.get("queued"):
-                    return "busy"
-            if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
-                return "busy"
-            self.engine.unload()
-            if self.vision is not None and hasattr(self.vision, "unload"):
-                self.vision.unload()
-            print(f"[sfnx] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
-                  "the next request loads it again", flush=True)
-            return "unloaded"
-        finally:
-            self.fifo.release()
-
-    def start_idle_unload(self):
-        if not self.idle_unload_s or not hasattr(self.engine, "unload"):
-            return
-        print(f"[sfnx] the model unloads after {self.idle_unload_s} s without requests", flush=True)
-
-        def loop():
-            while True:
-                time.sleep(max(1.0, min(30.0, self.idle_unload_s / 4)))
-                try:
-                    self.unload(idle_for=self.idle_unload_s)
-                except EngineStuck as e:                # tried again at the next turn; the thread keeps running
-                    print(f"[sfnx] idle unload: {e}", flush=True)
-        threading.Thread(target=loop, daemon=True).start()
 
     def set_shared(self, defaults) -> dict:
         """The Chat settings every client gets for what it leaves out; {} / None = clients use their own again."""
@@ -2907,7 +2644,7 @@ class Service:
         elif s.get("busy"):
             state = "generating"
         elif not self.loaded():
-            state = "unloaded"
+            state = "stopped"
         else:
             state = "idle"
         live = {"state": state, "queued": s.get("queued", 0), "phase": s.get("phase") if s.get("busy") else None,
@@ -2954,42 +2691,6 @@ class Service:
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
 
-    def prometheus(self) -> str:
-        """GET /metrics/prometheus: the totals and what is running in Prometheus' text format, under llama-server's
-        metric names (llamacpp:*) so its dashboards work unchanged; the drafts and requests as strata:*."""
-        with self.status_lock:
-            s, t = dict(self.status), dict(self.totals)
-            running = len(self.live_reqs) or int(bool(s.get("busy")))
-            prompt_n = t["prompt_tokens"] - t["reused"]               # what was read, as llama.cpp counts it
-            prompt_s, decode_s = t["prompt_ms"] / 1000, t["decode_ms"] / 1000
-            # llama.cpp reads these two gauges from a bucket it resets on every scrape (server_metrics::bucket,
-            # "the gauges are averaged over the window between two scrapes"), so an idle server reports 0 rather
-            # than its lifetime average. Keep the same window here, or the names lie to llama.cpp dashboards.
-            was_prompt_n, was_prompt_s, was_predicted_n, was_decode_s = self.scrape_bucket
-            self.scrape_bucket = (prompt_n, prompt_s, t["output_tokens"], decode_s)
-        d_prompt_n, d_prompt_s = prompt_n - was_prompt_n, prompt_s - was_prompt_s
-        d_predicted_n, d_decode_s = t["output_tokens"] - was_predicted_n, decode_s - was_decode_s
-        rows = [
-            ("llamacpp:prompt_tokens_total", "counter", "Prompt tokens read", prompt_n),
-            ("llamacpp:prompt_tokens_cached_total", "counter", "Prompt tokens the conversation cache already held",
-             t["reused"]),
-            ("llamacpp:prompt_seconds_total", "counter", "Prompt read time", prompt_s),
-            ("llamacpp:tokens_predicted_total", "counter", "Tokens generated", t["output_tokens"]),
-            ("llamacpp:tokens_predicted_seconds_total", "counter", "Generation time", decode_s),
-            ("llamacpp:prompt_tokens_seconds", "gauge", "Average prompt read throughput in tokens/s, since the last scrape",
-             d_prompt_n / d_prompt_s if d_prompt_s > 0 else 0),
-            ("llamacpp:predicted_tokens_seconds", "gauge", "Average generation throughput in tokens/s, since the last scrape",
-             d_predicted_n / d_decode_s if d_decode_s > 0 else 0),
-            ("llamacpp:requests_processing", "gauge", "Requests running", running),
-            ("llamacpp:requests_deferred", "gauge", "Requests waiting their turn", s.get("queued") or 0),
-            ("strata:requests_total", "counter", "Requests finished", t["requests"]),
-            ("strata:drafts_offered_total", "counter", "Speculative draft tokens offered", t["drafts_offered"]),
-            ("strata:drafts_accepted_total", "counter", "Speculative draft tokens accepted", t["drafts_accepted"]),
-            ("strata:model_loaded", "gauge", "1 while the model is loaded", int(self.loaded())),
-        ]
-        return "".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
-                       for name, kind, help_, value in rows)
-
     def v1_status(self) -> dict:
         """GET /v1/status: what this server is and does, for a client that would rather ask than guess (a front-end
         that polls its OpenAI-compatible server's status, collabosm's for one): the model and its window, images,
@@ -3020,7 +2721,7 @@ class Service:
                             "requested": getattr(self, "requested_slots", max(1, int(getattr(self.engine, "batch", 0) or 0)))},
             "dialects": ["/v1/chat/completions", "/v1/messages", "/v1/responses"],
             "vision": {"enabled": images, "available": images, "error": None},
-            "image_generation": self.images.status() if self.images is not None else {"enabled": False},
+
             "activity": {"requests": totals["requests"] + running,
                          "in_flight": running + int(s.get("queued") or 0),
                          "last_request_at": int(last_at) if last_at else None},
@@ -3099,7 +2800,7 @@ class Service:
         if self.prompts is not None:
             self.prompts.forget(ids)
 
-    def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
+    def prepare(self, messages, tools, kwargs, max_new=None, force=None, cancel=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
         prompt; with thinking, Service.run writes it once the thinking is over."""
@@ -3287,7 +2988,7 @@ class Service:
                 print(f"[sfnx] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery,
+        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True,
                               declared_only=declared_only)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
@@ -3319,8 +3020,7 @@ class Service:
         tail = ""                                       # the last characters written (the newlines before a call)
         answered, close_retried = False, False          # #1053: content or a call came out; the thinking was closed
         timings, before = None, None                    # this request's timings; the engine's `last` before it
-        recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
-        looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
+
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
@@ -3372,7 +3072,7 @@ class Service:
                         if not par:
                             self.status["queued"] -= 1
                             queued_counted = False
-                    # issue #27: it died in an earlier request (or was unloaded) - start it again instead of failing
+                    # issue #27: it died in an earlier request - start it again instead of failing
                     # (parallel requests do not hold the fifo: one of them starts it, the others wait for that).
                     # #1603: a parallel request stays counted as queued until it is registered as running below -
                     # waiting here for the fifo (an image encode) left it neither - and one on a
@@ -3388,7 +3088,7 @@ class Service:
                             queued_counted = False
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
-                                  max_tokens=max_new, reasoning_recoveries=0, thinking_budget=budget,
+                                  max_tokens=max_new, thinking_budget=budget,
                                   request_id=request_id, record=trace["id"] if trace is not None else None)
                         if par:
                             self.live_reqs[id(st)] = (st, rate)
@@ -3406,7 +3106,7 @@ class Service:
                         segment_before = getattr(self.engine, "last", None)
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
-                        recover_prompt = None
+
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         literal = None                  # a stop token that quoted the marker: its text, to go on
                         opens = False                   # the thinking is over: write the forced call's opening
@@ -3455,8 +3155,6 @@ class Service:
                                 self._note(n, evs, st, rate)
                                 last_print = self._progress(last_print, st=st)
                                 for ev in evs:
-                                    if self.reasoning_loop_recovery and ev.kind == "reasoning":
-                                        reasoning_text += ev.text or ""
                                     if ev.kind in ("content", "tool_start", "tool_call"):
                                         answered = True
                                     yield "event", ev
@@ -3468,19 +3166,6 @@ class Service:
                                 if stops is not None and stops.hit is not None:
                                     finish = "stop"         # gen.close() below STOPs the engine, as for a stop token
                                     break
-                                if (self.reasoning_loop_recovery and not recovery_count and parser.state == "reasoning"
-                                        and n >= next_loop_check and not parser.buf and not parser.pending
-                                        and not detok.pending()):
-                                    next_loop_check = n + LOOP_CHECK_EVERY
-                                    repeat_coverage = reasoning_repeat_coverage(reasoning_text)
-                                    if repeat_coverage >= LOOP_COVERAGE:
-                                        if self.reasoning_loop_recovery == "stop":
-                                            looped = True        # #728: end the reply here, as for a repeated token
-                                            break
-                                        if not emb:              # "recover": not for a request with pictures
-                                            recover_prompt = focused_recovery_prompt(self.tok, ids, raw_ids)
-                                            if recover_prompt is not None:
-                                                break
                                 if budget and parser.state == "reasoning":
                                     thought += 1
                                     # at a clean point: no tag held back, no character split across tokens
@@ -3517,26 +3202,6 @@ class Service:
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
-                        if recover_prompt is not None and not cancel.is_set() and n < max_new:
-                            recovery_count += 1
-                            # Only the two settings that keep the same words coming are raised (temperature to at
-                            # least 1.0, presence penalty to at least 1.5): a client's top_p and top_k are never
-                            # touched, and its own request dict is copied, not changed.
-                            want = (max(1.0, float((sampling or {}).get("temperature") or 0)),
-                                    max(1.5, float((sampling or {}).get("presence_penalty") or 0)))
-                            if want != tuple(float((sampling or {}).get(k) or 0)
-                                             for k in ("temperature", "presence_penalty")):
-                                sampling = {**(sampling or {}), "temperature": want[0], "presence_penalty": want[1]}
-                            prompt = recover_prompt
-                            with self.status_lock:
-                                st["reasoning_recoveries"] = recovery_count
-                            if trace is not None:
-                                trace["reasoning_recoveries"] = recovery_count
-                                trace["reasoning_repeat_coverage"] = round(repeat_coverage, 3)
-                            print(f"[sfnx] repeated reasoning detected at {n} tokens "
-                                  f"(coverage={repeat_coverage:.3f}); resuming the same output with the low-effort "
-                                  "instruction (reasoning_loop_recovery)", flush=True)
-                            continue
                         if literal is not None and not cancel.is_set() and max_new - n - len(literal) >= 1:
                             literal_left -= 1
                             print("[sfnx] a stop token inside an open code span: the model quoted the marker; "
@@ -3609,15 +3274,11 @@ class Service:
                         prompt = prompt + seg + extra
                     if cancel.is_set():
                         finish = "cancel"
-                    elif looped:
-                        print(f"[sfnx] the thinking repeated the same passages (coverage={repeat_coverage:.3f}) at "
-                              f"{n} tokens: ended as \"length\" (reasoning_loop_recovery: \"stop\" in "
-                              "strata-<model>.json; remove it to turn this off)", flush=True)
                     elif repeated:
                         print(f"[sfnx] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
-                              f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
-                              "strata-<model>.json; 0 turns this off). If a new request with a short prompt does the "
-                              "same, restart the server and report it (#606)", flush=True)
+                              f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in the config; 0 "
+                              "turns this off). If a new request with a short prompt does the same, restart the "
+                              "service and report it (#606)", flush=True)
                 except GeneratorExit:                   # the client disconnected mid-stream
                     finish = "disconnect"
                     raise
@@ -3646,8 +3307,6 @@ class Service:
                                 "first_engine_token_s": first_engine_token_s,
                                 # the request's whole prompt, and the tokens read of it (None: an older engine)
                                 "prompt_total": len(ids), "prompt_read": last.get("prompt_read"),
-                                "reasoning_recoveries": recovery_count,
-                                "reasoning_repeat_coverage": round(repeat_coverage, 3),
                                 "engine_generated": last.get("generated"),
                                 "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
                                 "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
@@ -3668,9 +3327,6 @@ class Service:
                             t["decode_ms"] += last.get("decode_ms") or 0.0
                             t["drafts_offered"] += last.get("drafts_offered") or 0
                             t["drafts_accepted"] += last.get("drafts_accepted") or 0
-                            ft0 = st.get("first_token")             # this request's own (#465: one per request)
-                            self.latencies.observe(ft0 - started if ft0 else None, n,
-                                                   (last.get("decode_ms") or 0.0) / 1000, time.time() - started)
                             fresh = getattr(self.engine, "last", None)
                             if fresh is not None and fresh is not before:      # the engine's clock for THIS request
                                 timings = request_timings(seen, n, last)
@@ -3706,7 +3362,7 @@ class Service:
         except QueueCancelled:
             finish = "cancel"
             yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0, "timings": None,
-                           "reasoning_tokens": 0, "reasoning_recoveries": 0}
+                           "reasoning_tokens": 0}
             return
         finally:
             with self.status_lock:
@@ -3727,8 +3383,7 @@ class Service:
         if stops is not None and stops.hit is None and stops.held:
             yield "event", Event("content", stops.flush())     # the held tail was not a stop string after all
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
-                "timings": timings, "reasoning_tokens": thinking_n,
-                "reasoning_recoveries": recovery_count}
+                "timings": timings, "reasoning_tokens": thinking_n}
         if stops is not None and stops.hit is not None:
             done["stop_sequence"] = stops.hit
         yield "done", done
@@ -3825,103 +3480,10 @@ def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
           f"prompt_tokens={prompt_tokens} last={last.get('role')!r}:{preview!r}", flush=True)
 
 
-# ------------------------------------------------------------------------------------------------ MCP tool loop
-def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new, max_req, sampling, cancel,
-                 mcp_names):
-    """Service.run with the MCP tools executed here: the model writes a call to an MCP tool, the server runs it, adds
-    the call and its result to the conversation and lets the model continue - up to `max_rounds` times.  Yields what
-    Service.run yields (text, thinking, the request's own tool calls) plus ("mcp", {...}) for the tool activity, and
-    one ("done", ...) at the very end with the output tokens of every round.
-
-    `mcp_names`: the MCP tools this request offered; any other call is one of the request's own tools and ends the
-    turn as always (the client answers it).  MCP calls written in the same answer are then not run (their results
-    could not reach the model before the client's)."""
-    max_rounds = int(hub.settings["max_rounds"])
-    total, rounds, done = 0, 0, None
-    messages = list(messages)
-    while True:
-        text, reasoning, calls, own_calls = [], [], [], 0
-        for kind, x in svc.run(ids, thinking, tools, max_new, sampling, cancel, declared_only=True):
-            if kind == "done":
-                done = x
-                continue
-            if kind == "event":
-                ev: Event = x
-                if ev.call is not None and ev.call.name in mcp_names:
-                    if ev.kind == "tool_start":          # the model has started writing a call: say so at once
-                        yield "mcp", {"event": "start", "id": ev.call.id, "name": ev.call.name}
-                    elif ev.kind == "tool_call":
-                        calls.append(ev.call)
-                    continue                             # its argument pieces are not streamed to the client
-                if ev.kind == "tool_call":
-                    own_calls += 1
-                elif ev.kind == "content":
-                    text.append(ev.text)
-                elif ev.kind == "reasoning":
-                    reasoning.append(ev.text)
-            yield kind, x
-        total += done["completion_tokens"]
-        run_them = calls and not own_calls and done["finish"] == "stop" and not cancel.is_set()
-        if run_them and rounds >= max_rounds:
-            yield "mcp", {"event": "limit", "max_rounds": max_rounds}
-            run_them = False
-        if not run_them:
-            for c in calls:                              # announced, never run: close them in the client's view
-                yield "mcp", {"event": "result", "id": c.id, "ok": False, "skipped": True, "text": "not run",
-                              "chars": 0, "truncated": False, "ms": 0}
-            break
-        rounds += 1
-        results = []
-        for c in calls:
-            s, tool = hub.routes().get(c.name, (None, c.name))
-            yield "mcp", {"event": "call", "id": c.id, "name": c.name, "server": s.name if s else None,
-                          "tool": tool, "arguments": c.arguments, "round": rounds}
-            # The call runs on a thread while this generator keeps yielding heartbeats: they reach the client as
-            # keep-alives, which is how a client that went away (the web app's Stop) is noticed during a slow tool.
-            box = {}
-
-            def work(c=c, box=box):
-                try:
-                    box["r"] = hub.call(c.name, c.arguments, cancel)
-                except McpCancelled:
-                    box["cancelled"] = True
-            worker = threading.Thread(target=work, daemon=True)
-            worker.start()
-            try:
-                while worker.is_alive():
-                    worker.join(1.0)
-                    if worker.is_alive():
-                        yield "ping", None
-            except GeneratorExit:
-                cancel.set()                             # the client is gone: stop the tool too
-                raise
-            if "r" not in box:
-                break
-            r = box["r"]
-            print(f"[sfnx] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
-                  f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
-            results.append(r["text"])
-            yield "mcp", {"event": "result", "id": c.id, **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")}}
-        if cancel.is_set() or len(results) < len(calls):
-            done = {**done, "finish": "cancel"}
-            break
-        messages.append({"role": "assistant", "content": "".join(text).strip(),
-                         **({"reasoning_content": "".join(reasoning).strip()} if reasoning else {}),
-                         "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
-        messages += [{"role": "tool", "content": r} for r in results]
-        try:
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, cancel=cancel)
-        except ClientGone:                                      # #1999: the client left while a picture was prepared
-            done = {**done, "finish": "cancel"}
-            break
-    yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
-
-
-def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None, force=None):
-    """`run`: the events to send instead of Service.run's (run_with_mcp); its ("mcp", {...}) items become chunks with
-    an empty delta and a `strata_mcp` field, which only the web app reads.  `force`: see Service.run."""
+def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None):
+    """The chat completion's chunks from Service.run's events.  `force`: see Service.run."""
     cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
-    model = svc.model_for(req)
+    model = svc.model
 
     def chunk(delta, finish=None):
         return {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
@@ -3931,13 +3493,9 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     finished = set()                               # ... and the ones whose final tool_call came (#211)
-    for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel, force=force, declared_only=True):
+    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force, declared_only=True):
         if kind == "ping":                         # nothing to say yet: an SSE comment keeps the stream alive
             yield None
-        elif kind == "mcp":
-            c = chunk({})
-            c["strata_mcp"] = x
-            yield c
         elif kind == "event":
             ev: Event = x
             if ev.kind == "reasoning" and ev.text:
@@ -3982,12 +3540,11 @@ def _is_json(text: str) -> bool:
 
 
 def openai_collect(chunks) -> dict:
-    content, reasoning, by_index, last, mcp = [], [], {}, None, []
+    content, reasoning, by_index, last = [], [], {}, None
     for c in chunks:
         if c is None:                              # a heartbeat
             continue
-        if c.get("strata_mcp"):
-            mcp.append(c["strata_mcp"])
+
         d = c["choices"][0]["delta"]
         content.append(d.get("content") or "")
         reasoning.append(d.get("reasoning_content") or "")
@@ -4007,8 +3564,7 @@ def openai_collect(chunks) -> dict:
         msg["reasoning_content"] = "".join(reasoning)
     if calls:
         msg["tool_calls"] = calls
-    if mcp:
-        msg["strata_mcp"] = mcp
+
     out = {"id": last["id"], "object": "chat.completion", "created": last["created"], "model": last["model"],
            "choices": [{"index": 0, "message": msg, "finish_reason": last["choices"][0]["finish_reason"]}],
            "usage": last["usage"]}
@@ -4053,7 +3609,7 @@ def structured_chunks(chunks, validator):
 def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None):
     mid = "msg_" + uuid.uuid4().hex[:24]
     yield "message_start", {"type": "message_start", "message": {
-        "id": mid, "type": "message", "role": "assistant", "model": svc.model_for(req), "content": [],
+        "id": mid, "type": "message", "role": "assistant", "model": svc.model, "content": [],
         "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": len(ids), "output_tokens": 0}}}
     index, open_kind, used_tool = -1, None, False
 
@@ -4321,14 +3877,12 @@ def make_handler(svc: Service):
             origin = self.headers.get("Origin")
             if svc.api_key or not origin:
                 return False
-            if not origin_allowed(origin, self.headers.get("Host"), svc.host_names,
-                                  [*svc.trusted_origins, *svc.cors_origins]):
+            if not origin_allowed(origin, self.headers.get("Host"), svc.host_names):
                 print(f"[sfnx] refused an API request from the web page {origin!r} (no API key; add its host to "
-                      f"\"allowed_hosts\" or its origin to \"cors_origins\" in the config)", flush=True)
+                      f"\"allowed_hosts\" in the config)", flush=True)
                 self._json(403, {"error": {"type": "forbidden", "message":
                                  f"web pages of {origin} may not use this server without an API key; set \"api_key\", "
-                                 f"or add the page's host to \"allowed_hosts\" (or its origin to \"cors_origins\") "
-                                 f"in the config"}})
+                                 f"or add the page's host to \"allowed_hosts\" in the config"}})
                 return True
             if not self.headers.get("Content-Type", "").startswith("application/json"):
                 self._json(415, {"error": {"message": "send application/json"}})
@@ -4374,34 +3928,6 @@ def make_handler(svc: Service):
                 with svc.status_lock:
                     self.record.update(values)
 
-        def _cors(self):
-            """#321: CORS headers for an API path (/v1/*) and an origin the config lists in cors_origins - nothing
-            otherwise, so a browser keeps every other page away from the API, /settings, /unload and the MCP tools."""
-            if not svc.cors_origins or not self.path.split("?")[0].startswith("/v1/"):
-                return
-            origin = (self.headers.get("Origin") or "").rstrip("/")
-            if "*" in svc.cors_origins:
-                allow = "*"
-            elif origin and origin in svc.cors_origins:
-                allow = origin
-                self.send_header("Vary", "Origin")
-            else:
-                return
-            self.send_header("Access-Control-Allow-Origin", allow)
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            # the headers the preflight asks for (SDKs add their own; "*" does not cover Authorization)
-            asked = self.headers.get("Access-Control-Request-Headers")
-            self.send_header("Access-Control-Allow-Headers",
-                             asked or "Authorization, Content-Type, x-api-key, anthropic-version, anthropic-beta")
-            self.send_header("Access-Control-Max-Age", "600")
-
-        def do_OPTIONS(self):
-            # a CORS preflight: no credentials come with it, so no API key; the headers only for cors_origins
-            self.send_response(204)
-            self._cors()
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-
         def _json(self, code, obj, headers=None):
             if self.record is not None:
                 with svc.status_lock:
@@ -4415,8 +3941,6 @@ def make_handler(svc: Service):
             self.send_header("Content-Type", "application/json")
             for k, v in (headers or {}).items():
                 self.send_header(k, str(v))
-
-            self._cors()
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -4466,26 +3990,7 @@ def make_handler(svc: Service):
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            if path == "/metrics/prometheus":
-                if self._authorized():
-                    body = svc.prometheus().encode()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
-                return
             if path == "/metrics":
-                from front import prometheus
-                if prometheus.wants_prometheus(self.headers.get("Accept", ""), urlsplit(self.path).query):
-                    if self._authorized():   # a scraper: the text format, vLLM's names (front/prometheus.py)
-                        body = prometheus.render(svc.metrics(), svc.latencies.snapshot()).encode()
-                        self.send_response(200)
-                        self.send_header("Content-Type", prometheus.CONTENT_TYPE)
-                        self.send_header("Content-Length", str(len(body)))
-                        self.end_headers()
-                        self.wfile.write(body)
-                    return
                 if self._authorized():
                     # the last 12 requests; `?requests=all` every one kept (the Monitor's "Show all", issue #35)
                     self._json(200, svc.metrics(all_requests="requests=all" in self.path))
@@ -4504,11 +4009,6 @@ def make_handler(svc: Service):
                     self._json(200, {"shared": bool(svc.shared), "defaults": svc.shared})
                 return
 
-            if path == "/mcp":
-                # the MCP servers, their state and tools (the web app's switch and Monitor card)
-                if self._authorized():
-                    self._json(200, svc.mcp.status() if svc.mcp else {"servers": [], "tools": 0})
-                return
             if path == "" or (path == "/api-monitor" and svc.api_monitor):
                 body = (ROOT / "front" / "web" / ("monitor.html" if path else "index.html")).read_bytes()
                 self.send_response(200)
@@ -4519,21 +4019,8 @@ def make_handler(svc: Service):
             elif path in ("/health", "/api/health"):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
-                                 "image_generation": svc.images is not None,
+
                                  "loaded": svc.loaded(), "service": "strata"})
-            elif path.startswith("/v1/images/files/"):
-                # response_format url: the name (32 random hex digits) is the access, as an OpenAI image URL is
-                f = svc.images.file(path[len("/v1/images/files/"):]) if svc.images is not None else None
-                if f is None:
-                    self._json(404, {"error": {"message": "not found (the server keeps the newest images only)"}})
-                    return
-                body = f.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "image/png")
-                self.send_header("Cache-Control", "private, max-age=86400")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
             elif path == "/status":
                 if not self._authorized():                  # #212: it shows the end of the last answer
                     return
@@ -4555,17 +4042,7 @@ def make_handler(svc: Service):
                              "meta": {"n_ctx": svc.reported_ctx()},
                              "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
                                               "output_modalities": ["text"]}}
-                    if not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
-                        model["status"] = {"value": "unloaded"}   # like llama-server's router: listed, loads on use
-                        loaded = True
-                    if svc.aliases:                       # #297: the aliases, and each one listed under its own id
-                        model["aliases"] = list(svc.aliases)
-                    data = [model, *({**model, "id": x, "alias_of": svc.model} for x in svc.aliases)]
-                    data = data if loaded else []
-                    if svc.images is not None:            # the image model: POST /v1/images/generations
-                        data.append({"id": svc.images.model, "object": "model", "status": {"value": "loaded"},
-                                     "architecture": {"input_modalities": ["text"], "output_modalities": ["image"]}})
-                    self._json(200, {"object": "list", "data": data})
+                    self._json(200, {"object": "list", "data": [model] if loaded else []})
             elif path == "/props":
                 if self._authorized():
                     self._props()
@@ -4610,32 +4087,6 @@ def make_handler(svc: Service):
             if path == "/settings":
                 self._settings()
                 return
-
-            if path in ("/unload", "/load") and not self._control_body():
-                return
-            # JSON from Strata's own page only, as /settings: else a plain form POST from any site unloads the model
-            if path in ("/unload", "/load") and not self._own_page("the model can be loaded or unloaded"):
-                return
-
-            if path == "/unload":                            # give the GPU back now (between requests)
-                try:
-                    wait_s = unload_wait(parse_qs(urlsplit(self.path).query).get("wait", [None])[0],
-                                         svc.UNLOAD_WAIT_S)
-                    r = svc.unload_waiting(wait_s) if wait_s else svc.unload()
-                except EngineStuck as e:
-                    self._json(503, {"error": {"type": "server_error", "message": str(e)}})
-                    return
-                self._json(409 if r == "busy" else 200, {"status": r})
-                return
-            if path == "/load":                              # load now, e.g. ahead of a request
-                try:
-                    svc.load()
-                    self._json(200, {"status": "loaded"})
-                except GpuBusy as e:
-                    ra = getattr(e, "retry_after", None)
-                    self._json(503, {"error": {"type": "server_error", "message": str(e)}},
-                               headers={"Retry-After": int(ra)} if ra else None)
-                return
             try:
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
@@ -4644,33 +4095,6 @@ def make_handler(svc: Service):
                     self._json(404, responses_error_body("this server keeps no responses (stateless); send the "
                                                          "whole conversation to POST /v1/responses", code="not_found"))
                     return
-                if path in ("/v1/load", "/v1/unload"):
-                    if not self._own_page("the model can be loaded or unloaded"):
-                        return
-                    if req.get("model") not in (None, svc.model):
-                        self._json(404, {"error": {"message": "model not found"}})
-                        return
-                    if path == "/v1/unload":
-                        wait_s = unload_wait(parse_qs(urlsplit(self.path).query).get("wait", [None])[0],
-                                             svc.UNLOAD_WAIT_S)
-                        result = svc.unload_waiting(wait_s) if wait_s else svc.unload()
-                        if result == "busy":
-                            raise ModelBusy("a request is running or queued")
-                    else:
-                        if not svc.fifo.acquire(blocking=False):
-                            raise ModelBusy("a request is running or queued")
-                        try:
-                            with svc.status_lock:
-                                if svc.status.get("busy") or svc.status.get("queued"):
-                                    raise ModelBusy("a request is running or queued")
-                            svc.ensure_loaded()
-                            svc.last_request_at = time.time()
-                        finally:
-                            svc.fifo.release()
-                        result = "loaded"
-                    self._json(200, {"status": result, **svc.v1_status()})
-                    return
-
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
                     self.record = svc.begin_request(path, req)
                 if path == "/v1/responses":
@@ -4681,8 +4105,7 @@ def make_handler(svc: Service):
                     self._anthropic(req)
                 elif path == "/v1/messages/count_tokens":
                     self._count_tokens(req)
-                elif path == "/v1/images/generations":
-                    self._images(req)
+
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except ValueError as e:
@@ -4691,8 +4114,6 @@ def make_handler(svc: Service):
                     self._json(400, responses_error_body(str(e)))
                 else:
                     self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
-            except ModelBusy as e:
-                self._json(409, {"error": {"type": "model_busy", "message": str(e)}})
             except StructuredOutputError as e:
                 self._json(502, {"error": {"type": "structured_output_failed", "code": "structured_output_failed",
                                           "message": str(e)}})
@@ -4733,39 +4154,12 @@ def make_handler(svc: Service):
                         record["state"] = "error" if record.get("error") else record.get("outcome", "completed")
                     svc.request_trace.record = None
 
-        def _images(self, req):
-            """POST /v1/images/generations (front/images.py): one sd-cli job in the GPU's turn."""
-            gen = svc.images
-            if gen is None:
-                self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
-                                           "message": "image generation is not set up on this server (run setup "
-                                                      "with --images qwen-image)"}})
-                return
-            job = images_api.parse_request(req, gen.cfg)        # ImageRequestError (a ValueError): 400
-            svc.last_request_at = time.time()
-            cancel = threading.Event()
-            self._watch_client(cancel)
-            print(f"[sfnx] image: {job['width']}x{job['height']}, n={job['n']}, {job['steps']} steps, "
-                  f"seed {job['seed']}", flush=True)
-            try:
-                with images_api.gpu_turn(svc, gen, job, cancel) as policy:
-                    images, figures = gen.run(job, cancel)
-            except images_api.ImageJobFailed as e:
-                self._json(500, {"error": {"type": "server_error", "code": "image_generation_failed",
-                                           "message": str(e)}})
-                return
-            figures["gpu_policy"] = policy
-            print(f"[sfnx] image done in {figures['seconds']:.1f} s ({policy})", flush=True)
-            host = self.headers.get("Host") or f"{self.server.server_address[0]}:{self.server.server_address[1]}"
-            scheme = "https" if (self.headers.get("X-Forwarded-Proto") or "").lower() == "https" else "http"
-            self._json(200, gen.response(images, job, figures, f"{scheme}://{host}"))
-
         def _props(self):
             model = parse_qs(urlsplit(self.path).query).get("model", [svc.model])[0]
-            if model not in svc.model_names():
+            if model != svc.model:
                 self._json(404, {"error": {"message": "model not found"}})
                 return
-            if not svc.loaded() and not getattr(svc.engine, "unloaded", False):
+            if not svc.loaded():
                 self._json(503, {"error": {"message": "the engine is not running"}})
                 return
             defaults = {**model_card_sampling(svc.model_arch, True), **svc.sampling_defaults, **svc.shared}
@@ -4787,73 +4181,32 @@ def make_handler(svc: Service):
                 props["build_info"] = "Strata " + str(version)
             self._json(200, props)
 
-        def _control_body(self) -> bool:
-            """Consume the unused control body before replying/closing (the close otherwise sends a TCP reset)."""
-            if self._chunked():
-                self.body_read = True
-                try:
-                    self.connection.settimeout(2.0)
-                    self._read_chunked(65536, keep=False)
-                except BadBody as e:
-                    self._json(e.status, {"error": {"message": f"control request: {e}"}})
-                    return False
-                except OSError:
-                    self._json(400, {"error": {"message": "incomplete control request body"}})
-                    return False
-                return True
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-            except ValueError:
-                self._json(400, {"error": {"message": "invalid Content-Length"}})
-                return False
-            if not 0 <= length <= 65536:
-                self._json(413, {"error": {"message": "control request body is limited to 64 KiB"}})
-                return False
-            timeout = self.connection.gettimeout()
-            try:
-                self.connection.settimeout(2.0)
-                complete = len(self.rfile.read(length)) == length
-            except OSError:
-                complete = False
-            finally:
-                self.connection.settimeout(timeout)
-                self.body_read = True                    # nothing left for the drain to wait for (#594)
-            if not complete:
-                self._json(400, {"error": {"message": "incomplete control request body"}})
-            return complete
-
         def _own_page(self, what) -> bool:
             """Only JSON (a form or a "simple" cross-site request can't send it without a CORS preflight, which this
-            server never grants) and no foreign Origin: a web page elsewhere must not change settings or run tools."""
+            server never grants) and no foreign Origin: a web page elsewhere must not change settings."""
             if not self.headers.get("Content-Type", "").startswith("application/json"):
                 self._json(415, {"error": {"message": "send application/json"}})
                 return False
             if self._foreign_origin():
-                self._json(403, {"error": {"message": f"{what} only from Strata's own page (or an origin in the "
-                                                      f"config's trusted_origins)"}})
+                self._json(403, {"error": {"message": f"{what} only from this server's own page"}})
                 return False
             return True
 
         def _foreign_origin(self) -> bool:
-            """A web page of another origin sent this.  The Origin must be this server's own address (host and port),
-            or an origin the config trusts (trusted_origins: the web app behind a reverse proxy or tunnel); no Origin
-            is a client that is no browser.  Headers a proxy adds (X-Forwarded-*, CF-Ray, CF-Connecting-IP) prove
-            nothing about the page that sent the request, so they open nothing."""
+            """A web page of another origin sent this.  The Origin must be this server's own address (host and port);
+            no Origin is a client that is no browser.  Headers a proxy adds (X-Forwarded-*, CF-Ray, CF-Connecting-IP)
+            prove nothing about the page that sent the request, so they open nothing."""
             origin = (self.headers.get("Origin") or "").rstrip("/")
-            return bool(origin) and origin.split("://", 1)[-1] != self.headers.get("Host", "") and \
-                origin not in svc.trusted_origins
+            return bool(origin) and origin.split("://", 1)[-1] != self.headers.get("Host", "")
 
         def _no_local_images(self, messages):
-            """A web page of another origin must not have a file on this computer read as an image.  Without an
-            api_key, _foreign_page refuses such a page unless cors_origins lets it in - and a page cors_origins lets
-            in (["*"]: every page) could name any file and, CORS allowing, read what the model says about it.  data:
-            and http(s) images are the page's own to send; files come from Strata's own page, a trusted origin or a
-            client that is no browser.  ValueError (a 400)."""
+            """A web page of another origin (one on a name in allowed_hosts, or any page with the API key) must not have
+            a file on this machine read as an image: data: and http(s) images are the page's own to send; files come
+            from this server's own page or a client that is no browser.  ValueError (a 400)."""
             if self._foreign_origin() and any(not src.startswith(("data:", "http://", "https://"))
                                               for src in images_of(messages)):
-                raise ValueError("a web page of another origin cannot have a file on this computer read as an "
-                                 "image: send it as a data: URL (or add the page's origin to the config's "
-                                 "trusted_origins)")
+                raise ValueError("a web page of another origin cannot have a file on this machine read as an "
+                                 "image: send it as a data: URL")
 
         def _settings(self):
             # They change what every client gets, so only the app's own page may set them
@@ -4881,7 +4234,6 @@ def make_handler(svc: Service):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("X-Accel-Buffering", "no")   # nginx and similar proxies pass each event at once
-            self._cors()
             self.end_headers()
 
         def _capture(self, items, api):
@@ -4930,32 +4282,19 @@ def make_handler(svc: Service):
                 tools = None
             force = forced_call(req.get("tool_choice"), tools)      # a bad value is a 400 before anything is sent
             messages, validator = prepare_format(req.get("response_format"), messages)
-            if validator is not None and (tools or req.get("strata_mcp")):
-                raise ValueError("structured response_format with tools/MCP is not supported")
+            if validator is not None and tools:
+                raise ValueError("structured response_format with tools is not supported")
             svc.load()
-            max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
+            max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
 
-            use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (front/mcp.py)
-            own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # #592: a second line of defence
-            if use_mcp:
-                if not self._own_page("MCP tools can be used"):   # tools run with the user's rights on this PC
-                    return
-                svc.mcp.wait(10)                                  # servers still starting (only right after start)
-                extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
-                use_mcp = bool(extra)
-                tools = (tools or []) + extra or None
-            if force and use_mcp:
-                raise ValueError("a forced tool_choice with MCP tools is not supported")
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, cancel=cancel)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
-            run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
-                               {t["name"] for t in extra}) if use_mcp else None
-            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
+            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, force=force)
             if validator is not None:
                 chunks = structured_chunks(chunks, validator)
             chunks = self._capture(chunks, "openai")
@@ -4987,29 +4326,9 @@ def make_handler(svc: Service):
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
 
-        def _responses_ready(self, req, events):
-            """Send a finished Responses result that did not run on the engine."""
-            if not req.get("stream"):
-                return self._json(200, responses_api.collect(events))
-            self._sse()
-            try:
-                for e in events:
-                    self.wfile.write(f"event: {e['type']}\n".encode() + b"data: " +
-                                     json.dumps(e, ensure_ascii=False).encode() + b"\n\n")
-                    self.wfile.flush()
-            except OSError:
-                self._note(outcome="disconnected")
-
         def _responses(self, req):
             """#451: POST /v1/responses - OpenAI's Responses API, stateless (front/responses.py), on the chat path.
             Errors use the Responses format; once the stream has started they arrive as a response.failed event."""
-            try:
-                title = (responses_api.thread_title_events(req, svc.model_for(req))
-                         if svc.codex_thread_titles else None)
-            except ResponsesError as e:
-                return self._json(e.status, e.body())
-            if title is not None:
-                return self._responses_ready(req, title)
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             try:
@@ -5019,8 +4338,6 @@ def make_handler(svc: Service):
                 return
             except ResponsesError as e:
                 return self._json(e.status, e.body())
-            except ModelBusy as e:
-                return self._json(409, responses_error_body(str(e), "server_error", code="model_busy"))
             except (GpuBusy, EngineStarting, EngineStuck, EngineDied) as e:
                 return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
 
@@ -5130,29 +4447,15 @@ def make_handler(svc: Service):
             except ValueError as e:                           # its message starts with the field's name: the param
                 raise ResponsesError(str(e), str(e).partition(":")[0]) from None
             svc.load()
-            # #924 (opt-in): a Codex compaction request is rendered with its conversation's tools, so its prompt
-            # starts as the cached one did; the parser and the response keep the request's own tools
-            shown = responses_api.prompt_tools(req, tools) if svc.codex_compaction_cache else tools
             try:
-                try:
-                    ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0, req=req,
-                                                          cancel=cancel)
-                except ValueError:
-                    if shown is tools:
-                        raise
-                    shown = tools                            # too long with the kept tools: the request as sent
-                    ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0, req=req,
-                                                          cancel=cancel)
-            except ResponsesError:
-                raise
+                ids, thinking, max_new = svc.prepare(messages, tools, kw, req.get("max_output_tokens") or 0,
+                                                     cancel=cancel)
             except ValueError as e:                          # too long for the context, an image without vision
                 raise ResponsesError(str(e), "input", "context_length_exceeded" if "context" in str(e) else None) \
                     from None
-            if svc.codex_compaction_cache:
-                responses_api.prompt_made(req, shown)
             _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
             include = req.get("include") if isinstance(req.get("include"), list) else []
-            asm = responses_api.Assembler(req, svc.model_for(req), len(ids), names,
+            asm = responses_api.Assembler(req, svc.model, len(ids), names,
                                           "reasoning.encrypted_content" in include, validator is not None,
                                           call_validators)
             # the request is also the sampling dict, as on the chat path (temperature, top_p, top_k, seed, ...)
@@ -5181,7 +4484,7 @@ def make_handler(svc: Service):
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, cancel=cancel)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
             events = self._capture(events, "anthropic")
@@ -5305,10 +4608,10 @@ def allowed_hosts_of(value, env: str = "") -> list[str]:
     return list(dict.fromkeys(out))
 
 
-def host_names_for(bind_host: str, allowed_hosts=(), trusted_origins=()) -> set[str]:
+def host_names_for(bind_host: str, allowed_hosts=()) -> set[str]:
     """Every name this server answers to besides an IP address: localhost, the address it listens on, the config's
-    allowed_hosts and trusted_origins' hosts, and - listening beyond this PC (0.0.0.0 or a LAN address) - this PC's
-    name and LAN addresses (the LAN addresses matter for the Origin check, which takes no IP on trust)."""
+    allowed_hosts, and - listening beyond this machine (0.0.0.0 or a LAN address) - its name and LAN addresses (the
+    LAN addresses matter for the Origin check, which takes no IP on trust)."""
     names = set(LOOPBACK_NAMES)
     bind = host_name(bind_host)
     if bind and bind not in ("0.0.0.0", "::"):
@@ -5321,7 +4624,6 @@ def host_names_for(bind_host: str, allowed_hosts=(), trusted_origins=()) -> set[
             pass
         names.update(("host.docker.internal", *lan_addresses()))
     names.update(x for x in allowed_hosts if x != "*")
-    names.update(filter(None, (host_name(o.split("://", 1)[-1]) for o in trusted_origins)))
     return names
 
 
@@ -5355,14 +4657,9 @@ def explicit_no_key(value) -> bool:
     return isinstance(value, str) and value.strip().lower() == "none"
 
 
-def open_server_warning(port, public=False, tools=False) -> str:
+def open_server_warning(port) -> str:
     """The one plain warning for a server on the network with no API key (recommend, never force)."""
-    msg = f"no API key: anyone who can reach port {port} can use the model" + (" and its tools" if tools else "") + "."
-    if tools:
-        msg += " The tools can read and change files on this computer."
-    if public:
-        msg += " This address is on the public internet, so anyone who finds it can use it."
-    return msg + " Add an API key to keep others out."
+    return f"no API key: anyone who can reach port {port} can use the model. Add an API key to keep others out."
 
 
 def api_key_of(value):
@@ -5398,15 +4695,13 @@ def key_matches(given: str, key) -> bool:
     return ok
 
 
-def origin_allowed(origin: str, host, names, origins=()) -> bool:
+def origin_allowed(origin: str, host, names) -> bool:
     """A browser page's Origin that may use the model without an API key: this server's own page (the Origin is the
-    request's own Host), a page on one of the names this server answers to (any port), or an origin the config lists
-    (trusted_origins, cors_origins).  Unlike the Host check no IP passes on trust: a page served from any other IP is
-    another site.  "null" (a sandboxed frame, a file:// page) does not pass: any site can send it.  An origin of another
-    scheme (chrome-extension://, moz-extension://, an Electron app's app://) does: no web site can send one."""
+    request's own Host) or a page on one of the names this server answers to (any port).  Unlike the Host check no IP
+    passes on trust: a page served from any other IP is another site.  "null" (a sandboxed frame, a file:// page) does
+    not pass: any site can send it.  An origin of another scheme (chrome-extension://, moz-extension://, an Electron
+    app's app://) does: no web site can send one."""
     origin = (origin or "").strip().rstrip("/")
-    if origin in origins or "*" in origins:             # cors_origins ["*"]: the config lets every page in
-        return True
     scheme, sep, rest = origin.lower().partition("://")
     if not sep or not scheme:
         return False
@@ -5419,34 +4714,12 @@ def origin_allowed(origin: str, host, names, origins=()) -> bool:
 
 
 def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
-    svc.host_names = host_names_for(host, svc.allowed_hosts, svc.trusted_origins)
+    svc.host_names = host_names_for(host, svc.allowed_hosts)
     svc.start_telemetry()
     httpd = Server((host, port), make_handler(svc))
     httpd.svc = svc
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
-
-
-def origins_of(value, key: str, wildcard: bool) -> list[str]:
-    """#321: a config's origin list ("https://chat.example.com" or a list of them) - scheme://host[:port], no path;
-    "*" only where `wildcard` allows it.  A wrong entry stops the start rather than opening less or more than meant."""
-    if value is None or value == "" or value == []:
-        return []
-    items = [value] if isinstance(value, str) else value
-    if not isinstance(items, list) or not all(isinstance(x, str) for x in items):
-        raise SystemExit(f"[sfnx] {key}: expected an origin or a list of origins")
-    out = []
-    for x in items:
-        x = x.strip().rstrip("/")
-        if x == "*" and wildcard:
-            out.append(x)
-            continue
-        scheme, sep, rest = x.partition("://")
-        if scheme not in ("http", "https") or not sep or not rest or "/" in rest or "*" in rest:
-            raise SystemExit(f"[sfnx] {key}: {x!r} is not an origin like https://chat.example.com"
-                             + ("" if wildcard else " (no wildcards here)"))
-        out.append(x)
-    return out
 
 
 def clean_shared_defaults(d) -> dict:
@@ -5512,11 +4785,7 @@ CONFIG_KEYS = frozenset((
     "tokenizer", "model_name", "host", "port", "api_key", "allowed_hosts", "api_monitor",
     # requests
     "sampling", "reasoning_effort", "reasoning_budget_tokens", "reasoning_close_retry", "answer_room",
-    "fit_max_tokens", "repeat_stop_tokens", "anthropic_thinking",
-    "images", "mcp", "mcp_servers", "aliases", "codex_thread_titles", "codex_compaction_cache", "cors_origins",
-    "trusted_origins", "idle_unload_s", "min_free_vram_mib", "before_load", "before_load_timeout_s",
-    "before_load_ignore_failure", "before_load_strict", "lazy_load", "tool_call_recovery", "env_to_user",
-    "reasoning_loop_recovery"))
+    "fit_max_tokens", "repeat_stop_tokens", "anthropic_thinking"))
 # the "vision" section's keys (Vision.reader_args, vision_env and the CPU fallback read them)
 VISION_KEYS = frozenset(("exe", "cpu_exe", "mmproj", "model", "gpu", "threads", "max_tokens", "min_tokens",
                          "cuda_device"))
@@ -5721,23 +4990,12 @@ def main(argv=None) -> int:
     ap.add_argument("--no-api-key", action="store_true",
                     help="serve on the network without an API key (anyone who can reach the port can use the model; "
                          "also \"api_key\": \"none\" in the config). Warns once, never refuses")
-    ap.add_argument("--mcp-config", help="a JSON file with MCP servers in Claude Desktop's format ({\"mcpServers\": "
-                                         "{...}}); the web app's chat can use their tools (also \"mcp_servers\" in "
-                                         "the config)")
-    ap.add_argument("--lazy", action="store_true", help="start the API unloaded (the engine and the vision encoder start with the first request)")
+
     ap.add_argument("--api-monitor", action=argparse.BooleanOptionalAction, default=None,
                     help="the API request monitor (/api-monitor and the Monitor tab's request details): keeps the last "
                          "100 requests' prompts and answers in memory, each cut to its start and end (on by default; "
                          "--no-api-monitor or \"api_monitor\": false in the config keeps nothing)")
-    ap.add_argument("--idle-unload", type=float, default=None, metavar="SECONDS",
-                    help="unload the model after this many seconds without requests, so other programs (games, other "
-                         "model servers) can use the VRAM; the next request loads it again (also \"idle_unload_s\" "
-                         "in the config; default: never)")
-    ap.add_argument("--min-free-vram-mib", type=int, default=None,
-                    help="load an unloaded model only when this much VRAM is free, else answer 503 (also "
-                         "\"min_free_vram_mib\" in the config; default: always load)")
-    ap.add_argument("--before-load", help="a command run before the model is loaded again (e.g. to unload another "
-                                          "server's model; also \"before_load\" in the config, a string or a list)")
+
     a = ap.parse_args(list(sys.argv[1:] if argv is None else argv))
     # Every ordinary way of being asked to stop takes Ctrl+C's path (QUIT to the engine, then exit): SIGTERM (systemd)
     # and SIGHUP (the terminal closed, ssh dropped). They are installed before anything slow starts, so one that
@@ -5797,8 +5055,7 @@ def main(argv=None) -> int:
         merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
         types = json.loads((tpath / "token_type.json").read_text())
         tok = ST.Tokenizer(tokens, merges, types)
-    hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
-    lazy = False
+
     if a.engine == "sfnx":
         if not cfg:
             ap.error("--engine sfnx needs --config")
@@ -5808,24 +5065,21 @@ def main(argv=None) -> int:
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
             print(f"[sfnx] sampling defaults from the config: {pretty}", flush=True)
-        lazy = a.lazy or cfg.get("lazy_load") is True
         if cfg.get("vision"):
-            print("loading the vision encoder ..." if not lazy else
-                  "vision encoder unloaded; it starts with the model ...", flush=True)
+            print("[sfnx] loading the vision encoder ...", flush=True)
             # relative paths are the config's cwd's, as for the engine below
             vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                         if k in ("exe", "cpu_exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
                     for k, v in cfg["vision"].items()}
             vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                            env=vision_env(cfg, env), lazy=lazy)
-        print("model unloaded; the first request loads it ..." if lazy else
-              "loading the model (the first start takes a minute or two) ...", flush=True)
+                            env=vision_env(cfg, env))
+        print("[sfnx] loading the model ...", flush=True)
         exe = cfg["exe"] if os.path.isabs(cfg["exe"]) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", cfg["exe"]))
         try:
             silence = engine_silence_s(cfg)             # #481: checked before the (minutes-long) start
         except ValueError as e:
             raise SystemExit(f"[sfnx] config {e}")
-        engine = StrataEngine(exe, engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=env, lazy=lazy)
+        engine = StrataEngine(exe, engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=env)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
@@ -5849,21 +5103,6 @@ def main(argv=None) -> int:
             and requested > 0 else 1
     svc.answer_room = cfg.get("answer_room") is not False
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
-    if cfg.get("images"):                               # image generation (front/images.py), set up by setup --images
-        icfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
-                    if k in ("exe", "diffusion_model", "vae", "llm", "out_dir") and isinstance(v, str)
-                    and not os.path.isabs(v) else v)
-                for k, v in cfg["images"].items()}
-        try:
-            svc.images = images_api.ImageGen(icfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None)
-        except ValueError as e:
-            raise SystemExit(f"[sfnx] config: {e}")
-        gone = svc.images.missing()
-        if gone:
-            print(f"[sfnx] image generation: missing {', '.join(gone)} - requests fail until setup --images has run "
-                  "again", flush=True)
-        print(f"[sfnx] image generation: {svc.images.model} {icfg.get('quant') or ''} on "
-              f"{icfg.get('backend') or '?'} (POST /v1/images/generations; GPU policy {svc.images.policy})", flush=True)
     if cfg.get("reasoning_effort") is not None:         # #1641: the thinking level of requests that name none
         try:
             svc.config_effort = clean_shared_defaults({"reasoning_effort": cfg["reasoning_effort"]}).get("reasoning_effort")
@@ -5872,20 +5111,12 @@ def main(argv=None) -> int:
         if svc.config_effort:
             print(f"[sfnx] thinking level: {svc.config_effort} (reasoning_effort in the config; a request, or the "
                   "Chat settings shared with other apps, can set its own)", flush=True)
-    svc.codex_thread_titles = cfg.get("codex_thread_titles") is True    # #923: opt-in, off by default
-    svc.codex_compaction_cache = cfg.get("codex_compaction_cache") is True   # #924: opt-in, off by default
-    try:
-        svc.set_aliases(cfg.get("aliases"))             # #297: other names the model answers to
-    except ValueError as e:
-        raise SystemExit(f"[sfnx] config {e}")
-    if svc.aliases:
-        print(f"[sfnx] model aliases: {', '.join(svc.aliases)}", flush=True)
+
     svc.api_key = preflight_api_key
     if not svc.api_key and "api_key" in cfg and not no_key_chosen:             # #569: written, but empty: the server has none (a warning, not a stop)
         print("[sfnx] the api_key in the config is empty: this server has no API key (anyone who can reach it can "
               "use it); set one, or leave api_key out", file=sys.stderr, flush=True)
-    svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
-    svc.trusted_origins = origins_of(cfg.get("trusted_origins"), "trusted_origins", wildcard=False)
+
     try:
         svc.allowed_hosts = allowed_hosts_of(cfg.get("allowed_hosts"), os.environ.get("STRATA_ALLOWED_HOSTS", ""))
     except ValueError as e:
@@ -5903,35 +5134,12 @@ def main(argv=None) -> int:
         print("[sfnx] API request monitor on (/api-monitor): the last 100 requests' prompts and answers are kept in "
               "memory" + ("" if svc.api_key else "; anyone who can reach this server can read them (no API key)"),
               flush=True)
-    if svc.cors_origins:
-        print(f"[sfnx] CORS on /v1/* for {', '.join(svc.cors_origins)}"
-              + ("" if svc.api_key or "*" not in svc.cors_origins else
-                 " - WARNING: any web page may use the model (no API key)"), flush=True)
-    svc.idle_unload_s = a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0)
-    svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
-        int(cfg.get("min_free_vram_mib") or 0)
-    svc.before_load = a.before_load or cfg.get("before_load") or None
-    try:
-        svc.before_load_timeout_s = float(cfg.get("before_load_timeout_s") or svc.before_load_timeout_s)
-    except (TypeError, ValueError):
-        print("[sfnx] \"before_load_timeout_s\" in the config is not a number; using "
-              f"{svc.before_load_timeout_s:g} s", flush=True)
-    svc.before_load_ignore_failure = cfg.get("before_load_ignore_failure") is True
-    svc.before_load_strict = cfg.get("before_load_strict") is True
 
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[sfnx] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
     svc.anthropic_think_unasked = mode == "model"
-    recovery = cfg.get("tool_call_recovery", False)     # opt-in: see OutputParser's recover
-    if not isinstance(recovery, bool):
-        raise SystemExit(f"[sfnx] config \"tool_call_recovery\" must be true or false, not {recovery!r}")
-    svc.tool_call_recovery = recovery
-    etu = cfg.get("env_to_user", False)                # opt-in: see frontend._env_to_user
-    if not isinstance(etu, bool):
-        raise SystemExit(f"[sfnx] config \"env_to_user\" must be true or false, not {etu!r}")
-    import front.frontend as _frontend
-    _frontend.ENV_TO_USER = etu
+
     rs = cfg.get("repeat_stop_tokens", REPEAT_STOP_TOKENS)   # #606: opt-out with 0
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise SystemExit(f"[sfnx] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
@@ -5946,13 +5154,7 @@ def main(argv=None) -> int:
         if budget:
             print(f"[sfnx] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
                   flush=True)
-    recovery = cfg.get("reasoning_loop_recovery", False)   # #728: false (default) | "stop" | "recover" (true)
-    if recovery is True:
-        recovery = "recover"
-    if recovery is not False and recovery not in ("stop", "recover"):
-        raise SystemExit("[sfnx] config \"reasoning_loop_recovery\" must be false, \"stop\" or \"recover\", "
-                         f"not {recovery!r}")
-    svc.reasoning_loop_recovery = recovery
+
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... and every card it is split over (issue #112)
     if a.config:                                        # the Chat settings shared with other apps, from last time
@@ -5970,16 +5172,9 @@ def main(argv=None) -> int:
             if svc.shared:
                 print("[sfnx] other apps use the Chat settings: " +
                       ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)
-    if hub is not None:
-        import atexit
-        svc.mcp = hub
-        print(f"[sfnx] starting {len(hub.servers)} MCP server{'s' * (len(hub.servers) != 1)} for the web app's "
-              f"chat: {', '.join(hub.servers)}", flush=True)
-        hub.start()
-        atexit.register(hub.close)                      # the servers Strata started end with it
+
     httpd = serve(svc, host=a.host, port=a.port)
     bound_port = httpd.server_address[1]               # --port 0: report the port the OS actually assigned
-    svc.start_idle_unload()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
     print(f"ready: http://{here}:{bound_port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
@@ -5993,8 +5188,7 @@ def main(argv=None) -> int:
         if not ips:
             print("       from other devices: http://<this PC's IP address>:" + str(bound_port) + "/", flush=True)
         if not svc.api_key:
-            print("       WARNING: " + open_server_warning(bound_port, tools=svc.mcp is not None),
-                  flush=True)
+            print("       WARNING: " + open_server_warning(bound_port), flush=True)
     interrupted = False
     try:
         while True:
@@ -6003,8 +5197,7 @@ def main(argv=None) -> int:
         interrupted = True
         print("\n[sfnx] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
     finally:
-        closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
-                   hub.close if hub is not None else None]
+        closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None]
         for close in filter(None, closers):
             try:
                 close()
