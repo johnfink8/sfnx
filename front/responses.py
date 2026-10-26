@@ -11,7 +11,7 @@ Codex CLI is the first client.  What it needs, and what this does:
   * function tools, also inside `namespace` tools (Codex's MCP and agent tools: the model sees `namespace.name`) and
     `custom` tools (a free-form `input` string); hosted tools (web search, ...) are left out, the model cannot run them;
   * reasoning items: the model's thinking is returned as `reasoning_text` content (no summaries: this model does not
-    write them, see docs/DETAILS.md) and, when `include` asks for `reasoning.encrypted_content`, also as an opaque
+    write them) and, when `include` asks for `reasoning.encrypted_content`, also as an opaque
     `encrypted_content` string (base64, not encrypted: the client already holds the text).  Either form sent back is
     put into the conversation again, so the prompt matches what the model wrote and the cache is reused;
   * the official event order: response.created, response.in_progress, response.output_item.added, deltas,

@@ -1989,7 +1989,7 @@ class Vision:
         filled the memory.  One that cannot be read is a ValueError (a 400 that says so), not a dropped connection."""
         too_big = f"the image URL's file is over {IMAGE_URL_MAX >> 20} MiB"
         try:
-            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "strata"}), timeout=60) as r:
+            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "sfnx"}), timeout=60) as r:
                 size = r.headers.get("Content-Length") or ""
                 if size.isdigit() and int(size) > IMAGE_URL_MAX:
                     raise ValueError(too_big)
@@ -2438,7 +2438,7 @@ class Service:
         print("[sfnx] the engine is running again", flush=True)
 
     def _say_died(self, e: Exception) -> None:
-        """The server window's line for an engine that died (or was ended, #481) in the middle of a request."""
+        """The journal's line for an engine that died (or was ended, #481) in the middle of a request."""
         note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
         log = getattr(self.engine, "log_path", None)
         print(f"[sfnx] {e}. {note} The next request starts the engine again."
@@ -2708,7 +2708,7 @@ class Service:
         ctx = self.reported_ctx()
         images = self.vision is not None
         return {
-            "service": "strata", "model": self.model,
+            "service": "sfnx", "model": self.model,
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
                                   "constrained_decoding": False, "stream_buffered": True},
@@ -2815,7 +2815,7 @@ class Service:
         images = images_of(messages)
         if images:
             if self.vision is None:
-                raise ValueError("this server was started without the vision encoder (run setup again and choose "
+                raise ValueError("this server was started without the vision encoder (the config's \"vision\" section "
                                  "'vision'), so it cannot read images")
             pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
             start = self.tok.encode(VISION_START, parse_special=True)[0]
@@ -2879,7 +2879,7 @@ class Service:
                                  f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
                                  f"({ctx}); requests are never truncated. Send a smaller "
                                  f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
-                                 "model's strata-<model>.json to shorten it to the room left (#545)")
+                                 "server's config to shorten it to the room left (#545)")
             print(f"[sfnx] max_tokens {max_new} shortened to {max(1, room)}: the prompt ({len(ids)} tokens) leaves that much "
                   f"of the context ({ctx}); \"fit_max_tokens\": false answers 400 instead", flush=True)
             max_new = max(1, room)          # a shorter completion beats a 400 (the default)
@@ -2939,7 +2939,7 @@ class Service:
                 s["tail"] = ((s.get("tail") or "") + (ev.text or ""))[-600:]
 
     def _progress(self, last_print, every=1.0, st=None):
-        """A progress line in the server window every `every` seconds while a request runs."""
+        """A progress line in the journal every `every` seconds while a request runs."""
         now = time.time()
         if now - last_print < every:
             return last_print
@@ -3331,7 +3331,7 @@ class Service:
                             if finish == "length" and parser.state in ("reasoning", "rcall"):   # #530
                                 print("[sfnx] the reply reached max tokens while still thinking, so it has no "
                                       "answer: a thinking budget (reasoning_budget_tokens, in the request or in "
-                                      "strata-<model>.json for every request) leaves room to answer", flush=True)
+                                      "the config for every request) leaves room to answer", flush=True)
                             if os.environ.get("STRATA_DEBUG") and raw_ids:
                                 print(f"[sfnx] raw: {self.tok.decode(raw_ids)!r}", flush=True)
                         st["busy"] = False
@@ -3850,8 +3850,8 @@ def make_handler(svc: Service):
                   f"answers to (add it to \"allowed_hosts\" in the config or STRATA_ALLOWED_HOSTS, or set an API key)",
                   flush=True)
             self._json(403, {"error": {"type": "forbidden", "message":
-                             f"Host {host!r} is not allowed (DNS rebinding protection). Reaching Strata under this "
-                             f"name on purpose? Add it to \"allowed_hosts\" in the config (strata-<model>.json) or to "
+                             f"Host {host!r} is not allowed (DNS rebinding protection). Reaching sFNX under this "
+                             f"name on purpose? Add it to \"allowed_hosts\" in the config (serve/sfnx.json) or to "
                              f"the STRATA_ALLOWED_HOSTS environment variable, or set an API key (\"api_key\"), which "
                              f"turns this check off"}})
             return False
@@ -3906,7 +3906,7 @@ def make_handler(svc: Service):
                         cancel.set()
                         return
 
-            threading.Thread(target=watch, daemon=True, name="strata-client-watch").start()
+            threading.Thread(target=watch, daemon=True, name="client-watch").start()
 
         def _note(self, **values):
             """#332: what the monitor shows about this request (nothing when the monitor is off)."""
@@ -4006,7 +4006,7 @@ def make_handler(svc: Service):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
 
-                                 "loaded": svc.loaded(), "service": "strata"})
+                                 "loaded": svc.loaded(), "service": "sfnx"})
             elif path == "/status":
                 if not self._authorized():                  # #212: it shows the end of the last answer
                     return
@@ -4039,7 +4039,7 @@ def make_handler(svc: Service):
                         busy = bool(svc.status.get("busy"))
                         # llama.cpp's name for what the slot's context holds: the running request's prompt size,
                         # kept after it ends (the conversation cache carries it on).  A front-end's context meter
-                        # divides it by n_ctx; without the key it reads 0 % against Strata forever (#562).
+                        # divides it by n_ctx; without the key it reads 0 % forever (#562).
                         in_use = int(svc.status.get("prompt_tokens") or 0)
                     if getattr(svc.engine, "batch", 0) and hasattr(svc.engine, "slots_view"):
                         # --batch: one entry per slot (the same view /metrics has), not one for the whole engine
@@ -4164,7 +4164,7 @@ def make_handler(svc: Service):
                 props["model_path"] = svc.engine.model_path
             version = getattr(svc.engine, "info", {}).get("version")
             if version:
-                props["build_info"] = "Strata " + str(version)
+                props["build_info"] = "sfnx " + str(version)
             self._json(200, props)
 
         def _own_page(self, what) -> bool:
@@ -4523,7 +4523,7 @@ class Server(ThreadingHTTPServer):
 
 
 def lan_addresses() -> list[str]:
-    """This PC's IPv4 addresses on its networks (what another device types in), without loopback/link-local."""
+    """This machine's IPv4 addresses on its networks (what another device types in), without loopback/link-local."""
     import socket
     first, ips = None, set()
     try:                                                # the address of the default route; sends nothing (UDP)
@@ -4589,7 +4589,7 @@ def allowed_hosts_of(value, env: str = "") -> list[str]:
         dot = x.startswith(".")
         name = host_name(x[1:] if dot else x)
         if not name:
-            raise ValueError(f"allowed_hosts: {raw!r} is not a host name like strata.example.com")
+            raise ValueError(f"allowed_hosts: {raw!r} is not a host name like sfnx.example.com")
         out.append("." + name if dot else name)
     return list(dict.fromkeys(out))
 
@@ -5165,14 +5165,14 @@ def main(argv=None) -> int:
     print(f"ready: http://{here}:{bound_port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
           f"{', API key required' if svc.api_key else ''})", flush=True)
-    print(f"       open http://{here}:{bound_port}/ in a browser to chat; close this window to stop the model", flush=True)
+    print(f"       open http://{here}:{bound_port}/ in a browser to chat", flush=True)
     if a.host not in ("127.0.0.1", "localhost", "::1"):
         # issue #26: reachable from other devices - say at which address, and what can still block it
         ips = lan_addresses()
         for ip in ips:
             print(f"       from other devices: http://{ip}:{bound_port}/   (API: http://{ip}:{bound_port}/v1)", flush=True)
         if not ips:
-            print("       from other devices: http://<this PC's IP address>:" + str(bound_port) + "/", flush=True)
+            print("       from other devices: http://<this machine's IP address>:" + str(bound_port) + "/", flush=True)
         if not svc.api_key:
             print("       WARNING: " + open_server_warning(bound_port), flush=True)
     interrupted = False

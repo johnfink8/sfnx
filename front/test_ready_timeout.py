@@ -1,6 +1,5 @@
 """#1527: the READY-read timeout (#1317) ends the engine, and the request that was loading it must end too -
 a 503 with the reason, not a connection that never answers (or a misleading 400)."""
-import os
 from pathlib import Path
 import sys
 import tempfile
@@ -36,8 +35,6 @@ for line in sys.stdin:
 '''
 
 
-@unittest.skipIf(os.name == "nt", "the .cmd wrapper keeps the pipe open after the kill (only the wrapper dies), so the "
-                                  "close of its stdout waits for the sleeping child; a real engine is one process")
 class ReadyTimeout(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
@@ -49,12 +46,9 @@ class ReadyTimeout(unittest.TestCase):
 
     def make_script(self, name, code):
         py = self.root / (name + '.py')
-        if os.name == 'nt':
-            py.write_text(code); script = self.root / (name + '.cmd')
-            script.write_text(f'@"{sys.executable}" "{py}" %*\r\n')
-        else:
-            script = py; py.write_text('#!' + sys.executable + '\n' + code); py.chmod(0o700)
-        return str(script)
+        py.write_text('#!' + sys.executable + '\n' + code)
+        py.chmod(0o700)
+        return str(py)
 
     def service(self, script, extra_args=()):
         eng = StrataEngine(script, list(extra_args), lazy=True)
@@ -105,7 +99,7 @@ class ReadyTimeout(unittest.TestCase):
 
 
 class SpawnFailure(unittest.TestCase):
-    """The engine program cannot be started at all (missing, not executable, or blocked by Windows - #735): the
+    """The engine program cannot be started at all (missing, not executable - #735): the
     request that was loading it gets a 503 with the reason, not a dropped connection."""
     BODIES = {'/v1/chat/completions': {'messages': [{'role': 'user', 'content': 'hi'}], 'max_tokens': 8},
               '/v1/messages': {'model': 'strata', 'max_tokens': 8, 'messages': [{'role': 'user', 'content': 'hi'}]},

@@ -36,7 +36,7 @@ class HostNames(unittest.TestCase):
 
     def test_allowed_hosts_of(self):
         self.assertEqual(allowed_hosts_of(None), [])
-        self.assertEqual(allowed_hosts_of("Strata.Example.com"), ["strata.example.com"])
+        self.assertEqual(allowed_hosts_of("Sfnx.Example.com"), ["sfnx.example.com"])
         self.assertEqual(allowed_hosts_of(["https://a.example.com:8443/x", ".example.org", "*"], "box, nas.lan "),
                          ["a.example.com", ".example.org", "*", "box", "nas.lan"])
         for bad in (["bad name"], 5, [3], "http://"):
@@ -45,7 +45,7 @@ class HostNames(unittest.TestCase):
 
     def test_names_from_the_bind_address(self):
         with mock.patch("front.server.lan_addresses", return_value=["192.168.1.20"]):
-            self.assertEqual(host_names_for("127.0.0.1"), LOCAL)                 # this PC only: nothing else
+            self.assertEqual(host_names_for("127.0.0.1"), LOCAL)                 # this machine only: nothing else
             self.assertEqual(host_names_for("localhost"), LOCAL)
             names = host_names_for("0.0.0.0")                                    # other devices too
             self.assertIn(socket.gethostname().lower(), names)

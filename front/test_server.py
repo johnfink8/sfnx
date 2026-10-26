@@ -2406,7 +2406,7 @@ class WebApp(unittest.TestCase):
         try:
             props = json.loads(self.get("/props")[2])
             self.assertEqual(props["model_path"], engine.model_path)
-            self.assertEqual(props["build_info"], "Strata 0.1.21")
+            self.assertEqual(props["build_info"], "sfnx 0.1.21")
             for busy in (True, False):
                 with self.svc.status_lock:
                     self.svc.status["busy"] = busy
@@ -3937,7 +3937,7 @@ class AnswerBeforeTheBody(unittest.TestCase):
             except OSError:
                 pass
             answer = b""
-            while chunk := s.recv(65536):                    # Windows raises a reset here, where Linux keeps the answer
+            while chunk := s.recv(65536):
                 answer += chunk
             time.sleep(0.2)
             # Linux shows the reset only as a pending socket error, after the answer and the end of the stream

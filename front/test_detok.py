@@ -1,9 +1,8 @@
 """The streaming detokenizer (perf-review F-1): the incremental one emits exactly what the old re-decode did, token
 by token, and its cost per token does not grow with the reply.
 
-    python -m unittest front.test_detok      (needs a pack's tokenizer; skipped without one)
+    python -m unittest front.test_detok      (the model's own tokenizer, data/tokenizer)
 """
-import os
 import random
 import sys
 import time
@@ -18,13 +17,8 @@ from front.server import Detokenizer  # noqa: E402
 
 
 def find_tokenizer():
-    cands = [os.environ.get("STRATA_TOKENIZER", "")]
-    cands += [str(p) for p in ROOT.glob("packs/*/tokenizer")] + [str(p) for p in ROOT.glob("pack/*/tokenizer")]
-    cands += [r"C:\Users\AI-Server\Desktop\Strata\Public\Engine\pack\full\tokenizer"]
-    for c in cands:
-        if c and (Path(c) / "vocab.json").exists():
-            return Path(c)
-    return None
+    """The model's own tokenizer (data/tokenizer)."""
+    return ROOT / "data" / "tokenizer"
 
 
 class OldDetokenizer:
@@ -42,7 +36,6 @@ class OldDetokenizer:
         return delta
 
 
-@unittest.skipIf(find_tokenizer() is None, "no pack tokenizer here")
 class Detok(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -108,20 +101,17 @@ _REAL = []
 
 
 def real_tokenizer():
-    """The pack's tokenizer, loaded once for every class that needs it (None when there is no pack here)."""
+    """The model's tokenizer, loaded once for every class that needs it."""
     if not _REAL:
+        import json
+        import strata_tokenizer as ST
         t = find_tokenizer()
-        if t is None:
-            _REAL.append(None)
-        else:
-            import json
-            import strata_tokenizer as ST
-            vocab = json.loads((t / "vocab.json").read_text(encoding="utf-8"))
-            toks = [None] * len(vocab)
-            for s, i in vocab.items():
-                toks[i] = s
-            _REAL.append(ST.Tokenizer(toks, (t / "merges.txt").read_text(encoding="utf-8").split("\n"),
-                                      json.loads((t / "token_type.json").read_text())))
+        vocab = json.loads((t / "vocab.json").read_text(encoding="utf-8"))
+        toks = [None] * len(vocab)
+        for s, i in vocab.items():
+            toks[i] = s
+        _REAL.append(ST.Tokenizer(toks, (t / "merges.txt").read_text(encoding="utf-8").split("\n"),
+                                  json.loads((t / "token_type.json").read_text())))
     return _REAL[0]
 
 
@@ -250,7 +240,6 @@ class HeapBpe(unittest.TestCase):
         rng = random.Random(2)
         self.parity(tok, [random_text(rng) for _ in range(60)] + ["a" * 5000, "ab" * 3000, ""])
 
-    @unittest.skipIf(find_tokenizer() is None, "no pack tokenizer here")
     def test_pack_vocab(self):
         tok = real_tokenizer()
         rng = random.Random(3)
@@ -273,7 +262,6 @@ class HeapBpe(unittest.TestCase):
     def test_speed_synthetic(self):
         self.check_speed(synthetic_tokenizer())
 
-    @unittest.skipIf(find_tokenizer() is None, "no pack tokenizer here")
     def test_speed_pack(self):
         self.check_speed(real_tokenizer())
 

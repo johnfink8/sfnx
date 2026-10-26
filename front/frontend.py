@@ -66,7 +66,7 @@ class ChatTemplate:
                                     **kwargs)
 
     def _detect_caps(self) -> dict[str, bool]:
-        """llama.cpp's capability names, checked at load time against this template and Strata's tool-call format.
+        """llama.cpp's capability names, checked at load time against this template and its tool-call format.
         These are rendering hints, not a guarantee that the model will follow a request."""
         def render(messages, tools=None):
             try:
