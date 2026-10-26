@@ -3387,6 +3387,7 @@ class SilentEngine(unittest.TestCase):
         engine.proc.poll.return_value = None
         engine.lines, engine.can_stop, engine.max_context = queue.Queue(), can_stop, 4096
         engine.silence_s, engine.log_path = silence, None
+        engine._activity = lambda: None                 # no process to read: the stall guard has nothing to decide on
         return engine
 
     def later(self, engine, delay, *lines):

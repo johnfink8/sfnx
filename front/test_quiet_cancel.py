@@ -168,6 +168,7 @@ class QuietWaitPolicy(unittest.TestCase):
     def test_expired_silence_is_not_a_heartbeat(self):
         engine = object.__new__(server.StrataEngine)
         engine.proc = mock.Mock()
+        engine._activity = lambda: None
         engine.proc.poll.return_value = None
         engine.proc.stdin = io.StringIO()
         engine.lines = mock.Mock()
@@ -195,6 +196,7 @@ class QuietWaitPolicy(unittest.TestCase):
             with self.subTest(control=control):
                 engine = object.__new__(server.StrataEngine)
                 engine.proc = mock.Mock()
+                engine._activity = lambda: None
                 engine.proc.poll.return_value = None
                 engine.proc.stdin = io.StringIO()
                 engine.lines = mock.Mock()

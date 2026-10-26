@@ -38,7 +38,6 @@ import re
 import select
 import signal
 import socket
-
 import shutil
 import subprocess
 import sys
@@ -54,9 +53,11 @@ from pathlib import Path
 from typing import Iterator, Protocol
 from urllib.parse import parse_qs, urlsplit
 
+import psutil
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "front" / "vendor"))
-sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
+sys.path.insert(0, str(ROOT))   # run as a script as well as a module
 from front.frontend import (LATE_NOTE, THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
                             tool_choice_of, unmark_think_literals)
@@ -190,7 +191,7 @@ def _timeout_env(name: str, default: float) -> float | None:
 # moves no bytes of I/O in that time is not slow, it is idle or frozen (a deadlock in a CUDA call, a driver stall, a lost
 # step), and waiting longer cannot help: it is ended, and the next request starts it again.  An engine that is silent but
 # still working is never ended by this, only reported once (the recommendation: engine_silence_s, or this variable).
-# STRATA_ENGINE_STALL_S overrides it (0 = off).  Needs psutil (setup installs it); without it nothing is ended.
+# STRATA_ENGINE_STALL_S overrides it (0 = off).
 ENGINE_STALL_S = _timeout_env("STRATA_ENGINE_STALL_S", 90.0)
 STALL_CPU_EPS_S = 0.5       # CPU seconds the engine may use in the whole stall window and still count as frozen
 STALL_IO_EPS_B = 1 << 20    # bytes read or written in that window
@@ -1706,13 +1707,12 @@ class StrataEngine:
     def _activity(self) -> tuple[float, int] | None:
         """#1317: (CPU seconds, I/O bytes) the engine process has used so far, or None when they cannot be read."""
         try:
-            import psutil
             pr = psutil.Process(self.proc.pid)
             t = pr.cpu_times()
             io = pr.io_counters()
-            return (t.user + t.system, io.read_bytes + io.write_bytes)
-        except Exception:  # noqa: BLE001 - psutil missing, the process gone, no permission: no reading
+        except (psutil.NoSuchProcess, psutil.AccessDenied):   # the process gone, or not ours to read
             return None
+        return (t.user + t.system, io.read_bytes + io.write_bytes)
 
     def _stall_check(self, heard: float, state: dict, stall_s: float) -> None:
         """#1317: called while the engine is silent.  Takes a baseline soon after the last line, and at stall_s of silence
@@ -1738,7 +1738,7 @@ class StrataEngine:
                 print(f"[sfnx] the engine has said nothing for {age:.0f} s but is still working; it is not ended (the "
                       "limit is engine_silence_s). If it is stuck, \"engine_silence_s\" can be set lower.", flush=True)
         else:
-            state["next"] = float("inf")   # no reading (psutil missing): nothing to decide on
+            state["next"] = float("inf")   # no reading (the process gone): nothing to decide on
 
     def _silent(self, what: str) -> EngineSilent:
         """#481: end an engine that lost step with the server (its main thread waits for a command the server never
