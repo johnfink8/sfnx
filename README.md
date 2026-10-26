@@ -45,13 +45,15 @@ whether it accepts one token or sixteen, and code drafts where prose does not.
 ## Running it
 
 Needs CUDA 12.9, g++-14, llama.cpp at a37cc46 checked out (or linked) as `llama.cpp/` (`make LLAMA=path` for
-elsewhere), the front end's venv (`.venv`; packages in [front/README.md](front/README.md)), the draft layer's files in
-`data/mtp-rt/`, and a `models` link to the folder holding the GGUFs — `UD-Q4_K_XL/`, `Q8_0/` and `mmproj-F16.gguf`.
+elsewhere), the front end's venv (`.venv`, from `pyproject.toml`; see [front/README.md](front/README.md)), the draft
+layer's files in `data/mtp-rt/`, and a `models` link to the folder holding the GGUFs — `UD-Q4_K_XL/`, `Q8_0/` and
+`mmproj-F16.gguf`.
 Every path in the configs and scripts is relative to the checkout. The cards' IOMMU groups must be identity domains:
 the ring writes between cards, and the engine refuses to start otherwise.
 
 ```bash
 ln -s /path/to/Qwen3.8-Flash-Next models
+python3.14 -m venv .venv && .venv/bin/pip install .   # the front end's packages (pyproject.toml)
 make -j32                    # bin/sfnx and the picture encoder; ~2 min from scratch on this box
 make install                 # the systemd unit for this checkout and user: port 8080, enabled at boot
 sudo systemctl start sfnx    # ~80 s to load; the API is on port 8080

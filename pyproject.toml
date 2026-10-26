@@ -1,0 +1,31 @@
+# The Python side of sFNX: the front end (front/) and the helper scripts (ref/, tools/). Not a package to publish; this
+# file lists what the venv needs, pinned to the versions prod and the front end's tests run on.
+#
+#   python3.14 -m venv .venv && .venv/bin/pip install '.[test]'
+#   uv venv -p 3.14 .venv && uv pip install -p .venv -r pyproject.toml --extra test
+
+[project]
+name = "sfnx"
+version = "0"
+requires-python = ">=3.14"
+dependencies = [
+    "jinja2==3.1.6",
+    "jsonschema==4.26.0",
+    "pillow==13.0.0",
+    "psutil==7.2.2",
+    "referencing==0.37.0",
+    "regex==2026.9.29",
+]
+
+[project.optional-dependencies]
+test = ["pytest==9.1.1"]
+# ref/*.py and tools/mtp_experts.py; pyyaml for llama.cpp's gguf-py, which the GGUF tools take from PYTHONPATH
+tools = ["numpy==2.5.4", "pyyaml==6.0.3"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# installs the dependencies only: front/ runs from the checkout
+[tool.hatch.build.targets.wheel]
+bypass-selection = true

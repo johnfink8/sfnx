@@ -10,7 +10,9 @@ cd ~/src/sfnx
 .venv/bin/python -m pytest -q front/                                          # 967 passed, 19 skipped (~6 min; no GPU)
 ```
 
-The venv (`.venv`, Python 3.14): `jinja2`, `regex`, `jsonschema`, `referencing`, `psutil`, `pillow`, `pytest`.
+The venv (`.venv`, Python 3.14) comes from `pyproject.toml` at the checkout's root, pinned to what prod runs:
+`python3.14 -m venv .venv && .venv/bin/pip install '.[test]'` (or `uv venv -p 3.14 .venv && uv pip install -p .venv -r
+pyproject.toml --extra test`). Add the `tools` extra (`numpy`, `pyyaml`) for the scripts in `ref/` and `tools/`.
 
 ## Where it came from
 
