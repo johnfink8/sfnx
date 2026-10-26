@@ -42,7 +42,7 @@ install: build
 	sudo systemctl enable sfnx
 	@echo "install: the unit runs $(CONFIG); a running sfnx keeps its old config until sudo systemctl restart sfnx"
 
-NVCC := /usr/local/cuda/bin/nvcc
+NVCC := /opt/cuda-12.9/bin/nvcc
 # llama.cpp at a37cc46 (its ggml headers; its libraries for the picture encoder): a checkout in llama.cpp/, or LLAMA=path
 LLAMA ?= $(CURDIR)/llama.cpp
 GG := $(LLAMA)/ggml
@@ -158,7 +158,7 @@ ref/mmid_bench: ref/mmid_bench.cpp $(LU)/build/bin/libmtmd.so
 # llama.cpp's libraries, built in its own tree with CUDA for sm_70
 $(LU)/build/bin/libmtmd.so:
 	test -d $(LU)/.git || { echo "clone llama.cpp at a37cc46 into $(LU) first (or make LLAMA=path)" >&2; exit 1; }
-	cmake -S $(LU) -B $(LU)/build -G Ninja -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70 -DCMAKE_BUILD_TYPE=Release \
+	cmake -S $(LU) -B $(LU)/build -G Ninja -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_CUDA_COMPILER=/opt/cuda-12.9/bin/nvcc -DCMAKE_BUILD_TYPE=Release \
 	    -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_CUDA_HOST_COMPILER=g++-14 \
 	   
 	cmake --build $(LU)/build --target mtmd llama
