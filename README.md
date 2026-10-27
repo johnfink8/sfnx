@@ -70,8 +70,8 @@ twenty-four would leave some cards none.
 **Nobody has run these counts.** They compile, and two checks run on the CPU: the split rule reproduces the two- and
 three-card splits exactly and covers every head and FF block on every supported count (static checks in
 `src/card_split.hpp`), and the prompt path's ring plan matches the two- and three-card step sequences and completes
-consecutive sums on every supported count (`bin/pf_ring_plan_test`). Decode's sums go between cards as fp32 by default on these
-counts (`FNX_RING_F32`, [docs/config.md](docs/config.md#card-count)), as on two. How to validate a count:
+consecutive sums on every supported count (`bin/pf_ring_plan_test`). Decode's sums go between cards as fp16 pairs on every count;
+`FNX_RING_F32=1` sends fp32, more exact and ~30% slower on one request ([docs/config.md](docs/config.md#card-count)). How to validate a count:
 [docs/verification.md](docs/verification.md#other-card-counts).
 
 ## Running it

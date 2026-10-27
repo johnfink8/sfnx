@@ -48,9 +48,9 @@ Logits against llama.cpp on the 62k prompt by prompt-chunk size: 4,096 rows KL m
 
 ## What is not exact
 
-- On three cards the sums between cards travel as fp16 pairs. `FNX_RING_F32=1` sends them as fp32: KL 5.75e-4 →
-  4.38e-4 on the code prompt. Two cards send decode's sums as fp32 by default: with fp16 pairs their code and edit
-  prompts are 1.25x over the bar. The prompt path's sums stay fp16 on every count (its copy-engine ring has no fp32
+- The sums between cards travel as fp16 pairs. `FNX_RING_F32=1` sends decode's as fp32: KL 5.75e-4 → 4.38e-4 on
+  the code prompt on three cards. On two cards fp16 leaves code and edit 1.25x over the bar; fp32 brings them within
+  it, at ~30% of one request's decode. The prompt path's sums stay fp16 on every count (its copy-engine ring has no fp32
   form); the 62k prompt, read through it, is within the bar on two and three. On n cards a part is rounded to f16 at
   each of n - 1 hops, so on four or more it is the first suspect if `long64` fails.
 - The kernels are built with fast math.
@@ -107,8 +107,9 @@ To validate count n (n cards, `iommu=pt` or the IOMMU off, and peer access betwe
 5. `tools/lab.sh exact` (against that base, and windows of 1, 2, 3, 11 and 16 rows byte for byte),
    `tools/lab.sh batch` (batched windows give each lane its tokens alone) and `tools/lab.sh decode` (speed, with the
    GPUs' use).
-6. Optional, to choose the default: fp16 sums in a directory of their own. `tools/lab.sh unload`, then with
-   `FNX_LAB_DIR=/tmp/fnx-lab-$UID-${n}card-fp16`: `tools/lab.sh start "" "-E FNX_RING_F32=0"` and `exact base`.
+6. If step 4 fails on KL alone: fp32 sums in a directory of their own, to tell the ring's rounding from a real fault.
+   `tools/lab.sh unload`, then with `FNX_LAB_DIR=/tmp/fnx-lab-$UID-${n}card-fp32`:
+   `tools/lab.sh start "" "-E FNX_RING_F32=1"` and `exact base`. Two cards need this to pass step 4.
 7. Through the front end, `tools/lab.sh unload` first (four cards: `serve/sfnx-4card.json`; another count: a copy with
    its `"gpu"` list and vision card): `serve/run.sh serve/sfnx-4card.json`, then `serve/api_smoke.py
    http://127.0.0.1:8095` and `serve/image_test.py http://127.0.0.1:8095/v1`.

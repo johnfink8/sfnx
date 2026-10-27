@@ -1923,11 +1923,10 @@ std::vector<int> Engine::step(const std::vector<int>& lanes, const std::vector<i
 }
 
 bool ring_f32() {
-    // fp32 by default on every count but three: on two cards, with fp16 pairs the code and edit prompts' KL against
-    // llama.cpp is 1.25x the exactness bar (code 7.48e-4, fp32 5.73e-4 against a bar of 6.06e-4). Four, six and eight
-    // are unmeasured: each hop rounds a partial sum to f16 again, so they start from fp32, which held the bar where fp16
-    // did not
-    const long long v = env_int("FNX_RING_F32", NCARD == 3 ? 0 : 1);
+    // fp16 pairs by default on every count: fp32 costs ~30% of one request's decode on two cards. fp32's KL is lower
+    // (two cards' code prompt 5.73e-4 against fp16's 7.48e-4, a bar of 6.06e-4, so fp16 is over it there; three cards
+    // 4.38e-4 against 5.75e-4, both within)
+    const long long v = env_int("FNX_RING_F32", 0);
     if (v != 0 && v != 1) throw std::runtime_error("FNX_RING_F32: 0 or 1, got " + std::to_string(v));
     return v == 1;
 }

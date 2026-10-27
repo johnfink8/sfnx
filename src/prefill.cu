@@ -784,7 +784,7 @@ void Engine::prefill_alloc() {
         p->ctl = palloc<int>((size_t) (1 + (pf_c_ / MAXT)) * 2);
         p->ring_sm = env_flag("FNX_PF_RING_SM");
         if (p->ring_sm && b.ring.f32)
-            throw std::runtime_error("FNX_PF_RING_SM: the SM ring carries fp16 only, and the ring is fp32 (FNX_RING_F32, 1 by default on every count but three)");
+            throw std::runtime_error("FNX_PF_RING_SM: the SM ring carries fp16 only, and FNX_RING_F32=1 makes the ring fp32");
         p->ring = b.ring;
         if (p->ring_sm) {   // ~140 MB a card at 1,024 rows a chunk
             p->ring.rows = pf_c_;
