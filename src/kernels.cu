@@ -616,7 +616,7 @@ __device__ __forceinline__ void att_merge(float& m, float& z, float& a, float m2
 __global__ void __launch_bounds__(HD) k_att_merge(AttRing r, const float* qg, const float* part, float* out, int T,
                                                   const unsigned* tagp, int call) {
     const unsigned tag = *tagp * 256u + (unsigned) call + 1u;
-    const int g = r.card, i = threadIdx.x, hl = blockIdx.x, t = blockIdx.y;   // head hl of a chunk (0..7), row t
+    const int g = r.card, i = threadIdx.x, hl = blockIdx.x, t = blockIdx.y;   // head hl of a chunk (0..ATT_OWN-1), row t
     constexpr int W = HD + 2;
     const size_t slot_sz = (size_t) ATT_ROWS * ATT_OWN * W, set_sz = (NCARD - 1) * slot_sz;
     unsigned long long* in = (unsigned long long*) r.in + (tag & 1) * set_sz;
@@ -1267,7 +1267,7 @@ void ple_post(float* R, const float* key, const float* value, const float* nk, c
 }
 
 // flags: [2 sets][kind: the reduce steps' (in), then the finished chunks' (ag)][block]; three cards: in step 0, in
-// step 1, ag step 2, ag step 3
+// step 1, ag step 2, ag step 3; two cards: in step 0, ag step 1
 constexpr int RB_BLOCKS = 240, RB_KINDS = 2 * NCARD - 2;
 size_t ring_flag_words() { return (size_t) 2 * RB_KINDS * RB_BLOCKS; }
 

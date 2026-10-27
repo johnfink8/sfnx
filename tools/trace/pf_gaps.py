@@ -23,6 +23,8 @@ own = [r for r in rows if "k_hcb_prep" in r[2] or "k_pf_" in r[2]]
 if os.environ.get("READ") == "1":
     last_win = max((r[1] for r in rows if "k_argmax_fin" in r[2]), default=0)
     own = [r for r in own if r[0] >= last_win]
+if not own:
+    sys.exit(f"{sys.argv[0]}: no prompt-path kernels (k_hcb_prep / k_pf_*) on device {dev} in {path}")
 t0, t1 = own[0][0], own[-1][1]
 span = [r for r in rows if r[0] >= t0 and r[1] <= t1]
 

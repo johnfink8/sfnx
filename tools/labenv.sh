@@ -39,10 +39,12 @@ need_py() {
     [ -x "$PY" ] || { echo "no python at $PY: make fnx/.venv (numpy) or set PY="; exit 1; }
 }
 
-unit() {
+unit() {   # the cards: the first FNX_NCARD of the build (build/ncard), by PCI order, as tools/lab.sh gives them
+    _u_ncard=$(cat "$FNX/build/ncard" 2> /dev/null) || { echo "labenv: no $FNX/build/ncard: build first (make)"; return 1; }
     # shellcheck disable=SC2086
     timeout "${UNIT_TIMEOUT:-2400}" sudo systemd-run --quiet --wait --pipe --collect -p LimitMEMLOCK=infinity \
-        --uid="$(id -u)" --gid="$(id -g)" -p WorkingDirectory="$FNX" "$@"
+        --uid="$(id -u)" --gid="$(id -g)" -p WorkingDirectory="$FNX" -E CUDA_DEVICE_ORDER=PCI_BUS_ID \
+        -E CUDA_VISIBLE_DEVICES="$(seq -s, 0 $((_u_ncard - 1)))" "$@"
 }
 
 sampled() {

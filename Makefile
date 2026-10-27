@@ -33,7 +33,8 @@ LLAMA ?= $(CURDIR)/llama.cpp
 GG := $(LLAMA)/ggml
 NVFLAGS := -DFNX_DIR='"$(CURDIR)"' -O3 --use_fast_math -std=c++17 -arch=sm_70 -ccbin g++-14 -Wno-deprecated-gpu-targets -I$(GG)/src/ggml-cuda -I$(GG)/src -I$(GG)/include --expt-relaxed-constexpr
 # the cards every layer is split across (src/model.hpp): 3 (prod), or 2 (make FNX_NCARD=2 ...). build/ncard
-# holds the count the objects in build/ were made for; a different count rewrites it, which rebuilds them all
+# holds the count the objects in build/ were made for; a different count rewrites it, which rebuilds them all. It is
+# written while make reads this file, so any make in this checkout restamps it to its count, -n and `make ref` too
 FNX_NCARD ?= 3
 $(if $(filter 2 3,$(FNX_NCARD)),,$(error FNX_NCARD: 2 or 3, not '$(FNX_NCARD)'))
 NVFLAGS += -DFNX_NCARD=$(FNX_NCARD)
@@ -106,7 +107,9 @@ bin/fnx_hold: build/tool_fnx_hold.o build/gguf.o build/model.o build/store.o
 	$(NVCC) $(NVFLAGS) -cudart shared -o $@ $^ -lcuda
 lab: bin/fnx_lab bin/fnx_hold build/libfnx_lab.so
 # the loader sources' hash, built into the holder and the worker: the holder refuses a worker built from other ones
-# (tools/lab_proto.hpp). A new hash names a new stamp file, which rebuilds both objects
+# (tools/lab_proto.hpp). A new hash names a new stamp file, which rebuilds both objects. A count other than 3 joins the
+# hash (a two-card worker refuses a three-card holder); three cards' hash is the sources' alone, so prod's holder
+# stamp follows only the loader's code
 LOADER_SRC := src/model.cpp src/model.hpp src/gguf.cpp src/gguf.hpp src/store.cpp src/store.hpp tools/lab_proto.hpp
 $(if $(filter-out $(wildcard $(LOADER_SRC)),$(LOADER_SRC)),$(error loader sources missing: $(filter-out $(wildcard $(LOADER_SRC)),$(LOADER_SRC))))
 LOADER_REV := $(shell { cat $(LOADER_SRC); [ $(FNX_NCARD) = 3 ] || echo ncard $(FNX_NCARD); } | sha1sum | cut -c1-16)

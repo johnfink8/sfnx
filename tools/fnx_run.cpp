@@ -352,6 +352,10 @@ static std::string loaded_code() {
     }
     return file_line(path);
 }
+// what the logits depend on besides the model and the code's sums: the card count it was built for and decode's ring
+static std::string build_line(int ncard, bool f32) {
+    return "build ncard " + std::to_string(ncard) + " ring " + (f32 ? "fp32" : "fp16-pairs");
+}
 static std::string run_identity(const char* model) {
     std::string id;
     char real[PATH_MAX];
@@ -365,6 +369,7 @@ static std::string run_identity(const char* model) {
     }
     while (!rev.empty() && (rev.back() == '\n' || rev.back() == ' ')) rev.pop_back();
     id += "tree " FNX_DIR " " + rev + "\n";
+    id += build_line(fnx::NCARD, fnx::ring_f32()) + "\n";
     std::vector<std::string> env;
     for (char** e = environ; *e; ++e)
         if (!std::strncmp(*e, "FNX_", 4)) env.emplace_back(*e);
@@ -720,9 +725,24 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
     const std::string id_path = dir + "/" + stem + "-base.id", out_name = base_run ? "base-new" : name;
     const std::string me = run_identity(argv[1]);
     std::string base_id;
-    if (!base_run) {
+    {
         std::ifstream f(id_path);
         base_id.assign(std::istreambuf_iterator<char>(f), {});
+    }
+    // a base made by another build (card count, ring) is neither compared with nor written over: its logits differ in
+    // their last bits by design, and a base written over would be lost to the build that owns it. A record from before
+    // build lines is three cards', its ring as its env set it
+    if (!base_id.empty()) {
+        std::string theirs = id_line(base_id, "build");
+        if (theirs.empty()) theirs = build_line(3, id_line(base_id, "env").find(" FNX_RING_F32=1") != std::string::npos);
+        if (theirs != id_line(me, "build")) {
+            std::printf("exact: the base in %s is another build's (%s; this one: %s): give this build a lab directory of its own, "
+                        "FNX_LAB_DIR=/tmp/fnx-lab-%u-%dcard\n",
+                        dir.c_str(), theirs.c_str(), id_line(me, "build").c_str(), (unsigned) getuid(), fnx::NCARD);
+            return 1;
+        }
+    }
+    if (!base_run) {
         if (base_id.empty())
             std::printf("exact: no base identity %s (a base from before identity records, or none): make one with `exact base`\n",
                         id_path.c_str());

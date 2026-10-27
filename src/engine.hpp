@@ -1,4 +1,4 @@
-// fnx engine: runs windows of up to MAXT token rows through the model on all three cards at once.
+// fnx engine: runs windows of up to MAXT token rows through the model on all the cards (NCARD) at once.
 #pragma once
 
 #include <chrono>
@@ -30,6 +30,9 @@ struct CardPool;
 // reading every batched row (1 or unset). Read once; a value it does not know throws
 enum class BatchDrafts { off, lookup, mtp };
 BatchDrafts batch_drafts();
+// FNX_RING_F32: decode's sums between cards as fp32 (true) or fp16 pairs; default fp32 on two cards, fp16 on three.
+// Read at each call (an Engine reads it when it is made; the lab's identity records reads it too); not 0 or 1 throws
+bool ring_f32();
 
 class Engine {
 public:
@@ -75,7 +78,8 @@ public:
     struct Pf;       // per-card buffers of the batched path
     struct PfRing;   // its chunk sums on the copy engines
 
-    // the draft layer (load it with Mtp first): its buffers and K/V on every card
+    // the draft layer: its buffers and K/V on every card. Make the Mtp before this Engine: the Engine sizes its arena
+    // from the VRAM left after the draft layer's weights are already on the cards
     void mtp_attach(const Mtp& mtp);
     // one draft-layer window: T rows of a source residual (from_main: rows src_row.. of the last verify window's final
     // residuals; else the draft layer's own row src_row from the window before), paired with tokens (the token after

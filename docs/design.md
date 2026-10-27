@@ -18,8 +18,9 @@ third of **every** layer:
 - **Output head.** A third of the vocabulary per card.
 - **Copied on every card.** The hyper-connection mixes, the router, the embeddings.
 
-Between the cards: two sums per layer, 96 per window, passed around a ring as fp16 pairs. A value past fp16's range is
-an error, never a silent overflow. `FNX_RING_F32=1` sends them as fp32 (KL 5.75e-4 → 4.38e-4 on the code prompt).
+Between the cards: two sums per layer, 96 per window, passed around a ring as fp16 pairs (three cards; a two-card
+build's decode sends fp32). A value past fp16's range is an error, never a silent overflow. `FNX_RING_F32=1` sends
+them as fp32 on three cards too (KL 5.75e-4 → 4.38e-4 on the code prompt).
 
 Decode moves the sums with the GPU's own threads; prompts move them with the copy engines. The ring kernels take ~4.5 ms
 of a 22.5 ms six-row window on card 0, waiting for the slowest card included.

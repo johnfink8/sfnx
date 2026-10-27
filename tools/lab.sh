@@ -183,7 +183,7 @@ trace)
     [ -n "$t" ] || { echo "no trace written"; exit 1; }
     read_only=0
     case "$2" in read*) read_only=1 ;; esac
-    for d in 0 1 2; do
+    for d in $(seq 0 $(($(cat build/ncard) - 1))); do
         READ=$read_only python3 "$P/pf_kernels.py" "$t" "$d" 14
         READ=$read_only python3 "$P/pf_gaps.py" "$t" "$d" 8
     done

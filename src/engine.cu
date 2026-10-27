@@ -273,11 +273,7 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         // sized for fp32 words (two per pair); fp16 pairs use the first half of each slot row's room
         b->ring.in = dalloc<unsigned long long>(ring_in_words(MAXT));
         b->ring.ag = dalloc<unsigned long long>(ring_ag_words(MAXT));
-        // fp32 by default on two cards: with fp16 pairs there the code and edit prompts' KL against llama.cpp is 1.25x
-        // the exactness bar (code 7.48e-4, fp32 5.73e-4 against a bar of 6.06e-4)
-        const long long ring_f32 = env_int("FNX_RING_F32", NCARD == 2 ? 1 : 0);
-        if (ring_f32 != 0 && ring_f32 != 1) throw std::runtime_error("FNX_RING_F32: 0 or 1, got " + std::to_string(ring_f32));
-        b->ring.f32 = ring_f32 == 1;
+        b->ring.f32 = ring_f32();
         b->ring.err = dalloc<unsigned>(1);
         b->att_ring.card = c;
         b->att_ring.in = dalloc<unsigned long long>(att_ring_words());
@@ -1607,7 +1603,7 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
     hc_read(R, b.bo_a, b.inj_a, L.hc_norm[1], L.hc_down[1], L.hc_up[1], L.hc_inj[1], m_.eps, b.mixed, b.inj_f, b.hcs, b.ring.err, T, b.st, b.xq);
     // the shared expert (rows P + t of part): its gate|up in the router's launch and its swiglu and down in the routed
     // gate|up's (Q4_K experts), else on the second stream (a fork and a join cost ~5 us more than the launches' blocks)
-    const bool sh_in = L.gu_e.type == T_Q4_K && L.sh_gu.s.q && L.sh_down.s.q && ffs % 32 == 0 && ffs <= 256;
+    const bool sh_in = L.gu_e.type == T_Q4_K && L.sh_gu.s.q && L.sh_down.s.q && ffs % 32 == 0 && ffs <= SH_MAXF;
     if (!sh_in) {
         ck(cudaEventRecord(b.fork, b.st), "fork");
         ck(cudaStreamWaitEvent(b.st2, b.fork, 0), "fork wait");
@@ -1924,6 +1920,14 @@ std::vector<int> Engine::step(const std::vector<int>& lanes, const std::vector<i
     last_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     last_gpu_ms = gpu_ms;
     return out;
+}
+
+bool ring_f32() {
+    // fp32 by default on two cards: with fp16 pairs there the code and edit prompts' KL against llama.cpp is 1.25x the
+    // exactness bar (code 7.48e-4, fp32 5.73e-4 against a bar of 6.06e-4)
+    const long long v = env_int("FNX_RING_F32", NCARD == 2 ? 1 : 0);
+    if (v != 0 && v != 1) throw std::runtime_error("FNX_RING_F32: 0 or 1, got " + std::to_string(v));
+    return v == 1;
 }
 
 BatchDrafts batch_drafts() {

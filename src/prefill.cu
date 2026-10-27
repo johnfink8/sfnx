@@ -394,6 +394,7 @@ struct Engine::Pf {
     // into stage[l & 1] (on cs) of layer l's experts not in a slot, as many as fit; the rest are read in place
     char* stage[2] = {};
     size_t stage_bytes = 0;
+    size_t alloc_bytes = 0;           // what the prompt path holds on this card (palloc's tally; the stages added later)
     int stage_rows = 0;               // FNX_PF_STAGE_ROWS (default 2048): shorter reads take the experts in place
     const char **ep_gu = nullptr, **ep_dn = nullptr, **ep_hgu = nullptr, **ep_hdn = nullptr;
     int* slot_h = nullptr;            // pinned: the ExpertCache's slot_of at the pass's start
@@ -544,7 +545,8 @@ void cud(CUresult e, const char* what) {
 // Two cards: halves, card g sends half g to the other, which adds its own: finished, and sent back.
 // Each step: a copy into the next card, then a flag there; the step after waits on this card's flag (stream memory
 // operations: no SM time, no host)
-static_assert(2 * NCARD - 2 <= 4, "the copy-engine ring's flags hold 4 steps a set");
+constexpr int PF_RING_STEPS = 4;   // flags a set holds: three cards' four steps (two cards use two)
+static_assert(2 * NCARD - 2 <= PF_RING_STEPS, "the copy-engine ring's flags hold PF_RING_STEPS steps a set");
 void pf_ring_dir(Engine::PfRing& r, int dev, int g, float* x, int C, unsigned seq, unsigned* err, cudaStream_t s) {
     const int set = (int) (seq & 1u);
     auto r0 = [&](int k) { return k * C / NCARD; };
@@ -552,10 +554,10 @@ void pf_ring_dir(Engine::PfRing& r, int dev, int g, float* x, int C, unsigned se
     const int a = g, b = (g + NCARD - 1) % NCARD, c = (g + 1) % NCARD;
     CUstream cs = (CUstream) s;
     auto signal = [&](int step) {
-        cud(cuStreamWriteValue32(cs, (CUdeviceptr) (r.nflags + set * 4 + step), seq, 0), "ring flag");
+        cud(cuStreamWriteValue32(cs, (CUdeviceptr) (r.nflags + set * PF_RING_STEPS + step), seq, 0), "ring flag");
     };
     auto wait = [&](int step) {
-        cud(cuStreamWaitValue32(cs, (CUdeviceptr) (r.flags + set * 4 + step), seq, CU_STREAM_WAIT_VALUE_GEQ), "ring wait");
+        cud(cuStreamWaitValue32(cs, (CUdeviceptr) (r.flags + set * PF_RING_STEPS + step), seq, CU_STREAM_WAIT_VALUE_GEQ), "ring wait");
     };
     auto copy = [&](__half* dst, const __half* src, int nrows) {
         ckc(cudaMemcpyPeerAsync(dst, r.next_dev, src, dev, (size_t) nrows * N * sizeof(__half), s), "ring copy");
@@ -667,7 +669,7 @@ void Engine::pf_seq_reset(unsigned start) {
         Pf& p = *pf_[(size_t) c];
         if (p.att_pend >= 0) throw std::runtime_error("prefill: sequence numbers restarted with an attention merge pending");
         ckc(cudaSetDevice(p.dev), "set");
-        ckc(cudaMemset(p.ring_ce.flags, 0, 2 * 4 * sizeof(unsigned)), "prompt ring flags");
+        ckc(cudaMemset(p.ring_ce.flags, 0, 2 * PF_RING_STEPS * sizeof(unsigned)), "prompt ring flags");
         for (unsigned* f : p.aflags) ckc(cudaMemset(f, 0, 2 * ATT_PIECES_MAX * sizeof(unsigned)), "attention exchange flags");
         p.seq = p.att_seq[0] = p.att_seq[1] = start;
     }
@@ -799,14 +801,14 @@ void Engine::prefill_alloc() {
         }
         {
             PfRing& r = p->ring_ce;
-            const size_t third = (size_t) (pf_c_ + NCARD - 1) / NCARD * N;   // a card's share of the rows (a half on two)
-            r.send = palloc<__half>(third);
+            const size_t share = (size_t) (pf_c_ + NCARD - 1) / NCARD * N;   // a card's share of the rows
+            r.send = palloc<__half>(share);
             for (int k = 0; k < 2; ++k) {
-                r.in0[k] = palloc<__half>(third);
-                r.in1[k] = palloc<__half>(third);
+                r.in0[k] = palloc<__half>(share);
+                if (NCARD == 3) r.in1[k] = palloc<__half>(share);   // the second hop's slot: two cards have one hop
                 r.ag[k] = palloc<__half>((size_t) pf_c_ * N);
             }
-            r.flags = palloc<unsigned>(2 * 4);
+            r.flags = palloc<unsigned>(2 * PF_RING_STEPS);
         }
         p->dev = b.dev;
         p->attn_dec = env_flag("FNX_PF_ATTN_DEC");
@@ -876,6 +878,7 @@ void Engine::prefill_alloc() {
                     own_event(*e);
                 }
         }
+        p->alloc_bytes = pf_card_bytes;
         pf_[c] = p;
         if (env_flag("FNX_PF_TIMING"))
             std::fprintf(stderr, "prefill buffers on card %d: %zu MiB (%zu MiB free before)\n", c, pf_card_bytes >> 20, free0 >> 20);
@@ -932,8 +935,9 @@ void Engine::prefill_stages() {
         p.stage_bytes = pf_stage_bytes(c);
         if (!p.stage_bytes) continue;
         ckc(cudaSetDevice(p.dev), "set");
-        pf_card_bytes = 0;
+        pf_card_bytes = p.alloc_bytes;   // palloc's out-of-memory message says what this card's prompt path holds
         for (char*& st : p.stage) st = palloc<char>(p.stage_bytes);
+        p.alloc_bytes = pf_card_bytes;
         if (env_flag("FNX_PF_TIMING"))
             std::fprintf(stderr, "prefill on card %d: passes of %d chunks, stages of %zu MiB\n", c, p.pass, p.stage_bytes >> 20);
     }

@@ -897,11 +897,30 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
         {8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31, 40, 41, 42, 43, 44, 45, 46, 47}};
     const int ffparts[NCARD][2] = {{0, 320}, {320, 640}};
 #endif
-    for (int c = 0; c < NCARD; ++c)
-        if (ffparts[c][0] % 32 || ffparts[c][1] % 32 || ffparts[c][1] - ffparts[c][0] > FF_CARD_MAX ||
-            ffparts[c][0] != (c ? ffparts[c - 1][1] : 0))
-            throw std::runtime_error("fnx: card " + std::to_string(c) + "'s FF slice is not whole 32-value blocks after the last, within FF_CARD_MAX");
+    for (int c = 0; c < NCARD; ++c) {
+        const std::string slice = "card " + std::to_string(c) + "'s FF slice [" + std::to_string(ffparts[c][0]) + ", " +
+                                  std::to_string(ffparts[c][1]) + ")";
+        if (ffparts[c][0] % 32 || ffparts[c][1] % 32) throw std::runtime_error("fnx: " + slice + " is not whole 32-value blocks");
+        if (ffparts[c][1] - ffparts[c][0] > FF_CARD_MAX)
+            throw std::runtime_error("fnx: " + slice + " is wider than FF_CARD_MAX (" + std::to_string(FF_CARD_MAX) + ")");
+        if (ffparts[c][0] != (c ? ffparts[c - 1][1] : 0)) throw std::runtime_error("fnx: " + slice + " does not start where the last ended");
+    }
     if (ffparts[NCARD - 1][1] != FF) throw std::runtime_error("fnx: the cards' FF slices do not cover the FF width");
+    {   // every value head on exactly one card, beside its key head (value head v belongs to key head v % NKH)
+        std::vector<int> seen(NVH, 0);
+        for (int c = 0; c < NCARD; ++c)
+            for (const int v : vparts[(size_t) c]) {
+                if (v < 0 || v >= NVH) throw std::runtime_error("fnx: card " + std::to_string(c) + " lists value head " + std::to_string(v));
+                ++seen[(size_t) v];
+                const int k = v % NKH;
+                if (k < kparts[c][0] || k >= kparts[c][0] + kparts[c][1])
+                    throw std::runtime_error("fnx: card " + std::to_string(c) + " has value head " + std::to_string(v) + " without its key head " +
+                                             std::to_string(k));
+            }
+        for (int v = 0; v < NVH; ++v)
+            if (seen[(size_t) v] != 1)
+                throw std::runtime_error("fnx: value head " + std::to_string(v) + " is on " + std::to_string(seen[(size_t) v]) + " cards");
+    }
     {
         int ndev = 0;
         ck(cudaGetDeviceCount(&ndev), "cudaGetDeviceCount");

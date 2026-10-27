@@ -11,10 +11,11 @@
 
 namespace fnx {
 
-// the cards every layer is split across: 3 (the box), or 2 (make FNX_NCARD=2: an experiment). The splits by card
-// (key and value heads, FF width) are tables in Model::Model, one per count
+// the cards every layer is split across: 3 (the box), or 2 (make FNX_NCARD=2). The splits by card (key and value
+// heads, FF width) are tables in Model::Model, one per count. The Makefile passes the count to every object that sees
+// this header: a default here would let one built without it link a different geometry
 #ifndef FNX_NCARD
-#define FNX_NCARD 3
+#error "FNX_NCARD is unset: build through the Makefile (make FNX_NCARD=2 or 3)"
 #endif
 constexpr int NCARD = FNX_NCARD;
 static_assert(NCARD == 2 || NCARD == 3, "FNX_NCARD: 2 or 3 cards");
@@ -24,8 +25,12 @@ constexpr int NKH = 16, NVH = 48, HS = 128;            // recurrent: key heads, 
 constexpr int NQH = 24, NKVH = 2, HD = 256, NROT = 64; // attention
 constexpr int MAXT = 16;                               // rows per window
 constexpr int PLE_LAYER = 1, PLE_HEADS = 16, PLE_DIM = 160;
-// the widest FF slice a card gets (Model::Model's ffparts): what the down kernels' per-card buffers are sized for
-constexpr int FF_CARD_MAX = NCARD == 3 ? 224 : FF / 2;
+// the widest FF slice a card gets: FF in whole 32-value blocks, the first cards one block wider when they do not divide
+// evenly (Model::Model's ffparts, checked against this there): what the down kernels' per-card buffers are sized for.
+// 224 on three cards, 320 on two
+constexpr int FF_CARD_MAX = (FF + 32 * NCARD - 1) / (32 * NCARD) * 32;
+// the shared expert's FF slice on a card, at most, for its fused path inside the routed launches (dense.cuh)
+constexpr int SH_MAXF = FF_CARD_MAX > 256 ? FF_CARD_MAX : 256;
 static_assert(NQH % NCARD == 0, "the attention's query heads split evenly over the cards");
 
 inline bool is_attn(int l) { return (l + 1) % 4 == 0; }

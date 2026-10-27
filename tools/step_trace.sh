@@ -25,7 +25,7 @@ if [ -z "$a" ] || [ -z "$b" ]; then
     failed "no trace written (verify: ${a:-none}, step: ${b:-none})"
     finish
 fi
-for d in 0 1 2; do
+for d in $(seq 0 $(($(cat build/ncard) - 1))); do
     echo "== card $d: A = verify, $L rows on one lane; B = step, $L lanes"
     python3 "$P/graph_kernels.py" "$a" "$b" "$W" $d 18 || failed "graph_kernels.py on card $d: exit $?"
 done
