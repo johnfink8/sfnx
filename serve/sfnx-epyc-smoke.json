@@ -34,9 +34,9 @@
  ],
  "port": 8096,
  "gpu": [
-  0,
   1,
-  2
+  2,
+  3
  ],
  "sampling": {
   "temperature": 0.6,

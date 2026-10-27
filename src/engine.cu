@@ -119,6 +119,43 @@ void require_identity_iommu(int dev) {
         throw std::runtime_error("card " + std::to_string(dev) + " (" + bdf + ") is in an IOMMU group of type '" + t + "' (" + path +
                                  "): the ring's writes between cards need identity domains; boot with iommu=pt");
 }
+
+// The ring's kernel stores into a peer card go through that card's BAR1 aperture. On GeForce cards (P2P enabled by
+// the community open-RM patch) the driver only builds a working peer mapping when BOTH cards map all their memory in
+// BAR1 ("static BAR1", i.e. Resizable BAR at full size); otherwise it falls back to mailbox P2P, which fails to set up
+// on these boards (dmesg: "remoteWMBoxLocalAddr != ~0ULL @ kern_bus_gm200.c") while cudaDeviceCanAccessPeer still
+// says 1. The stores are then lost (or land elsewhere) and the ring's first k_wait spins forever inside warm_graphs.
+// Refuse such a card up front. FNX_SKIP_BAR1_CHECK=1 skips this (boards with native P2P and a small BAR1).
+void require_full_bar1(int dev) {
+    if (env_flag("FNX_SKIP_BAR1_CHECK")) return;
+    char bus[32];
+    ck(cudaDeviceGetPCIBusId(bus, sizeof bus, dev), "cudaDeviceGetPCIBusId");
+    unsigned dom = 0, b = 0, d = 0, fn = 0;
+    if (std::sscanf(bus, "%x:%x:%x.%x", &dom, &b, &d, &fn) != 4)
+        throw std::runtime_error("card " + std::to_string(dev) + ": cannot read its PCI address '" + bus + "'");
+    char bdf[32];
+    std::snprintf(bdf, sizeof bdf, "%04x:%02x:%02x.%x", dom, b, d, fn);
+    const std::string path = std::string("/sys/bus/pci/devices/") + bdf + "/resource";
+    std::FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return;   // no sysfs: nothing to check
+    unsigned long long start = 0, end = 0, flags = 0;
+    char line[256];
+    int got = 0;
+    for (int i = 0; i <= 1 && std::fgets(line, sizeof line, f); ++i)   // line i of sysfs "resource" is BAR i
+        if (i == 1) got = std::sscanf(line, "%llx %llx %llx", &start, &end, &flags);
+    std::fclose(f);
+    if (got != 3 || end <= start) return;
+    const unsigned long long bar1 = end - start + 1;
+    cudaDeviceProp prop;
+    ck(cudaGetDeviceProperties(&prop, dev), "cudaGetDeviceProperties");
+    if (bar1 < (unsigned long long) prop.totalGlobalMem)
+        throw std::runtime_error("card " + std::to_string(dev) + " (" + bdf + ", " + prop.name + ") has a " +
+                                 std::to_string(bar1 >> 20) + " MiB BAR1 for " + std::to_string(prop.totalGlobalMem >> 20) +
+                                 " MiB of memory: the ring's peer stores need BAR1 to cover all of it (Resizable BAR at "
+                                 "full size, in the BIOS and in the card's VBIOS) or they are silently dropped and the ring "
+                                 "hangs. Leave this card out (config \"gpu\" / CUDA_VISIBLE_DEVICES) or set "
+                                 "FNX_SKIP_BAR1_CHECK=1");
+}
 }  // namespace
 
 
@@ -156,7 +193,10 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
     hc1_rows();   // FNX_HC1 checked now, not at the first hc read (inside a graph capture)
     pf_jobs_ = pf_c_ * TOPK / PF_JOB + NEXP;   // jobs of up to PF_JOB pairs per expert, at most
     set_prompt_rows(pf_c_);
-    for (int c = 0; c < NCARD; ++c) require_identity_iommu(m.cards[c].dev);
+    for (int c = 0; c < NCARD; ++c) {
+        require_identity_iommu(m.cards[c].dev);
+        require_full_bar1(m.cards[c].dev);
+    }
     const int extra_pages = (std::max(lanes, 1) - 1) * lane_block_pages();
     // the paged K/V pool: pages for the whole context (one more for the block a position past the last one needs)
     // and the extra lanes' blocks. Int8 rows: the context's pages as many as fit in their f16 bytes (the smallest ratio
