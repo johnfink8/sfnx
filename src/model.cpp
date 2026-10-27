@@ -879,8 +879,8 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
     ple_eos = g.i(p + "ple.eos_token_id");
     ple_image = g.i(p + "ple.image_token_id");
     cards.resize(NCARD);
-    // key heads per card (their q and k), value heads (s * NKH + k, ascending) and FF slices, by card_split.hpp's rule:
-    // three cards 16 value heads each with key heads 5 and 10 on two cards, two cards 24 each and no key head on both
+    // key heads per card (their q and k), value heads (numbered s * NKH + k, listed ascending: the order the card's
+    // slices are laid out in) and FF slices, by card_split.hpp's rule
     int kparts[NCARD][2], ffparts[NCARD][2];
     std::vector<std::vector<int>> vparts(NCARD);
     for (int c = 0; c < NCARD; ++c) {

@@ -38,7 +38,7 @@ NVFLAGS := -DFNX_DIR='"$(CURDIR)"' -O3 --use_fast_math -std=c++17 -arch=sm_70 -c
 # objects in build/ were made for; a different count rewrites it, which rebuilds them all. It is written while make
 # reads this file, so any make in this checkout restamps it to its count, -n and `make ref` too
 FNX_NCARD ?= 3
-$(if $(filter 2 3 4 6 8,$(FNX_NCARD)),,$(error FNX_NCARD: 2, 3, 4, 6 or 8 (the query heads, 24, split evenly; at most 8, CUDA's peers a card), not '$(FNX_NCARD)'))
+$(if $(filter 2 3 4 6 8,$(FNX_NCARD)),,$(error FNX_NCARD: 2, 3, 4, 6 or 8 (the 24 query heads and 48 value heads split evenly, a 32-value FF block on every card, at most 8 for CUDA's peers a card), not '$(FNX_NCARD)'))
 NVFLAGS += -DFNX_NCARD=$(FNX_NCARD)
 $(shell mkdir -p build && { [ "$$(cat build/ncard 2>/dev/null)" = "$(FNX_NCARD)" ] || echo $(FNX_NCARD) > build/ncard; })
 

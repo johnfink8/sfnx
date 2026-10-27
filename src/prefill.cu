@@ -334,9 +334,10 @@ struct Engine::PfRing {
 };
 
 constexpr int ATT_PIECES_MAX = 8;   // the attention exchange's pieces at most (FNX_PF_ATT_PIECES)
-// the attention exchange's receive slots a card's flags are laid out for: one per other card, two at least (two cards
-// keep three cards' layout)
-constexpr int ATT_SLOTS = NCARD - 1 > 2 ? NCARD - 1 : 2;
+// rows of a card's attention-exchange flags (aflags [row][piece], row k set by card + k + 1): one per other card, with
+// a floor of two, so two cards' flag allocation is three cards'. A flag count only: the receive blocks (arecv) and
+// every loop over the senders take NCARD - 1
+constexpr int ATT_FLAG_ROWS = NCARD - 1 > 2 ? NCARD - 1 : 2;
 
 struct Engine::Pf {
     cublasHandle_t blas = nullptr;
@@ -546,11 +547,9 @@ void cud(CUresult e, const char* what) {
 }
 
 // one direction's sum of x (C rows of N) over the cards, on stream s; this card is at position g of the direction's
-// ring (its next card: g + 1 there). Parts of the rows, one a card: card g sends part g to g + 1, each card after adds
-// its own and sends it on, until the card before g, which finishes it (card g finishes part g + 1); the finished parts
-// go round n - 1 times. Three cards: thirds, two hops to finish and two to spread; two cards: halves, one each.
-// The steps are r.plan (pf_ring_plan.hpp, checked by tools/pf_ring_plan_test.cpp). Each copy into the next card is
-// followed by a flag there; the step after waits on this card's flag (stream memory operations: no SM time, no host)
+// ring (its next card: g + 1 there), by the steps of r.plan (pf_ring_plan.hpp, which describes the algorithm). Each
+// copy into the next card is followed by a flag there; the step after waits on this card's flag (stream memory
+// operations: no SM time, no host)
 constexpr int PF_RING_STEPS = pf_ring_steps(NCARD);   // flags a set holds
 void pf_ring_dir(Engine::PfRing& r, int dev, int g, float* x, int C, unsigned seq, unsigned* err, cudaStream_t s) {
     if (r.plan.empty() || r.plan.front().part != g) throw std::runtime_error("prefill: the ring's plan is not card " + std::to_string(g) + "'s");
@@ -589,6 +588,7 @@ void pf_ring_dir(Engine::PfRing& r, int dev, int g, float* x, int C, unsigned se
             case PfRingOp::OUT:
                 k_pfr_out<<<grid_for((size_t) C * N / 2), 256, 0, s>>>((const __half2*) r.ag[set], (float2*) x, C * N / 2);
                 break;
+            default: throw std::runtime_error("prefill: a ring step of unknown kind " + std::to_string((int) o.k));
         }
     }
 }
@@ -663,7 +663,7 @@ void Engine::pf_seq_reset(unsigned start) {
         if (p.att_pend >= 0) throw std::runtime_error("prefill: sequence numbers restarted with an attention merge pending");
         ckc(cudaSetDevice(p.dev), "set");
         ckc(cudaMemset(p.ring_ce.flags, 0, 2 * PF_RING_STEPS * sizeof(unsigned)), "prompt ring flags");
-        for (unsigned* f : p.aflags) ckc(cudaMemset(f, 0, ATT_SLOTS * ATT_PIECES_MAX * sizeof(unsigned)), "attention exchange flags");
+        for (unsigned* f : p.aflags) ckc(cudaMemset(f, 0, ATT_FLAG_ROWS * ATT_PIECES_MAX * sizeof(unsigned)), "attention exchange flags");
         p.seq = p.att_seq[0] = p.att_seq[1] = start;
     }
     for (CardBuf* b : cb_) { ckc(cudaSetDevice(b->dev), "set"); ckc(cudaDeviceSynchronize(), "prompt sequence reset sync"); }
@@ -807,7 +807,7 @@ void Engine::prefill_alloc() {
         p->apart[1] = palloc<float>(NCARD * attn_prompt_block_floats(pf_c_));   // set 0 is in the attention phase's region
         for (int s = 0; s < 2; ++s) {
             p->arecv[s] = palloc<float>((NCARD - 1) * attn_prompt_block_floats(pf_c_));
-            p->aflags[s] = palloc<unsigned>(ATT_SLOTS * ATT_PIECES_MAX);   // [slot][piece]
+            p->aflags[s] = palloc<unsigned>(ATT_FLAG_ROWS * ATT_PIECES_MAX);   // [slot][piece]
         }
         if (const char* ap = std::getenv("FNX_PF_ATT_PIECES")) {
             char* end = nullptr;

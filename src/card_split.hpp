@@ -7,7 +7,8 @@ namespace fnx {
 
 // the counts the shapes allow: the query heads (NQH) split evenly, so do the value heads (NVH), every card gets at
 // least one 32-value FF block, and every card is a CUDA peer of every other (the prompt path's attention exchange
-// writes into every card; CUDA allows eight peer connections a card on PCIe, so nine cards at most). 2, 3, 4, 6, 8
+// writes into every card; CUDA allows eight peer connections a card on PCIe, so nine cards at most, and nine fails the
+// head split: NCARD_MAX is the largest count that passes both). 2, 3, 4, 6, 8
 constexpr int NCARD_MAX = 8;
 constexpr bool ncard_ok(int n) { return n >= 2 && n <= NCARD_MAX && NQH % n == 0 && NVH % n == 0 && FF / 32 >= n; }
 
