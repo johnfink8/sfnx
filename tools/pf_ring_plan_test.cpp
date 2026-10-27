@@ -128,6 +128,7 @@ static bool simulate(int n, int sums, unsigned seed) {
         const int set = (int) (c.seq & 1u);
         const PfRingOp& o = plan[g][c.pc];
         const std::string at = tag + "card " + std::to_string(g) + " sum " + std::to_string(c.seq) + " op " + std::to_string(c.pc) + ": ";
+        if ((o.k == K::ADD || o.k == K::SEND) && (o.hop < 0 || o.hop >= n - 1)) { fail(at + "a receive slot past n - 1 hops"); return false; }
         auto in = [&](Card& k, int hop) -> Slot& { return k.in[(size_t) (set * (n - 1) + hop)]; };
         auto ag = [&](Card& k, int part) -> Slot& { return k.ag[(size_t) (set * n + part)]; };
         if (o.k == K::WAIT) {
@@ -180,6 +181,9 @@ static bool simulate(int n, int sums, unsigned seed) {
                 s.consumed = true;
             }
             if (!c.pending.empty()) { fail(at + "copied after its last flag"); return false; }
+        } else {
+            fail(at + "a step of unknown kind " + std::to_string((int) o.k));
+            return false;
         }
         if (++c.pc == plan[g].size()) {
             c.pc = 0;
@@ -194,6 +198,13 @@ int main() {
         for (int g = 0; g < n; ++g)
             if (fnx::pf_ring_plan(n, g) != written(n, g))
                 fail(std::to_string(n) + " cards, card " + std::to_string(g) + ": the plan is not the written sequence");
+    for (const auto& [n, g] : std::vector<std::pair<int, int>>{{1, 0}, {0, 0}, {3, 3}, {3, -1}}) {
+        try {
+            fnx::pf_ring_plan(n, g);
+            fail("pf_ring_plan(" + std::to_string(n) + ", " + std::to_string(g) + ") made a plan");
+        } catch (const std::invalid_argument&) {
+        }
+    }
     constexpr int SUMS = 8, ORDERS = 500;
     int counts = 0;
     for (int n = 2; n <= fnx::NCARD_MAX; ++n)

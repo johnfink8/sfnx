@@ -788,8 +788,8 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
                              "ref/img/sphinx.png 'What does this picture show? Answer in two sentences.' 200 ref/img/sphinx\n",
                              llama_s.c_str(), stem.c_str(), argv[1]);
             else
-                std::fprintf(stderr, "exact: no llama.cpp reference %s for %s; make it with\n  ref/fnx_logref %s %s 200 %s\n",
-                             llama_s.c_str(), stem.c_str(), argv[1], prompt.c_str(), llama_s.c_str());
+                std::fprintf(stderr, "exact: no llama.cpp reference %s for %s; make it with\n  ref/fnx_logref %s %s %d %s\n",
+                             llama_s.c_str(), stem.c_str(), argv[1], prompt.c_str(), long64 ? 200 : 300, llama_s.c_str());
             std::printf("exact %s %s: FAIL: no llama.cpp reference %s\n", name.c_str(), p, llama_s.c_str());
             rc = 1;
             continue;

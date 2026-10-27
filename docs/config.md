@@ -56,7 +56,8 @@ of each expert's FF width, and need at most eight CUDA peers a card. Every layer
 | 6 | 8 / 3 or 4 (key heads 2, 5, 10 and 13 on two cards) | 128, 128, 96 x 4 | 4 | builds; untested on hardware |
 | 8 | 6 / 2 | 96 x 4, 64 x 4 | 3 | builds; untested on hardware |
 
-K/V is dealt by position (blocks of 4 positions, card j % n) and the vocabulary in n equal ranges on every count.
+K/V is dealt by position (blocks of 4 positions, card j % n) and the vocabulary in ranges of ceil(vocab / n) tokens, the last card's
+shorter, on every count.
 Validating a count: [docs/verification.md](verification.md#other-card-counts).
 
 ## Engine settings

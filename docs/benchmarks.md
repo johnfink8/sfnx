@@ -137,7 +137,9 @@ code and edit prompts are 1.25x over the exactness bar ([docs/verification.md](v
 Exactness on two cards with fp32 sums, against llama.cpp CUDA (`lab.sh exact`): KL mean 5.73e-4 code, 3.14e-6 edit, 4.01e-3 on the
 62k prompt, 7.89e-3 on the picture, every prompt within the bar; windows of 1–16 rows and batched lanes give the same
 tokens as 5-row windows and lanes alone. fp32 sums cost a quarter to a third of one request's decode where the bytes
-they add should cost microseconds a sum: not traced yet.
+they add should cost microseconds a sum: not traced yet. With the fp16 default only the code and edit KL are
+recorded (code 7.48e-4, over the bar, and edit over it too); no full `exact` run (top-1, the 62k prompt, the picture)
+is recorded for it.
 
 **One card: use Strata.** Built and run once (6,415 experts in VRAM, 26%: 73% of decode's picks), sFNX reads every
 expert it lacks over the card's one PCIe link and loses to Strata, which computes part of the misses on the CPU next

@@ -21,7 +21,8 @@ third of **every** layer:
 That is three cards. The split follows one rule for any count the build allows (`src/card_split.hpp`; 2, 3, 4, 6 or 8,
 [docs/config.md](config.md#card-count)): the value heads in key-head order dealt in equal runs, a key head on two cards
 when a run starts inside its value heads; the FF width in 32-value blocks, the first cards one block more when the
-count does not divide 20; the query heads, K/V blocks and vocabulary 1/n each. Only two and three cards have run.
+count does not divide 20; the query heads and K/V blocks 1/n each, the vocabulary in ranges of ceil(vocab / n), the last shorter. Only two
+and three cards have run.
 
 Between the cards: two sums per layer, 96 per window, passed around a ring as fp16 pairs. On n cards a sum takes n - 1 hops
 to reduce and n - 1 to spread. A value past fp16's range is an error, never a silent overflow. `FNX_RING_F32=1` sends

@@ -88,7 +88,7 @@ nobody here has the cards. Checked without them, on the CPU:
   sum before had read it, without a deadlock.
 
 Not checked anywhere: the decode ring and the attention merge on more than three cards. They are the same loops on
-every count (n - 1 hops to reduce, n - 2 to forward), run so far with n = 2 and 3. Nor speed: each sum takes 2n - 2
+every count (n - 1 hops to reduce, n - 1 to spread), run so far with n = 2 and 3. Nor speed: each sum takes 2n - 2
 hops, so more cards add latency to each of a window's 96 sums while each card's share of the weights shrinks.
 
 To validate count n (n cards, `iommu=pt` or the IOMMU off, and peer access between every pair of cards:

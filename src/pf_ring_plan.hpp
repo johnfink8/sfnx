@@ -7,6 +7,8 @@
 // count's sum complete with nothing read before its flag.
 #pragma once
 
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace fnx {
@@ -31,7 +33,11 @@ struct PfRingOp {
 // flags a set holds: a sum's 2 n - 2 steps, four at least (two cards' set laid out as three cards')
 constexpr int pf_ring_steps(int n) { return 2 * n - 2 > 4 ? 2 * n - 2 : 4; }
 
+// card g's steps; every op's part is in [0, n), hop in [0, n - 1) and step in [0, pf_ring_steps(n)) where it has one, so
+// prefill.cu indexes its slots and flags with them unchecked
 inline std::vector<PfRingOp> pf_ring_plan(int n, int g) {
+    if (n < 2 || g < 0 || g >= n)
+        throw std::invalid_argument("pf_ring_plan: card " + std::to_string(g) + " of " + std::to_string(n) + " (2 cards at least)");
     using K = PfRingOp;
     auto mod = [n](int v) { return ((v % n) + n) % n; };
     std::vector<PfRingOp> ops;
@@ -60,6 +66,9 @@ inline std::vector<PfRingOp> pf_ring_plan(int n, int g) {
     }
     ops.push_back({K::WAIT, -1, -1, 2 * n - 3});   // the last part arrived: all here
     ops.push_back({K::OUT});
+    for (const PfRingOp& o : ops)
+        if (o.part < -1 || o.part >= n || o.hop < -1 || o.hop >= n - 1 || o.step < -1 || o.step >= pf_ring_steps(n))
+            throw std::logic_error("pf_ring_plan: card " + std::to_string(g) + " of " + std::to_string(n) + ": a step out of range");
     return ops;
 }
 

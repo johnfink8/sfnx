@@ -1027,6 +1027,9 @@ int main(int argc, char** argv) {
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load).count(), a.max_ctx, a.K, a.lookup, a.batch,
                      fnx::NCARD, fnx::ring_f32() ? "fp32" : "fp16",
                      fnx::kv_q8() ? "int8" : "f16", e.free_pages() * fnx::KVP_POS, vfree.c_str());
+        if (fnx::NCARD > 3)
+            std::fprintf(stderr, "sfnx: %d cards builds and passes the CPU checks but has not been validated on hardware "
+                                 "(docs/verification.md, \"Other card counts\")\n", fnx::NCARD);
         say("INFO engine=sfnx version=0.2 spec=" + std::to_string(a.K) + " conversation_cache_mib=" + std::to_string(a.cache_mib) +
             (a.batch > 1 ? " batch_slots=" + std::to_string(a.batch) + " slot_cache=1" : ""));
         say("READY " + std::to_string(a.max_ctx) + " stop");

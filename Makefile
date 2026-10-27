@@ -52,7 +52,7 @@ bin/sfnx_input_test: tools/sfnx_input_test.cpp tools/sfnx_input.hpp
 bin/batch_plan_test: tools/batch_plan_test.cpp src/batch_plan.hpp
 	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -o $@ tools/batch_plan_test.cpp
 # the prompt path's ring plan against the two- and three-card sequences, and every supported count's sum, on the CPU
-bin/pf_ring_plan_test: tools/pf_ring_plan_test.cpp src/pf_ring_plan.hpp src/card_split.hpp src/model.hpp
+bin/pf_ring_plan_test: tools/pf_ring_plan_test.cpp src/pf_ring_plan.hpp src/card_split.hpp src/model.hpp src/gguf.hpp build/ncard
 	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -DFNX_NCARD=$(FNX_NCARD) -o $@ tools/pf_ring_plan_test.cpp
 
 # one object per source in build/ (headers tracked by nvcc's own dependency files), so a change recompiles only the
