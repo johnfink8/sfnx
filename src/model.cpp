@@ -860,7 +860,7 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
     }
     eps = (float) g.f(p + "attention.layer_norm_rms_epsilon");
     rope_base = (float) g.f(p + "rope.freq_base");
-    ctx_train = (int) g.i(p + "context_length");
+    ctx_train = g.has(p + "context_length") ? (int) g.i(p + "context_length") : 0;  // 0: untrained length unknown; FNX_ROPE_SCALE is what needs it
     tok_embd = &g.t("token_embd.weight");
     ple_table = &g.t("per_layer_token_embd.weight");
     if (tok_embd->type != T_Q8_0) throw std::runtime_error("fnx: token_embd.weight is not Q8_0 (the host's embedding reads Q8_0)");
