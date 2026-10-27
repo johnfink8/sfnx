@@ -11,23 +11,31 @@
 
 namespace fnx {
 
-// the cards every layer is split across: 3 (the box), or 2 (make FNX_NCARD=2). The splits by card (key and value
-// heads, FF width) are tables in Model::Model, one per count. The Makefile passes the count to every object that sees
-// this header: a default here would let one built without it link a different geometry
+// the cards every layer is split across: 3 (the box), or 2, 4, 6 or 8 (make FNX_NCARD=n; card_split.hpp says why
+// those). The splits by card (key and value heads, FF width) follow one rule (card_split.hpp), checked there against
+// the two- and three-card tables. The Makefile passes the count to every object that sees this header: a default here
+// would let one built without it link a different geometry
 #ifndef FNX_NCARD
-#error "FNX_NCARD is unset: build through the Makefile (make FNX_NCARD=2 or 3)"
+#error "FNX_NCARD is unset: build through the Makefile (make FNX_NCARD=2, 3, 4, 6 or 8)"
 #endif
 constexpr int NCARD = FNX_NCARD;
-static_assert(NCARD == 2 || NCARD == 3, "FNX_NCARD: 2 or 3 cards");
 constexpr int N = 2560, HC = 4, D = N * HC, LR = 320;
 constexpr int NL = 48, NEXP = 512, TOPK = 10, FF = 640, FF_SH = 640;
 constexpr int NKH = 16, NVH = 48, HS = 128;            // recurrent: key heads, value heads, head size
 constexpr int NQH = 24, NKVH = 2, HD = 256, NROT = 64; // attention
 constexpr int MAXT = 16;                               // rows per window
 constexpr int PLE_LAYER = 1, PLE_HEADS = 16, PLE_DIM = 160;
+
+}  // namespace fnx
+
+#include "card_split.hpp"
+
+namespace fnx {
+
+static_assert(ncard_ok(NCARD), "FNX_NCARD: 2, 3, 4, 6 or 8 cards (card_split.hpp, ncard_ok)");
 // the widest FF slice a card gets: FF in whole 32-value blocks, the first cards one block wider when they do not divide
-// evenly (Model::Model's ffparts, checked against this there): what the down kernels' per-card buffers are sized for.
-// 224 on three cards, 320 on two
+// evenly (card_split.hpp's ff_lo / ff_hi, checked against this in Model::Model): what the down kernels' per-card
+// buffers are sized for. 320 on two cards, 224 on three, 160 on four, 128 on six, 96 on eight
 constexpr int FF_CARD_MAX = (FF + 32 * NCARD - 1) / (32 * NCARD) * 32;
 // the shared expert's FF slice on a card, at most, for its fused path inside the routed launches (dense.cuh)
 constexpr int SH_MAXF = FF_CARD_MAX > 256 ? FF_CARD_MAX : 256;

@@ -30,7 +30,7 @@ struct CardPool;
 // reading every batched row (1 or unset). Read once; a value it does not know throws
 enum class BatchDrafts { off, lookup, mtp };
 BatchDrafts batch_drafts();
-// FNX_RING_F32: decode's sums between cards as fp32 (true) or fp16 pairs; default fp32 on two cards, fp16 on three.
+// FNX_RING_F32: decode's sums between cards as fp32 (true) or fp16 pairs; fp16 pairs by default.
 // Read at each call (an Engine reads it when it is made; the lab's identity records reads it too); not 0 or 1 throws
 bool ring_f32();
 

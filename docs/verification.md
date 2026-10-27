@@ -48,10 +48,11 @@ Logits against llama.cpp on the 62k prompt by prompt-chunk size: 4,096 rows KL m
 
 ## What is not exact
 
-- On three cards the sums between cards travel as fp16 pairs. `FNX_RING_F32=1` sends them as fp32: KL 5.75e-4 →
-  4.38e-4 on the code prompt. Two cards send decode's sums as fp32 by default: with fp16 pairs their code and edit
-  prompts are 1.25x over the bar. The prompt path's sums stay fp16 on both (its copy-engine ring has no fp32 form); the
-  62k prompt, read through it, is within the bar on both.
+- The sums between cards travel as fp16 pairs. `FNX_RING_F32=1` sends decode's as fp32: KL 5.75e-4 → 4.38e-4 on
+  the code prompt on three cards. On two cards fp16 leaves code and edit slightly over the bar (code KL 7.5e-4 against 6.1e-4, edit 7.1e-6 against 5.2e-6; the same top-1 as fp32); fp32 brings them within
+  it, at ~30% of one request's decode. The prompt path's sums stay fp16 on every count (its copy-engine ring has no fp32
+  form); the 62k prompt, read through it, is within the bar on two and three. On n cards a part is rounded to f16 at
+  each of n - 1 hops, so on four or more it is the first suspect if `long64` fails.
 - The kernels are built with fast math.
 - A prompt read from scratch on a lane that held another conversation can differ in its last bits from the same read on
   a fresh engine: first-token KL ~1e-4, and greedy text can part at a near-tie. Something of the lane's earlier use
@@ -72,6 +73,56 @@ On the current build at 49 GiB in RAM (the lab's `logits` against the same CPU t
 code edit 100.00% / 2.79e-6 / 2.1e-5. Both inside the Q4 bar above — llama.cpp's CPU backend against its CUDA one,
 4.85e-4 and 4.12e-6 — as sFNX's Q4 path is.
 
+## Other card counts
+
+Four, six and eight cards build (`make FNX_NCARD=n`, [docs/config.md](config.md#card-count)) but **have never run**:
+nobody here has the cards. Checked without them, on the CPU:
+
+- the split rule (`src/card_split.hpp`, static checks in every build): on every supported count each value head is on
+  one card beside its key head, the key heads and FF blocks are covered in order, no card is empty; for two and three
+  cards the rule gives exactly the splits the bases were made with;
+- the prompt path's ring (`bin/pf_ring_plan_test`): its steps for two and three cards are the sequences the
+  hand-written code ran, and on every supported count the cards' steps run against each other complete eight sums in
+  a row over the two buffer sets and the sequence-numbered flags, in 500 random interleavings: every part holding
+  every card's addend once, nothing read before the flag that covers it for its sum, no slot written over before the
+  sum before had read it, without a deadlock.
+
+Not checked anywhere: the decode ring and the attention merge on more than three cards. They are the same loops on
+every count (n - 1 hops to reduce, n - 1 to spread), run so far with n = 2 and 3. Nor speed: each sum takes 2n - 2
+hops, so more cards add latency to each of a window's 96 sums while each card's share of the weights shrinks.
+
+To validate count n (n cards, `iommu=pt` or the IOMMU off, and peer access between every pair of cards:
+[docs/config.md](config.md#boot-requirement)), with nothing else on the cards:
+
+1. Build: `FNX_NCARD=n make -j lab bin/sfnx test-bin ref`. The CPU checks: `bin/pf_ring_plan_test`,
+   `bin/batch_plan_test`, `bin/sfnx_input_test`.
+2. llama.cpp's references, before the lab takes the cards: `ref/fnx_logref MODEL ref/P.bin STEPS ref/lgr/llama_cuda_P.lgr`
+   with MODEL the UD-Q4_K_XL GGUF's first shard, for code1 and edit1 (300 steps) and long64 (200). `exact` prints the
+   command for any it misses; the picture's reference is in git.
+3. A lab directory of the count's own (its bases differ from three cards'), on every `lab.sh` call:
+   `export FNX_LAB_DIR=/tmp/fnx-lab-$UID-${n}card`, then `tools/lab.sh start`.
+4. `tools/lab.sh exact base`: logits against llama.cpp on long64, code1, edit1 and the picture. It writes a base only
+   when every prompt is within the bar: KL mean at most 1.25x llama.cpp's own CPU-against-CUDA KL for code1, edit1 and
+   the picture (1.0x for long64), top-1 at most 1.5 points under it.
+5. `tools/lab.sh exact` (against that base, and windows of 1, 2, 3, 11 and 16 rows byte for byte),
+   `tools/lab.sh batch` (batched windows give each lane its tokens alone) and `tools/lab.sh decode` (speed, with the
+   GPUs' use).
+6. If step 4 fails on KL alone: fp32 sums in a directory of their own, to tell the ring's rounding from a real fault.
+   `tools/lab.sh unload`, then with `FNX_LAB_DIR=/tmp/fnx-lab-$UID-${n}card-fp32`:
+   `tools/lab.sh start "" "-E FNX_RING_F32=1"` and `exact base`. Two cards need this to pass step 4.
+7. Through the front end, `tools/lab.sh unload` first (four cards: `serve/sfnx-4card.json`; another count: a copy with
+   its `"gpu"` list and vision card): `serve/run.sh serve/sfnx-4card.json`, then `serve/api_smoke.py
+   http://127.0.0.1:8095` and `serve/image_test.py http://127.0.0.1:8095/v1`.
+
+A failure in step 4 with the rest clean points at the arithmetic (the sums' precision, a split); a hang, a `ring` or
+`attn` error, or a timeout in the log at the transport (peer access, the IOMMU, a buffer sized for fewer cards).
+One place rests on timing rather than flags: with `FNX_PF_OVERLAP=1` (the default) the attention exchange takes a
+sequence number between two ring sums, so two attention layers' sums can use the same buffer set back to back
+(`bin/pf_ring_plan_test` does not model it). A hang or a wrong long64 that goes away with `FNX_PF_OVERLAP=0` points
+there. Six cards put four key heads on two cards each, and eight give each card the smallest slices (FF 64 or 96
+wide); a count that fails where four passes points at those. Above three cards the engine says at start that the
+count has not run on hardware yet.
+
 ## The test inventory
 
 | What | How |
@@ -85,6 +136,7 @@ code edit 100.00% / 2.79e-6 / 2.1e-5. Both inside the Q4 bar above — llama.cpp
 | Batched windows = alone, with and without drafts (every token up to each reference's end) | `bin/batch_test`, `tools/lab.sh batch` |
 | Batched drafts' sampler against plain sampling, in distribution (3 lanes, open1, 600 seeds: every p ≥ 0.34) | `SAMPLE_TEST_LANES=3 bin/sample_test` |
 | The batched-draft row plan against a brute force over every split | `bin/batch_plan_test` |
+| The prompt path's ring steps: two and three cards' sequences, and consecutive sums over both buffer sets on every supported count (CPU) | `bin/pf_ring_plan_test` |
 | The top-k ties | `bin/topk_test` |
 | The engine's stdin handling | `bin/sfnx_input_test` |
 | The conversation cache where prompts share much: two conversations alternating on a lane, a system prompt changed near its end | `tools/lab.sh cmd cache2` |

@@ -1266,8 +1266,8 @@ void ple_post(float* R, const float* key, const float* value, const float* nk, c
     ck_launch("ple_post");
 }
 
-// flags: [2 sets][kind: the reduce steps' (in), then the finished chunks' (ag)][block]; three cards: in step 0, in
-// step 1, ag step 2, ag step 3; two cards: in step 0, ag step 1
+// flags: [2 sets][kind: the reduce steps' (in), then the finished chunks' (ag)][block]; on n cards kinds 0..n-2 are in
+// steps 0..n-2 and kinds n-1..2n-3 ag steps n-1..2n-3 (three cards: in step 0, in step 1, ag step 2, ag step 3)
 constexpr int RB_BLOCKS = 240, RB_KINDS = 2 * NCARD - 2;
 size_t ring_flag_words() { return (size_t) 2 * RB_KINDS * RB_BLOCKS; }
 
