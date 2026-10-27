@@ -135,7 +135,7 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         if (orig <= 0) throw std::runtime_error("FNX_ROPE_SCALE: no n_ctx_orig (the model has no context_length and FNX_YARN_ORIG_CTX is unset)");
         const float lb = logf(m_.rope_base);
         // ggml.c's ggml_rope_yarn_corr_dims at n_dims = NROT: corr(beta) = n_dims * log(orig / (2*pi*beta)) / (2*log(base))
-        auto corr = [NROT, orig, lb](float beta) { return (float) NROT * logf((float) orig / (beta * 2.0f * M_PI)) / (2.0f * lb); };
+        auto corr = [orig, lb](float beta) { return (float) NROT * logf((float) orig / (beta * 2.0f * M_PI)) / (2.0f * lb); };  // NROT is a constexpr: used, not captured
         rope_scaled_.c_low = fmaxf(0.0f, floorf(corr(32.0f)));
         rope_scaled_.c_high = fminf((float) (NROT - 1), ceilf(corr(1.0f)));
         rope_scaled_.inv_scale = (float) (1.0 / S);
