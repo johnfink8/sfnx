@@ -83,7 +83,7 @@ done.
 
 | Check | What it proves | How it fails |
 | --- | --- | --- |
-| `lab.sh exact` | logits within the bar against llama.cpp CUDA (code, edit, a 62k prompt, the logo picture), byte for byte against the base, 1 / 2 / 3 / 11 / 16-row windows identical to 5-row ones. Two cards' default fp16 sums are over the bar on code and edit: judge a two-card build with `tools/lab.sh start "" "-E FNX_RING_F32=1"` | `FAIL: ...`, exit 1 |
+| `lab.sh exact` | logits within the bar against llama.cpp CUDA (code, edit, a 62k prompt, the logo picture), byte for byte against the base, 1 / 2 / 3 / 11 / 16-row windows identical to 5-row ones. Two cards' default fp16 sums are slightly over the bar on code and edit: judge a two-card build with `tools/lab.sh start "" "-E FNX_RING_F32=1"` | `FAIL: ...`, exit 1 |
 | `lab.sh exact base` | writes a new base, only when every prompt passes; `MODEL-base.id` records the build | `NOT written`, exit 1 |
 | `lab.sh batch` | batched windows (with their drafts) give each lane its tokens alone | MISMATCH, exit 1 |
 | `bin/sample_test` | speculative sampling matches plain sampling in distribution | MISMATCH, exit 1 |

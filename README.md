@@ -47,7 +47,7 @@ whether it accepts one token or sixteen, and code drafts where prose does not.
 Three cards are what sFNX is made for. It also builds for **two** (`make FNX_NCARD=2`, `serve/sfnx-2card.json`): each
 layer split in halves, a third of the experts in RAM, chosen by the engine at start. Ahead of Strata on the same two
 cards, by less than on three. Its sums between the cards are fp16 by default, as on three, which leaves the code and
-edit prompts over the exactness bar (code 1.2x, edit 1.4x) on two; `FNX_RING_F32=1` sends fp32, within the bar but with a ~30% penalty on
+edit prompts slightly over the exactness bar (code KL 7.5e-4 against 6.1e-4, edit 7.1e-6 against 5.2e-6; the same top-1 as fp32) on two; `FNX_RING_F32=1` sends fp32, within the bar but with a ~30% penalty on
 one request's decode:
 
 | One request, two cards | sFNX (fp16 sums) | sFNX, fp32 sums | Strata |

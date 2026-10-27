@@ -119,7 +119,7 @@ hardware at one point in time**, as above.
 
 Two cards hold 15,806 of the 24,576 experts (64%; the engine moves the rest to RAM by itself at start), which serve
 97% of decode's picks on the routing profile. The sums between cards are fp16 pairs by default, as on three; with them the
-code and edit prompts are over the exactness bar (code 1.2x, edit 1.4x) ([docs/verification.md](verification.md)). fp32 sums
+code and edit prompts are slightly over the exactness bar (code KL 7.5e-4 against 6.1e-4, edit 7.1e-6 against 5.2e-6; the same top-1 as fp32; [docs/verification.md](verification.md)). fp32 sums
 (`FNX_RING_F32=1`) are within it, at the cost shown.
 
 | One request | sFNX, 2 cards, fp16 sums | sFNX, 2 cards, fp32 sums | Strata, 2 cards |

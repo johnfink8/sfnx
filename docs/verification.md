@@ -49,7 +49,7 @@ Logits against llama.cpp on the 62k prompt by prompt-chunk size: 4,096 rows KL m
 ## What is not exact
 
 - The sums between cards travel as fp16 pairs. `FNX_RING_F32=1` sends decode's as fp32: KL 5.75e-4 → 4.38e-4 on
-  the code prompt on three cards. On two cards fp16 leaves code and edit over the bar (code 1.2x, edit 1.4x); fp32 brings them within
+  the code prompt on three cards. On two cards fp16 leaves code and edit slightly over the bar (code KL 7.5e-4 against 6.1e-4, edit 7.1e-6 against 5.2e-6; the same top-1 as fp32); fp32 brings them within
   it, at ~30% of one request's decode. The prompt path's sums stay fp16 on every count (its copy-engine ring has no fp32
   form); the 62k prompt, read through it, is within the bar on two and three. On n cards a part is rounded to f16 at
   each of n - 1 hops, so on four or more it is the first suspect if `long64` fails.
