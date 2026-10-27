@@ -33,11 +33,12 @@ NVCC := /usr/local/cuda/bin/nvcc
 LLAMA ?= $(CURDIR)/llama.cpp
 GG := $(LLAMA)/ggml
 NVFLAGS := -DFNX_DIR='"$(CURDIR)"' -O3 --use_fast_math -std=c++17 -arch=sm_70 -ccbin g++-14 -Wno-deprecated-gpu-targets -I$(GG)/src/ggml-cuda -I$(GG)/src -I$(GG)/include --expt-relaxed-constexpr
-# the cards every layer is split across (src/model.hpp): 3 (prod), or 2 (make FNX_NCARD=2 ...). build/ncard
-# holds the count the objects in build/ were made for; a different count rewrites it, which rebuilds them all. It is
-# written while make reads this file, so any make in this checkout restamps it to its count, -n and `make ref` too
+# the cards every layer is split across (src/model.hpp): 3 (prod), or 2, 4, 6 or 8 (make FNX_NCARD=4 ...; the counts
+# the model's shapes divide by, src/card_split.hpp; above three untested on hardware). build/ncard holds the count the
+# objects in build/ were made for; a different count rewrites it, which rebuilds them all. It is written while make
+# reads this file, so any make in this checkout restamps it to its count, -n and `make ref` too
 FNX_NCARD ?= 3
-$(if $(filter 2 3,$(FNX_NCARD)),,$(error FNX_NCARD: 2 or 3, not '$(FNX_NCARD)'))
+$(if $(filter 2 3 4 6 8,$(FNX_NCARD)),,$(error FNX_NCARD: 2, 3, 4, 6 or 8 (the query heads, 24, split evenly; at most 8, CUDA's peers a card), not '$(FNX_NCARD)'))
 NVFLAGS += -DFNX_NCARD=$(FNX_NCARD)
 $(shell mkdir -p build && { [ "$$(cat build/ncard 2>/dev/null)" = "$(FNX_NCARD)" ] || echo $(FNX_NCARD) > build/ncard; })
 

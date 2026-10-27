@@ -320,9 +320,9 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
             }
             if (!more) break;
             if (round == 8) throw std::runtime_error("FNX_ARENA: VRAM still short after placing the experts again 8 times");
-            // two cards are short by design; on three the experts fit unless something else holds VRAM
+            // two 32 GB cards are short by design; on three or more the experts fit unless something else holds VRAM
             std::fprintf(stderr, "fnx: VRAM short by %zu MiB on a card%s: %d more of the coldest experts to RAM\n", short_mib,
-                         NCARD == 3 ? " (another process on it?)" : "", more);
+                         NCARD >= 3 ? " (another process on it?)" : "", more);
             m.free_experts();
             m.ram_extra += more;
             m.place_experts();
@@ -1923,9 +1923,11 @@ std::vector<int> Engine::step(const std::vector<int>& lanes, const std::vector<i
 }
 
 bool ring_f32() {
-    // fp32 by default on two cards: with fp16 pairs there the code and edit prompts' KL against llama.cpp is 1.25x the
-    // exactness bar (code 7.48e-4, fp32 5.73e-4 against a bar of 6.06e-4)
-    const long long v = env_int("FNX_RING_F32", NCARD == 2 ? 1 : 0);
+    // fp32 by default on every count but three: on two cards, with fp16 pairs the code and edit prompts' KL against
+    // llama.cpp is 1.25x the exactness bar (code 7.48e-4, fp32 5.73e-4 against a bar of 6.06e-4). Four, six and eight
+    // are unmeasured: each hop rounds a partial sum to f16 again, so they start from fp32, which held the bar where fp16
+    // did not
+    const long long v = env_int("FNX_RING_F32", NCARD == 3 ? 0 : 1);
     if (v != 0 && v != 1) throw std::runtime_error("FNX_RING_F32: 0 or 1, got " + std::to_string(v));
     return v == 1;
 }
