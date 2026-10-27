@@ -110,7 +110,7 @@ lab: bin/fnx_lab bin/fnx_hold build/libfnx_lab.so
 # (tools/lab_proto.hpp). A new hash names a new stamp file, which rebuilds both objects. A count other than 3 joins the
 # hash (a two-card worker refuses a three-card holder); three cards' hash is the sources' alone, so prod's holder
 # stamp follows only the loader's code
-LOADER_SRC := src/model.cpp src/model.hpp src/gguf.cpp src/gguf.hpp src/store.cpp src/store.hpp tools/lab_proto.hpp
+LOADER_SRC := src/model.cpp src/model.hpp src/card_split.hpp src/gguf.cpp src/gguf.hpp src/store.cpp src/store.hpp tools/lab_proto.hpp
 $(if $(filter-out $(wildcard $(LOADER_SRC)),$(LOADER_SRC)),$(error loader sources missing: $(filter-out $(wildcard $(LOADER_SRC)),$(LOADER_SRC))))
 LOADER_REV := $(shell { cat $(LOADER_SRC); [ $(FNX_NCARD) = 3 ] || echo ncard $(FNX_NCARD); } | sha1sum | cut -c1-16)
 build/loader_rev.$(LOADER_REV):
