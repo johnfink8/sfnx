@@ -13,6 +13,7 @@ lands off by default until the GPU checks pass ([docs/verification.md](verificat
 | `serve/sfnx-gap.json` | a check config: prod's 262k context with a 440-page own pool (`FNX_ARENA_BASE_PAGES`), so reads and decodes lend |
 | `serve/sfnx-pool.json` | a check config: 32k context, `--spec 4`, `--lookup 7`, no env of its own — the arena is on, only the context is small |
 | `serve/sfnx-2card.json` | two cards (`"gpu": [0, 1]`), for an engine built with `make FNX_NCARD=2`: prod's settings without vision, a 32 GiB conversation cache, port 8095. The engine puts as many experts in RAM as the cards need at start; fp32 sums between the cards ([docs/benchmarks.md](benchmarks.md#two-cards-and-one-card)) |
+| `serve/sfnx-4card.json` | four cards (`"gpu": [0, 1, 2, 3]`), for an engine built with `make FNX_NCARD=4`: prod's settings with vision on card 3, a 32 GiB conversation cache, port 8095. Untested on hardware ([Card count](#card-count)) |
 | `serve/sfnx.service.in` | the systemd unit's template: `make install` fills in the checkout (`@ROOT@`) and whoever runs it (`@USER@`, `@GROUP@`) and writes `/etc/systemd/system/sfnx.service`. It overrides the config's port with `--port 8080` |
 | `serve/run.sh [CONFIG]` | the same as a transient unit on the config's own port (8095 for `sfnx.json`), with `LimitMEMLOCK` raised |
 
@@ -37,6 +38,26 @@ quoted in a code span ends the reply after all), `STRATA_PARALLEL_SOLO=0` (a lan
 `STRATA_KEEP_EMPTY_TURNS=1` (keep empty assistant turns in the prompt), `STRATA_ENGINE_READY_S`,
 `STRATA_ENGINE_STALL_S`, `STRATA_VISION_READY_S`, `STRATA_VISION_ENCODE_S` (watchdogs, 0 = off),
 `STRATA_MAX_BODY_MIB` (default 256), `STRATA_HTTP_BACKLOG` (default 256), `STRATA_BATCH_TRACE=1` (batch-slot trace).
+
+## Card count
+
+`FNX_NCARD` is a build setting: `make FNX_NCARD=n` builds for n cards (default 3, prod), and the engine refuses to start
+unless exactly n cards are visible (the config's `"gpu"`). `build/ncard` records the count `build/` was made for; a
+make with another count rebuilds everything. The Makefile and `src/card_split.hpp` accept 2, 3, 4, 6 and 8: the
+counts that divide the 24 query heads and 48 recurrent value heads evenly, leave every card at least one 32-value block
+of each expert's FF width, and need at most eight CUDA peers a card. Every layer splits by one rule
+(`src/card_split.hpp`), which a static check holds to the two- and three-card splits the bases were made with:
+
+| Cards | Recurrent heads a card (value / key) | Experts' FF slices | Query heads a card | Status |
+| --- | --- | --- | --- | --- |
+| 2 | 24 / 8 | 320 each | 12 | measured ([docs/benchmarks.md](benchmarks.md#two-cards-and-one-card)) |
+| 3 | 16 / 6 (key heads 5 and 10 on two cards) | 224, 224, 192 | 8 | prod |
+| 4 | 12 / 4 | 160 each | 6 | builds; untested on hardware |
+| 6 | 8 / 3 or 4 (key heads 2, 5, 10 and 13 on two cards) | 128, 128, 96 x 4 | 4 | builds; untested on hardware |
+| 8 | 6 / 2 | 96 x 4, 64 x 4 | 3 | builds; untested on hardware |
+
+K/V is dealt by position (blocks of 4 positions, card j % n) and the vocabulary in n equal ranges on every count.
+Validating a count: [docs/verification.md](verification.md#other-card-counts).
 
 ## Engine settings
 
@@ -75,7 +96,7 @@ The ones that change results or are worth knowing. The rest are kernel-level tun
 
 | Setting | Effect |
 | --- | --- |
-| `FNX_RING_F32=0` or `1` | decode's sums between cards as fp16 pairs (0) or fp32 (1); the prompt path's stay fp16. Default 0 on three cards (fp32 took the code prompt's KL from 5.75e-4 to 4.38e-4, and is slower) and 1 on two, where fp16 pairs leave code and edit 1.25x over the exactness bar (code 7.48e-4 against 6.06e-4; fp32 5.73e-4) and fp32 costs ~30% of one request's decode (lab: new code 141 → 98 tok/s, prose 113 → 90) |
+| `FNX_RING_F32=0` or `1` | decode's sums between cards as fp16 pairs (0) or fp32 (1); the prompt path's stay fp16. Default 0 on three cards (fp32 took the code prompt's KL from 5.75e-4 to 4.38e-4, and is slower) and 1 on two, where fp16 pairs leave code and edit 1.25x over the exactness bar (code 7.48e-4 against 6.06e-4; fp32 5.73e-4) and fp32 costs ~30% of one request's decode (lab: new code 141 → 98 tok/s, prose 113 → 90). Default 1 on four, six and eight too: unmeasured there, and each hop rounds a partial sum to f16 again, so they start from the form that held the bar on two; try 0 once `exact` passes with 1 |
 
 **The lab**
 
@@ -88,6 +109,11 @@ The ones that change results or are worth knowing. The rest are kernel-level tun
 
 The ring writes between cards, so every card's IOMMU group must be an identity domain. The engine checks at startup and
 refuses to run otherwise: *`the ring's writes between cards need identity domains; boot with iommu=pt`*.
+
+Every card must also be a CUDA peer of every other, not only of its ring neighbours: the prompt path's attention
+exchange copies into every card and sets flags there. The engine enables peer access for every pair at start and stops
+with `peer access` if one is refused (`nvidia-smi topo -p2p r` shows which pairs can). On this box (two sockets, the
+cards on separate root ports) every pair can, with `iommu=pt`.
 
 ## Where this API differs from Strata's
 

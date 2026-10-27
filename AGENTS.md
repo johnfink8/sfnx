@@ -10,8 +10,9 @@ the verification and the settings.
 ## Layout
 
 - **`src/`**: the engine. CUDA kernels and headers (`.cuh`), `engine.cu`, `prefill.cu`, `model.cpp`, `session.cpp`,
-  `batch.cpp` (batched windows with drafts), `batch_plan.hpp` (their row plan). `kernels.cu` compiles as nine objects
-  (`-DFNX_KPART=0..8`), each holding its share of the launchers.
+  `batch.cpp` (batched windows with drafts), `batch_plan.hpp` (their row plan), `card_split.hpp` (how a layer
+  divides over the cards, for any supported count), `pf_ring_plan.hpp` (the prompt path's ring steps). `kernels.cu`
+  compiles as nine objects (`-DFNX_KPART=0..8`), each holding its share of the launchers.
 - **`tools/`**: `sfnx.cpp` is the engine process (a line protocol on stdin, `sfnx_input.hpp`); `fnx_run.cpp` is the
   lab harness; `fnx_hold` / `fnx_lab` + `lab.sh` are the lab; the `*_test` programs and `*_check.sh` scripts are the
   checks (they share `labenv.sh`); the `*_probe` / `*_bench` programs measured the hardware the design rests on.
@@ -53,8 +54,8 @@ make trace                                             # the CUPTI tracer (tools
 - The engine programs and the lab's library link one set of position-independent objects in `build/`.
 - **Building writes `bin/sfnx` in place: stop the service first** (`sudo systemctl stop sfnx`), or build in another
   worktree.
-- A change to the loader (`model.*`, `gguf.*`, `store.*`, `tools/lab_proto.hpp`) changes the lab's wire stamp: the
-  running holder refuses new workers until `tools/lab.sh unload` + `start`.
+- A change to the loader (`model.*`, `card_split.hpp`, `gguf.*`, `store.*`, `tools/lab_proto.hpp`) changes the lab's
+  wire stamp: the running holder refuses new workers until `tools/lab.sh unload` + `start`.
 - Made locally, not in git: `models` and `llama.cpp` (links), `data/mtp-rt/` (the draft layer's runtime files,
   `tools/mtp_experts.py` from the BF16 checkpoint), `ref/lgr/` (llama.cpp's logits, `make ref` then
   `ref/fnx_logref`), `.venv` (the front end's). A second worktree links all five from the main checkout.
@@ -68,9 +69,10 @@ for GPU work and start it again when the work is done.
 The lab (`tools/lab.sh`, usage at its top) holds the model once (`fnx_hold`) and runs `fnx_run`'s commands in a
 worker, so a code change costs a library rebuild and `cmd reload`, not a model load. `set VAR=value` / `unset VAR`
 change engine settings and are kept for replacement workers. `lab.sh cmd` (and so `exact`, `batch`, `decode`, `trace`)
-exits with the worker's result code. The lab shows the build as many cards as it was made for (`build/ncard`). For two
-cards: `make FNX_NCARD=2 lab` and a lab directory of their own (`FNX_LAB_DIR=/tmp/fnx-lab-$UID-2card` on every
-`lab.sh` call), since their bases differ from three cards'; switching counts rebuilds everything.
+exits with the worker's result code. The lab shows the build as many cards as it was made for (`build/ncard`). For
+another count n (2 measured; 4, 6, 8 build but have never run, `docs/verification.md` says how to validate them):
+`make FNX_NCARD=n lab` and a lab directory of their own (`FNX_LAB_DIR=/tmp/fnx-lab-$UID-${n}card` on every `lab.sh`
+call), since their bases differ from three cards'; switching counts rebuilds everything.
 
 Measure speed with `lab.sh decode` (edit1 and code1 greedy, prose2 and code1s with prod's sampling, seeds fixed) and
 `lab.sh batch`; trace with `lab.sh trace`. A `kbench` win is not a win until the real window shows it. Sample GPU
@@ -85,7 +87,7 @@ done.
 | `lab.sh exact base` | writes a new base, only when every prompt passes; `MODEL-base.id` records the build | `NOT written`, exit 1 |
 | `lab.sh batch` | batched windows (with their drafts) give each lane its tokens alone | MISMATCH, exit 1 |
 | `bin/sample_test` | speculative sampling matches plain sampling in distribution | MISMATCH, exit 1 |
-| `bin/topk_test`, `bin/batch_plan_test`, `bin/sfnx_input_test` | the top-k ties, the batched row planner, the engine's stdin handling (the last two CPU only) | non-zero exit |
+| `bin/topk_test`, `bin/batch_plan_test`, `bin/sfnx_input_test`, `bin/pf_ring_plan_test` | the top-k ties, the batched row planner, the engine's stdin handling, the prompt path's ring steps on every supported count (the last three CPU only) | non-zero exit |
 | `serve/api_smoke.py`, `serve/image_test.py` | the API surface and pictures through the front end | `N failed` |
 | `.venv/bin/python -m pytest -q front/` | the front end (CPU only) | pytest |
 

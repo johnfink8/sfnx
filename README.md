@@ -58,6 +58,22 @@ of Strata on the same two cards, by less than on three:
 For **one** card, use Strata: it computes part of the experts a card cannot hold on the CPU, and was 2–3x sFNX's
 decode and 4–5x its prompt reading there. Both, with the method: [docs/benchmarks.md](docs/benchmarks.md#two-cards-and-one-card).
 
+## More cards (untested on hardware)
+
+It also builds for **four, six or eight** cards (`make FNX_NCARD=4`; `serve/sfnx-4card.json` for four): every layer in
+quarters, sixths or eighths by the same rule as two and three. Those are the counts the model's shapes allow: the
+attention's 24 query heads and the 48 recurrent value heads divide evenly, every card keeps at least one 32-value block
+of each expert's FF width, and every card can be a CUDA peer of every other (eight peers a card at most). Five and seven
+are refused at build time; twelve and twenty-four would leave some cards one FF block or none, and need more peers
+than CUDA gives.
+
+**Nobody has run these counts.** They compile, and two checks run on the CPU: the split rule reproduces the two- and
+three-card splits exactly and covers every head and FF block on every supported count (static checks in
+`src/card_split.hpp`), and the prompt path's ring plan matches the two- and three-card step sequences and completes a
+sum on every supported count (`bin/pf_ring_plan_test`). Decode's sums go between cards as fp32 by default on these
+counts (`FNX_RING_F32`, [docs/config.md](docs/config.md#card-count)), as on two. How to validate a count:
+[docs/verification.md](docs/verification.md#other-card-counts).
+
 ## Running it
 
 Needs CUDA 12.9, g++-14, llama.cpp at a37cc46 checked out (or linked) as `llama.cpp/` (`make LLAMA=path` for
@@ -76,8 +92,9 @@ sudo systemctl start sfnx    # ~80 s to load; the API is on port 8080
 ```
 
 `serve/run.sh` runs the same config as a transient unit on port 8095; `serve/run.sh serve/sfnx-q8.json` the Q8_0
-build. For two cards: `make FNX_NCARD=2 -j32 bin/sfnx`, then `serve/run.sh serve/sfnx-2card.json` (a build refuses
-to start on any other number of cards). Engine settings, and the files they read: [docs/config.md](docs/config.md).
+build. For two cards: `make FNX_NCARD=2 -j32 bin/sfnx`, then `serve/run.sh serve/sfnx-2card.json`; for four,
+`FNX_NCARD=4` and `serve/sfnx-4card.json` (a build refuses to start on any other number of cards). Engine settings,
+and the files they read: [docs/config.md](docs/config.md).
 
 ## Layout
 
@@ -92,8 +109,8 @@ to start on any other number of cards). Engine settings, and the files they read
 
 ## Limits
 
-- One model, one box: three `sm_70` cards (or two), no FP8 and no CUDA 13 — the kernels are written for this
-  generation.
+- One model, one box: three `sm_70` cards (or two; four, six or eight build but are untested), no FP8 and no
+  CUDA 13 — the kernels are written for this generation.
 - Not tied to one quantization, but a GGUF has to keep its embeddings, shared expert and draft-layer projections at
   Q8_0, and its routed experts in a type the kernels have ([docs/design.md](docs/design.md)); anything else throws at
   load. Both quants above are held to the same exactness bar ([docs/verification.md](docs/verification.md)).
