@@ -905,10 +905,11 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
     {
         int ndev = 0;
         ck(cudaGetDeviceCount(&ndev), "cudaGetDeviceCount");
-        if (ndev < NCARD)
-            throw std::runtime_error("fnx: built for " + std::to_string(NCARD) + " cards (FNX_NCARD), " + std::to_string(ndev) + " visible");
-        if (ndev > NCARD)
-            std::fprintf(stderr, "fnx: built for %d cards (FNX_NCARD): %d visible, using devices 0..%d\n", NCARD, ndev, NCARD - 1);
+        // a build for another count than the cards it is given is a config or build mistake (a 2-card binary on
+        // prod's three would serve, slower): CUDA_VISIBLE_DEVICES (the config's "gpu") must name exactly NCARD
+        if (ndev != NCARD)
+            throw std::runtime_error("fnx: built for " + std::to_string(NCARD) + " cards (FNX_NCARD), " + std::to_string(ndev) +
+                                     " visible: set CUDA_VISIBLE_DEVICES (a config's \"gpu\") to " + std::to_string(NCARD) + " of them");
     }
     const int vstep = (vocab + NCARD - 1) / NCARD;
     for (int c = 0; c < NCARD; ++c) {

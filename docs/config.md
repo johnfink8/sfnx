@@ -74,7 +74,7 @@ The ones that change results or are worth knowing. The rest are kernel-level tun
 
 | Setting | Effect |
 | --- | --- |
-| `FNX_RING_F32=0` or `1` | the ring's sums as fp16 pairs (0) or fp32 (1). Default 0 on three cards (fp32 took the code prompt's KL from 5.75e-4 to 4.38e-4, and is slower) and 1 on two, where fp16 pairs leave code and edit 1.25x over the exactness bar (code 7.48e-4 against 6.06e-4; fp32 5.73e-4) and fp32 costs ~30% of one request's decode (lab: new code 141 → 98 tok/s, prose 113 → 90) |
+| `FNX_RING_F32=0` or `1` | decode's sums between cards as fp16 pairs (0) or fp32 (1); the prompt path's stay fp16. Default 0 on three cards (fp32 took the code prompt's KL from 5.75e-4 to 4.38e-4, and is slower) and 1 on two, where fp16 pairs leave code and edit 1.25x over the exactness bar (code 7.48e-4 against 6.06e-4; fp32 5.73e-4) and fp32 costs ~30% of one request's decode (lab: new code 141 → 98 tok/s, prose 113 → 90) |
 
 **The lab**
 

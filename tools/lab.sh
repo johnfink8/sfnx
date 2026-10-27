@@ -46,13 +46,15 @@ env_record() {   # a set/unset the worker took, kept in worker.env: a replacemen
     case "$1" in "set "*) out="$out -E ${1#set }" ;; esac
     echo "$out" > "$DIR/worker.env"
 }
-unit() {   # name log env... -- command...
+unit() {   # name log env... -- command...; the cards: the first FNX_NCARD of the build (build/ncard), by PCI order
     name=$1 log=$2
     shift 2
+    ncard=$(cat build/ncard 2> /dev/null) || { echo "lab: no build/ncard: build the lab first (make lab)"; exit 1; }
     sudo systemctl stop "$name" 2> /dev/null
     sudo systemctl reset-failed "$name" 2> /dev/null
     sudo systemd-run --unit="$name" -p LimitMEMLOCK=infinity --uid="$(id -u)" --gid="$(id -g)" -p WorkingDirectory="$(pwd)" \
-        -p StandardOutput=append:"$log" -p StandardError=append:"$log" -E FNX_LAB_DIR="$DIR" "$@" > /dev/null 2>&1
+        -p StandardOutput=append:"$log" -p StandardError=append:"$log" -E FNX_LAB_DIR="$DIR" -E CUDA_DEVICE_ORDER=PCI_BUS_ID \
+        -E CUDA_VISIBLE_DEVICES="$(seq -s, 0 $((ncard - 1)))" "$@" > /dev/null 2>&1
 }
 wait_for() {   # unit log pattern tries (a fifth of a second each)
     for _ in $(seq "$4"); do

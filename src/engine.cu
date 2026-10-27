@@ -324,8 +324,9 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
             }
             if (!more) break;
             if (round == 8) throw std::runtime_error("FNX_ARENA: VRAM still short after placing the experts again 8 times");
-            std::fprintf(stderr, "fnx: VRAM short by %zu MiB on a card: %d more of the coldest experts to RAM\n",
-                         short_mib, more);
+            // two cards are short by design; on three the experts fit unless something else holds VRAM
+            std::fprintf(stderr, "fnx: VRAM short by %zu MiB on a card%s: %d more of the coldest experts to RAM\n", short_mib,
+                         NCARD == 3 ? " (another process on it?)" : "", more);
             m.free_experts();
             m.ram_extra += more;
             m.place_experts();

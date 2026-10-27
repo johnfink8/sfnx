@@ -1019,12 +1019,13 @@ int main(int argc, char** argv) {
     };
     try {
         Server srv(a, m, e, in);
-        const std::vector<long> vfree = e.free_vram_mib();
+        std::string vfree;   // each card's, "a / b / c"
+        for (const long v : e.free_vram_mib()) vfree += (vfree.empty() ? "" : " / ") + std::to_string(v);
         std::fprintf(stderr,
                      "sfnx: loaded in %.1f s, context %d, MTP K=%d, lookup %d, %d slot(s); K/V pool (%s) %d positions free; VRAM free "
-                     "%ld / %ld / %ld MiB\n",
+                     "%s MiB\n",
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load).count(), a.max_ctx, a.K, a.lookup, a.batch,
-                     fnx::kv_q8() ? "int8" : "f16", e.free_pages() * fnx::KVP_POS, vfree[0], vfree[1], vfree[2]);
+                     fnx::kv_q8() ? "int8" : "f16", e.free_pages() * fnx::KVP_POS, vfree.c_str());
         say("INFO engine=sfnx version=0.2 spec=" + std::to_string(a.K) + " conversation_cache_mib=" + std::to_string(a.cache_mib) +
             (a.batch > 1 ? " batch_slots=" + std::to_string(a.batch) + " slot_cache=1" : ""));
         say("READY " + std::to_string(a.max_ctx) + " stop");
