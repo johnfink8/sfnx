@@ -18,7 +18,7 @@
   "--conversation-cache-mib",
   "16384",
   "--batch",
-  "1"
+  "4"
  ],
  "cwd": ".",
  "env": {},
