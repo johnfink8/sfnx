@@ -106,6 +106,13 @@ int main(int argc, char** argv) {
         const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx = (uint32_t) (prompt.size() + N + 16);
+        // FNX_ROPE_SCALE=S + FNX_YARN_ORIG_CTX: YaRN over the trained length, for scaled-backend comparisons
+        // (llama.cpp's own defaults: ext_factor 1, betas 32/1; its net attention magnitude matches sfnx's)
+        if (const char* rs = std::getenv("FNX_ROPE_SCALE")) {
+            cp.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_YARN;
+            cp.rope_freq_scale = 1.0f / std::stof(rs);
+            if (const char* oc = std::getenv("FNX_YARN_ORIG_CTX")) cp.yarn_orig_ctx = (uint32_t) std::stoul(oc);
+        }
         // FNX_LOGREF_UBATCH: the prompt's batch size (1: the prompt through the decode path, token by token)
         cp.n_batch = cp.n_ubatch = std::getenv("FNX_LOGREF_UBATCH") ? std::atoi(std::getenv("FNX_LOGREF_UBATCH")) : 512;
         // FNX_LOGREF_KV=q8_0: the K/V cache as q8_0 (a quantized V cache needs flash attention)
