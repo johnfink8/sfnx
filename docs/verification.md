@@ -48,8 +48,9 @@ Logits against llama.cpp on the 62k prompt by prompt-chunk size: 4,096 rows KL m
 
 ## What is not exact
 
-- The sums between cards travel as fp16 pairs. `FNX_RING_F32=1` sends them as fp32: KL 5.75e-4 → 4.38e-4 on the code
-  prompt.
+- On three cards the sums between cards travel as fp16 pairs. `FNX_RING_F32=1` sends them as fp32: KL 5.75e-4 →
+  4.38e-4 on the code prompt. Two cards send fp32 by default: with fp16 pairs their code and edit prompts are 1.25x
+  over the bar.
 - The kernels are built with fast math.
 - A prompt read from scratch on a lane that held another conversation can differ in its last bits from the same read on
   a fresh engine: first-token KL ~1e-4, and greedy text can part at a near-tie. Something of the lane's earlier use

@@ -52,7 +52,7 @@ unit() {   # name log env... -- command...
     sudo systemctl stop "$name" 2> /dev/null
     sudo systemctl reset-failed "$name" 2> /dev/null
     sudo systemd-run --unit="$name" -p LimitMEMLOCK=infinity --uid="$(id -u)" --gid="$(id -g)" -p WorkingDirectory="$(pwd)" \
-        -p StandardOutput=append:"$log" -p StandardError=append:"$log" "$@" > /dev/null 2>&1
+        -p StandardOutput=append:"$log" -p StandardError=append:"$log" -E FNX_LAB_DIR="$DIR" "$@" > /dev/null 2>&1
 }
 wait_for() {   # unit log pattern tries (a fifth of a second each)
     for _ in $(seq "$4"); do

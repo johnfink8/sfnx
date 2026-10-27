@@ -273,7 +273,11 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         // sized for fp32 words (two per pair); fp16 pairs use the first half of each slot row's room
         b->ring.in = dalloc<unsigned long long>(ring_in_words(MAXT));
         b->ring.ag = dalloc<unsigned long long>(ring_ag_words(MAXT));
-        b->ring.f32 = env_flag("FNX_RING_F32");
+        // fp32 by default on two cards: with fp16 pairs there the code and edit prompts' KL against llama.cpp is 1.25x
+        // the exactness bar (code 7.48e-4, fp32 5.73e-4 against a bar of 6.06e-4)
+        const long long ring_f32 = env_int("FNX_RING_F32", NCARD == 2 ? 1 : 0);
+        if (ring_f32 != 0 && ring_f32 != 1) throw std::runtime_error("FNX_RING_F32: 0 or 1, got " + std::to_string(ring_f32));
+        b->ring.f32 = ring_f32 == 1;
         b->ring.err = dalloc<unsigned>(1);
         b->att_ring.card = c;
         b->att_ring.in = dalloc<unsigned long long>(att_ring_words());
