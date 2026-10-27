@@ -182,6 +182,10 @@ public:
 private:
     Model& m_;
     int max_ctx_, pos_ = 0;
+    // rope scaling set at engine construction (before any graph capture: the constants ride into the graphs as
+    // kernel arguments). rope_of hands a kernel the constants with that call's M-RoPE table
+    Rope rope_scaled_;
+    Rope rope_of(const int* tab) const { Rope r = rope_scaled_; r.tab = tab; return r; }
     unsigned tag_ = 1;            // the current lane's last window tag (its parity: the recurrent history half)
     unsigned tag_max_ = 1;        // the largest tag any window has used (tags rise across lanes: the ring sums tell
                                   // windows apart by them)

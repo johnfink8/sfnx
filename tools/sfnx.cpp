@@ -87,6 +87,7 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--conversation-cache-mib") a.cache_mib = std::stol(val());
         else if (k == "--batch") a.batch = std::stoi(val());
         else if (k == "--layer-split") val();   // Strata's layer split; sFNX splits every layer across the cards
+        else if (k == "--rope-scale") std::setenv("FNX_ROPE_SCALE", val().c_str(), 1);   // YaRN for a longer context
         else if (k == "--vision") a.vision = true;
         else throw std::runtime_error("unknown argument " + k);
     }

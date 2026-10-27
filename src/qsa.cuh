@@ -51,9 +51,10 @@ __device__ __forceinline__ float idx_norm_rope(float v, const float* w, int pos,
     float out = y;
     if (i < QSA_ROT) {
         const int k = i % (QSA_ROT / 2);
-        const float theta = (float) rope_pos(base, pos, k) * powf(base.base, -2.0f * (float) k / (float) QSA_ROT);
+        const float theta = (float) rope_pos(base, pos, k) * rope_unit_freq(base, k, QSA_ROT);
         float sn, cs;
         sincosf(theta, &sn, &cs);
+        sn *= base.mscale; cs *= base.mscale;
         const float x0 = buf[k], x1 = buf[k + QSA_ROT / 2];
         out = i < QSA_ROT / 2 ? x0 * cs - x1 * sn : x0 * sn + x1 * cs;
     }

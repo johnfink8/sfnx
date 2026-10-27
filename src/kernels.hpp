@@ -113,12 +113,28 @@ size_t gdn_prompt_work_floats(int C, int nv);
 // rotary positions: the base, and the image path's table. tab null: a row's rotary position is its cell. Else int32
 // [cells][3] (t, h, w) per cell, and pair i of a rotation takes stream i % 3 (interleaved M-RoPE, sections 11/11/10:
 // llama.cpp's IMROPE): an image's cells share t and differ in h and w, and the text after it runs on from there
+// With rope scaling (Engine ctor, FNX_ROPE_SCALE): a YaRN blend of the model's rotary frequencies with ones scaled
+// down for a longer context (llama.cpp's rope_yarn with ext_factor 1). c_low/c_high are the exponents from
+// llama.cpp's ggml_rope_yarn_corr_dims(beta_fast = 32, beta_slow = 1) at n_ctx_orig; the ramp is 1 below the low
+// dim (no scaling) and 0 above the high dim (fully scaled). mscale multiplies cos/sin (llama's attn_factor; 1 with
+// those defaults). scaled false: every field is unused and the frequencies are exactly the model's.
 struct Rope {
     float base = 1e7f;
     const int* tab = nullptr;
+    bool scaled = false;
+    float c_low = 0.f, c_high = 0.f, inv_scale = 1.f, mscale = 1.f;
 };
 #ifdef __CUDACC__
 __device__ __forceinline__ int rope_pos(const Rope& r, int cell, int pair) { return r.tab ? r.tab[(size_t) cell * 3 + pair % 3] : cell; }
+// the unit frequency of pair `pair` of an nrot-wide rotation; when scaled, the YaRN blend
+// (llama.cpp's rope_yarn: theta_interp * (1 - ramp) + theta_extrap * ramp, freq_scale = 1 / rope_scale)
+__device__ __forceinline__ float rope_unit_freq(const Rope& r, int pair, int nrot) {
+    const float fe = powf(r.base, -2.0f * (float) pair / (float) nrot);
+    if (!r.scaled) return fe;
+    const float y = ((float) pair - r.c_low) / fmaxf(0.001f, r.c_high - r.c_low);
+    const float ramp = 1.0f - fminf(1.0f, fmaxf(0.0f, y));
+    return fe * (ramp + (1.0f - ramp) * r.inv_scale);
+}
 #endif
 
 // attention: per-head RMS norms and NEOX rotary on the first NROT dims, then causal attention over [0, pos+t]

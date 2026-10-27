@@ -123,6 +123,28 @@ void require_identity_iommu(int dev) {
 
 
 Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
+    // rope scaling for a context past the trained length: FNX_ROPE_SCALE=S (S > 1) applies llama.cpp's YaRN with
+    // its defaults: ext_factor 1, beta_fast 32, beta_slow 1, mscale 1 (with those, llama.cpp's net yarn_attn_factor
+    // is exactly 1.0 — see its llama-context.cpp get_mscale and the cancellation there). n_ctx_orig is
+    // FNX_YARN_ORIG_CTX, else the model's context_length. Set once here, before any graph capture.
+    rope_scaled_.base = m_.rope_base;
+    if (const char* e = std::getenv("FNX_ROPE_SCALE")) {
+        const double S = env_num("FNX_ROPE_SCALE", 0.0);
+        if (S <= 1.0) throw std::runtime_error(std::string("FNX_ROPE_SCALE: want a scale > 1, got ") + e);
+        const int orig = (int) env_int("FNX_YARN_ORIG_CTX", 0) ? (int) env_int("FNX_YARN_ORIG_CTX", 0) : m_.ctx_train;
+        if (orig <= 0) throw std::runtime_error("FNX_ROPE_SCALE: no n_ctx_orig (the model has no context_length and FNX_YARN_ORIG_CTX is unset)");
+        const float lb = logf(m_.rope_base);
+        // ggml.c's ggml_rope_yarn_corr_dims at n_dims = NROT: corr(beta) = n_dims * log(orig / (2*pi*beta)) / (2*log(base))
+        auto corr = [NROT, orig, lb](float beta) { return (float) NROT * logf((float) orig / (beta * 2.0f * M_PI)) / (2.0f * lb); };
+        rope_scaled_.c_low = fmaxf(0.0f, floorf(corr(32.0f)));
+        rope_scaled_.c_high = fminf((float) (NROT - 1), ceilf(corr(1.0f)));
+        rope_scaled_.inv_scale = (float) (1.0 / S);
+        rope_scaled_.scaled = true;
+        std::fprintf(stderr, "fnx: rope scaling YaRN x%.4f: n_ctx_orig %d, dims %.0f..%.0f scaled (pairs %d, mscale 1)\n",
+                     S, orig, rope_scaled_.c_low, rope_scaled_.c_high, NROT / 2);
+        if (max_ctx <= orig)
+            std::fprintf(stderr, "fnx: note: scaling %d < trained %d: the blend applies but nothing needs the extra length\n", max_ctx, orig);
+    }
     const long long pf_rows = env_int("FNX_PF_ROWS", pf_c_);
     if (pf_rows < MAXT || pf_rows > 8192 || pf_rows % MAXT)
         throw std::runtime_error("FNX_PF_ROWS: a multiple of " + std::to_string(MAXT) + " from " + std::to_string(MAXT) + " to 8192, got " +
@@ -1577,7 +1599,7 @@ void Engine::attention(int T, CardBuf& b, const CardW& w, const LayerW& L, uint1
     // the indexer first (it reads mixed / its q8 copy, which the projections below leave as they are)
     if (!L.idx_wq) dense(L.idx_qk, b.xq, b.qsa_y, b, T);
     qsa(L.idx_wq, L.idx_wk, b.mixed, b.qsa_y, L.idx_qn, L.idx_kn, qsa_ring, qsa_pooled, b.pg, b.qsa_q, b.qsa_scores, b.qsa_cells,
-        b.qsa_ncells, max_ctx_ / 4, ctl, T, m_.eps, Rope{m_.rope_base, b.mrope}, b.att_ring.card, b.st);
+        b.qsa_ncells, max_ctx_ / 4, ctl, T, m_.eps, rope_of(b.mrope), b.att_ring.card, b.st);
     if (L.wq.s.q && L.wk.s.q && L.wv.s.q && L.wq.n_in == L.wk.n_in && L.wq.n_in == L.wv.n_in &&
         L.wq.n_out + L.wk.n_out + L.wv.n_out >= 8192) {   // q, k and v in one launch (compiled for 8192 rows and more)
         const Q8S ws[3] = {L.wq.s, L.wk.s, L.wv.s};
@@ -1589,7 +1611,7 @@ void Engine::attention(int T, CardBuf& b, const CardW& w, const LayerW& L, uint1
         dense(L.wk, b.xq, b.k, b, T);
         dense(L.wv, b.xq, b.v, b, T);
     }
-    attn_prep_append(b.qg, b.k, b.v, L.q_norm, L.k_norm, kc, vc, b.pg, b.att_ring.card, T, ctl, m_.eps, Rope{m_.rope_base, b.mrope}, b.st);
+    attn_prep_append(b.qg, b.k, b.v, L.q_norm, L.k_norm, kc, vc, b.pg, b.att_ring.card, T, ctl, m_.eps, rope_of(b.mrope), b.st);
     attn(b.qg, kc, vc, b.pg, b.att, b.att_ring, (const unsigned*) (ctl + 1), call, ctl, T, b.att_part, b.st, b.qsa_cells, b.qsa_ncells);
     quantize_q8_1(b.att, b.xq, w.nq * HD, T, b.st);
     dense(L.wo, b.xq, b.bo_a, b, T);
@@ -1766,9 +1788,9 @@ void Engine::enqueue_batch(const std::vector<int>& lanes) {
                     KvPages pg = b.pg;   // the card's page size and rows, the lane's table
                     pg.pt = LD.pt;
                     qsa_index(b.qsa_y + (size_t) r * qsa_rows(), L.idx_qn, L.idx_kn, LD.ring[l], b.qsa_pooled[l], pg, b.qsa_q + (size_t) r * 512,
-                              LD.ctl, 1, eps, Rope{m_.rope_base, LD.mrope}, b.st);
+                              LD.ctl, 1, eps, rope_of(LD.mrope), b.st);
                     attn_prep(b.qg + (size_t) r * NQH * 2 * HD, b.k + (size_t) r * NKVH * HD, L.q_norm, L.k_norm, NQH, NKVH, LD.ctl, 1, eps,
-                              Rope{m_.rope_base, LD.mrope}, b.st);
+                              rope_of(LD.mrope), b.st);
                     kv_append(b.k + (size_t) r * NKVH * HD, b.v + (size_t) r * NKVH * HD, b.kc[l], b.vc[l], pg, b.att_ring.card, 1, LD.ctl,
                               b.st);
                 }
@@ -2033,9 +2055,9 @@ void Engine::enqueue_rows(const std::vector<int>& lanes, const std::vector<int>&
                     const size_t r = (size_t) sg.r0[(size_t) i];
                     const int k = counts[(size_t) i];
                     qsa_index(b.qsa_y + r * qsa_rows(), L.idx_qn, L.idx_kn, LD.ring[l], b.qsa_pooled[l], pg, b.qsa_q + r * 512, LD.ctl, k, eps,
-                              Rope{m_.rope_base, LD.mrope}, b.st);
+                              rope_of(LD.mrope), b.st);
                     attn_prep(b.qg + r * NQH * 2 * HD, b.k + r * NKVH * HD, L.q_norm, L.k_norm, NQH, NKVH, LD.ctl, k, eps,
-                              Rope{m_.rope_base, LD.mrope}, b.st);
+                              rope_of(LD.mrope), b.st);
                     kv_append(b.k + r * NKVH * HD, b.v + r * NKVH * HD, b.kc[l], b.vc[l], pg, b.att_ring.card, k, LD.ctl, b.st);
                 }
                 const LaneRows lr{b.lane_rows[(size_t) T], b.lane_rows[(size_t) T] + MAXT};

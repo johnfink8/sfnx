@@ -454,9 +454,10 @@ __device__ void norm_rope(float* x, const float* w, int pos, float eps, const Ro
     x[i] = y;
     __syncthreads();
     if (i < NROT / 2) {
-        const float theta = (float) rope_pos(base, pos, i) * powf(base.base, -2.0f * (float) i / (float) NROT);
+        const float theta = (float) rope_pos(base, pos, i) * rope_unit_freq(base, i, NROT);
         float sn, cs;
         sincosf(theta, &sn, &cs);
+        sn *= base.mscale; cs *= base.mscale;
         const float x0 = x[i], x1 = x[i + NROT / 2];
         x[i] = x0 * cs - x1 * sn;
         x[i + NROT / 2] = x0 * sn + x1 * cs;
