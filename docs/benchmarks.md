@@ -122,7 +122,7 @@ Two cards hold 15,806 of the 24,576 experts (64%; the engine moves the rest to R
 code and edit prompts are 1.25x over the exactness bar ([docs/verification.md](verification.md)). fp32 sums
 (`FNX_RING_F32=1`) are within it, at the cost shown.
 
-| One request | sFNX, 2 cards | sFNX, 2 cards, fp32 sums | Strata, 2 cards |
+| One request | sFNX, 2 cards, fp16 sums | sFNX, 2 cards, fp32 sums | Strata, 2 cards |
 | --- | --- | --- | --- |
 | Code edit, greedy | **209.3–211.2 tok/s** | 152.7–154.4 | 130.6–134.7 |
 | New code, greedy | **136.5–162.9** | 107.0–112.2 | 93.8–98.7 |

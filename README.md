@@ -45,15 +45,17 @@ whether it accepts one token or sixteen, and code drafts where prose does not.
 ## Fewer cards
 
 Three cards are what sFNX is made for. It also builds for **two** (`make FNX_NCARD=2`, `serve/sfnx-2card.json`): each
-layer split in halves, a third of the experts in RAM, chosen by the engine at start. Exact to the same bar, and ahead
-of Strata on the same two cards, by less than on three:
+layer split in halves, a third of the experts in RAM, chosen by the engine at start. Ahead of Strata on the same two
+cards, by less than on three. Its sums between the cards are fp16 by default, as on three, which leaves the code and
+edit prompts 1.25x over the exactness bar on two; `FNX_RING_F32=1` sends fp32, within the bar but with a ~30% penalty on
+one request's decode:
 
-| One request, two cards | sFNX | Strata |
-| --- | --- | --- |
-| Code edit | 153–154 tok/s | 131–135 |
-| New code | 107–112 tok/s | 94–99 |
-| Prose, prod's sampling | 90–94 tok/s | 65–68 |
-| 114k-token prompt, cold read | 42.7 s | 53.7 s |
+| One request, two cards | sFNX (fp16 sums) | sFNX, fp32 sums | Strata |
+| --- | --- | --- | --- |
+| Code edit | 209–211 tok/s | 153–154 | 131–135 |
+| New code | 137–163 tok/s | 107–112 | 94–99 |
+| Prose, prod's sampling | 109–119 tok/s | 90–94 | 65–68 |
+| 114k-token prompt, cold read | 42.1 s | 42.7 s | 53.7 s |
 
 For **one** card, use Strata: it computes part of the experts a card cannot hold on the CPU, and was 2–3x sFNX's
 decode and 4–5x its prompt reading there. Both, with the method: [docs/benchmarks.md](docs/benchmarks.md#two-cards-and-one-card).
