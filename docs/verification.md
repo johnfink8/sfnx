@@ -82,8 +82,10 @@ nobody here has the cards. Checked without them, on the CPU:
   one card beside its key head, the key heads and FF blocks are covered in order, no card is empty; for two and three
   cards the rule gives exactly the splits the bases were made with;
 - the prompt path's ring (`bin/pf_ring_plan_test`): its steps for two and three cards are the sequences the
-  hand-written code ran, and on every supported count the cards' steps run against each other complete one sum, every
-  part holding every card's addend once, nothing read before the flag that covers it, without a deadlock.
+  hand-written code ran, and on every supported count the cards' steps run against each other complete eight sums in
+  a row over the two buffer sets and the sequence-numbered flags, in 500 random interleavings: every part holding
+  every card's addend once, nothing read before the flag that covers it for its sum, no slot written over before the
+  sum before had read it, without a deadlock.
 
 Not checked anywhere: the decode ring and the attention merge on more than three cards. They are the same loops on
 every count (n - 1 hops to reduce, n - 2 to forward), run so far with n = 2 and 3. Nor speed: each sum takes 2n - 2
@@ -127,7 +129,7 @@ A failure in step 4 with the rest clean points at the arithmetic (the sums' prec
 | Batched windows = alone, with and without drafts (every token up to each reference's end) | `bin/batch_test`, `tools/lab.sh batch` |
 | Batched drafts' sampler against plain sampling, in distribution (3 lanes, open1, 600 seeds: every p ≥ 0.34) | `SAMPLE_TEST_LANES=3 bin/sample_test` |
 | The batched-draft row plan against a brute force over every split | `bin/batch_plan_test` |
-| The prompt path's ring steps: two and three cards' sequences, and one sum completed on every supported count (CPU) | `bin/pf_ring_plan_test` |
+| The prompt path's ring steps: two and three cards' sequences, and consecutive sums over both buffer sets on every supported count (CPU) | `bin/pf_ring_plan_test` |
 | The top-k ties | `bin/topk_test` |
 | The engine's stdin handling | `bin/sfnx_input_test` |
 | The conversation cache where prompts share much: two conversations alternating on a lane, a system prompt changed near its end | `tools/lab.sh cmd cache2` |

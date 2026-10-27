@@ -1,11 +1,14 @@
 // The prompt path's copy-engine ring plan (src/pf_ring_plan.hpp), on the CPU alone:
 //   1. two and three cards: the plan is exactly the step sequence prefill.cu ran for them as hand-written code (written
 //      out below), for every card;
-//   2. every count card_split.hpp allows: the n cards' plans run against each other finish one sum with every part
-//      holding every card's addend once, nothing read on a card before the flag that covers it, every receive slot and
-//      gathered part written once, no deadlock, and no more flags than PF_RING_STEPS holds.
+//   2. every count card_split.hpp allows: the n cards' plans run against each other for several sums in a row, over
+//      the two buffer sets and the sequence-numbered flags the streams use, in many random interleavings: every sum's
+//      parts hold every card's addend once, nothing is read on a card before the flag that covers it for that sum, no
+//      slot is written twice in a sum or over a previous sum's contents before they were read, no deadlock, and no
+//      more flags than PF_RING_STEPS holds.
 // Exit 0 when all pass; each failure printed.
 #include <cstdio>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -44,104 +47,146 @@ static std::vector<PfRingOp> written(int n, int g) {
     return v;
 }
 
-// a buffer's contents in the simulation: which part, whose addends (bit per card), and the flag that publishes it on
-// the card holding it (-1: written there by the card itself)
+// a buffer's contents in the simulation: the sum it belongs to (its sequence number), which part, whose addends (bit
+// per card), the flag that publishes it on the card holding it (-1: written there by the card itself, -2: copied in,
+// its flag not yet written), and whether this card is through reading it (a later sum may then write over it)
 struct Slot {
     bool full = false;
+    unsigned seq = 0;
     int part = -1;
     unsigned addends = 0;
     int step = -1;
+    bool consumed = false;
 };
 
-static void simulate(int n) {
-    const std::string tag = std::to_string(n) + " cards: ";
+// `sums` sums one after another on every card, as pf_ring runs them: sum seq (from 1, after pf_seq_reset's 0) uses buffer
+// set seq & 1, a signal writes seq into the flag (cuStreamWriteValue32) and a wait passes once the flag is >= seq
+// (CU_STREAM_WAIT_VALUE_GEQ). Each card's steps are one stream (in order); the cards interleave as the random order
+// picks, so a card may run sums ahead of a slower one as far as the flags let it. Returns false after a failure.
+static bool simulate(int n, int sums, unsigned seed) {
+    const std::string tag = std::to_string(n) + " cards, order " + std::to_string(seed) + ": ";
     const unsigned all = (1u << n) - 1;
     std::vector<std::vector<PfRingOp>> plan(n);
     for (int g = 0; g < n; ++g) plan[g] = fnx::pf_ring_plan(n, g);
+    const int steps = fnx::pf_ring_steps(n);
+    struct Copied {
+        bool ag;
+        int i;
+    };
     struct Card {
         size_t pc = 0;
-        std::vector<bool> flag, waited;
-        std::vector<Slot> in, ag;
+        unsigned seq = 1;
+        std::vector<unsigned> flag, waited;   // [set][step]: the flag's value; the sum that last waited on it
+        std::vector<Slot> in, ag;             // [set][hop], [set][part]
         Slot send;
-        std::vector<int> pending_in, pending_ag;   // receive slots and parts copied to the next card since the last signal
-        bool done = false;
+        std::vector<Copied> pending;          // copied into the next card since this card's last signal (this sum's set)
     };
     std::vector<Card> cd(n);
-    const int steps = fnx::pf_ring_steps(n);
     for (Card& c : cd) {
-        c.flag.assign(steps, false);
-        c.waited.assign(steps, false);
-        c.in.assign(n - 1, {});
-        c.ag.assign(n, {});
+        c.flag.assign(2 * steps, 0);
+        c.waited.assign(2 * steps, 0);
+        c.in.assign(2 * (n - 1), {});
+        c.ag.assign(2 * n, {});
     }
-    // own writes (-1) are readable; a copy from the previous card (-2 until its signal) once its flag was waited on
-    auto readable = [&](const Card& c, const Slot& s) { return s.full && (s.step == -1 || (s.step >= 0 && c.waited[(size_t) s.step])); };
-    for (bool moved = true; moved;) {
-        moved = false;
+    std::mt19937 rng(seed);
+    auto readable = [&](const Card& c, const Slot& s, int set) {
+        return s.full && s.seq == c.seq && (s.step == -1 || (s.step >= 0 && c.waited[(size_t) (set * steps + s.step)] == c.seq));
+    };
+    // a write into a slot: the sum before on this set must have been read out of it, and this sum not yet written
+    auto writable = [&](const Slot& s, unsigned seq, const std::string& at, const char* what) {
+        if (s.full && s.seq == seq) { fail(at + what + " written twice in one sum"); return false; }
+        if (s.full && !s.consumed) {
+            fail(at + what + " of sum " + std::to_string(s.seq) + " written over by sum " + std::to_string(seq) + " before it was read");
+            return false;
+        }
+        return true;
+    };
+    for (;;) {
+        std::vector<int> ready;
+        bool left = false;
         for (int g = 0; g < n; ++g) {
-            Card& c = cd[g];
-            Card& nx = cd[(g + 1) % n];
-            while (!c.done && c.pc < plan[g].size()) {
-                const PfRingOp& o = plan[g][c.pc];
-                const std::string at = tag + "card " + std::to_string(g) + " op " + std::to_string(c.pc) + ": ";
-                if (o.k == K::WAIT) {
-                    if (o.step < 0 || o.step >= steps) { fail(at + "a flag past PF_RING_STEPS"); return; }
-                    if (!c.flag[(size_t) o.step]) break;
-                    c.waited[(size_t) o.step] = true;
-                } else if (o.k == K::PACK) {
-                    c.send = {true, o.part, 1u << g, -1};
-                } else if (o.k == K::ADD) {
-                    const Slot& r = c.in[(size_t) o.hop];
-                    if (!readable(c, r)) { fail(at + "adds a receive slot not yet covered by a flag it waited on"); return; }
-                    if (r.part != o.part) fail(at + "the receive slot holds another part");
-                    if (r.addends & (1u << g)) fail(at + "adds its own addend twice");
-                    const Slot s{true, o.part, r.addends | (1u << g), -1};
-                    if (o.fin) {
-                        if (s.addends != all) fail(at + "finishes a part without every card's addend");
-                        if (c.ag[(size_t) o.part].full) fail(at + "a gathered part written twice");
-                        c.ag[(size_t) o.part] = s;
-                    } else {
-                        c.send = s;
-                    }
-                } else if (o.k == K::SEND) {
-                    if (!c.send.full || c.send.part != o.part) { fail(at + "sends what the send buffer does not hold"); return; }
-                    if (nx.in[(size_t) o.hop].full) fail(at + "a receive slot written twice");
-                    Slot s = c.send;
-                    s.step = -2;   // set at the signal
-                    nx.in[(size_t) o.hop] = s;
-                    c.pending_in.push_back(o.hop);
-                } else if (o.k == K::PASS) {
-                    const Slot& f = c.ag[(size_t) o.part];
-                    if (!readable(c, f)) { fail(at + "passes a part not here yet"); return; }
-                    if (f.addends != all) fail(at + "passes an unfinished part");
-                    if (nx.ag[(size_t) o.part].full) fail(at + "a gathered part written twice on the next card");
-                    Slot s = f;
-                    s.step = -2;
-                    nx.ag[(size_t) o.part] = s;
-                    c.pending_ag.push_back(o.part);
-                } else if (o.k == K::SIGNAL) {
-                    if (o.step < 0 || o.step >= steps) { fail(at + "a flag past PF_RING_STEPS"); return; }
-                    if (nx.flag[(size_t) o.step]) fail(at + "a flag set twice");
-                    nx.flag[(size_t) o.step] = true;
-                    for (const int h : c.pending_in) nx.in[(size_t) h].step = o.step;
-                    for (const int k : c.pending_ag) nx.ag[(size_t) k].step = o.step;
-                    c.pending_in.clear();
-                    c.pending_ag.clear();
-                } else if (o.k == K::OUT) {
-                    for (int k = 0; k < n; ++k)
-                        if (!readable(c, c.ag[(size_t) k]) || c.ag[(size_t) k].addends != all)
-                            fail(at + "the sum read out without part " + std::to_string(k) + " finished and covered");
-                    c.done = true;
-                }
-                ++c.pc;
-                moved = true;
+            const Card& c = cd[g];
+            if (c.seq > (unsigned) sums) continue;
+            left = true;
+            const PfRingOp& o = plan[g][c.pc];
+            if (o.k == K::WAIT) {
+                if (o.step < 0 || o.step >= steps) { fail(tag + "a flag past PF_RING_STEPS"); return false; }
+                if (c.flag[(size_t) ((c.seq & 1) * steps + o.step)] < c.seq) continue;
             }
+            ready.push_back(g);
+        }
+        if (!left) break;
+        if (ready.empty()) {
+            for (int g = 0; g < n; ++g)
+                if (cd[g].seq <= (unsigned) sums)
+                    fail(tag + "card " + std::to_string(g) + " stuck in sum " + std::to_string(cd[g].seq) + " at op " + std::to_string(cd[g].pc));
+            return false;
+        }
+        const int g = ready[rng() % ready.size()];
+        Card& c = cd[g];
+        Card& nx = cd[(g + 1) % n];
+        const int set = (int) (c.seq & 1u);
+        const PfRingOp& o = plan[g][c.pc];
+        const std::string at = tag + "card " + std::to_string(g) + " sum " + std::to_string(c.seq) + " op " + std::to_string(c.pc) + ": ";
+        auto in = [&](Card& k, int hop) -> Slot& { return k.in[(size_t) (set * (n - 1) + hop)]; };
+        auto ag = [&](Card& k, int part) -> Slot& { return k.ag[(size_t) (set * n + part)]; };
+        if (o.k == K::WAIT) {
+            c.waited[(size_t) (set * steps + o.step)] = c.seq;
+        } else if (o.k == K::PACK) {
+            c.send = {true, c.seq, o.part, 1u << g, -1, false};
+        } else if (o.k == K::ADD) {
+            Slot& r = in(c, o.hop);
+            if (!readable(c, r, set)) { fail(at + "adds a receive slot not yet covered by a flag it waited on"); return false; }
+            if (r.part != o.part) fail(at + "the receive slot holds another part");
+            if (r.addends & (1u << g)) fail(at + "adds its own addend twice");
+            r.consumed = true;
+            const Slot s{true, c.seq, o.part, r.addends | (1u << g), -1, false};
+            if (o.fin) {
+                if (s.addends != all) fail(at + "finishes a part without every card's addend");
+                if (!writable(ag(c, o.part), c.seq, at, "a gathered part")) return false;
+                ag(c, o.part) = s;
+            } else {
+                c.send = s;
+            }
+        } else if (o.k == K::SEND) {
+            if (!c.send.full || c.send.seq != c.seq || c.send.part != o.part) { fail(at + "sends what the send buffer does not hold"); return false; }
+            if (!writable(in(nx, o.hop), c.seq, at, "the next card's receive slot")) return false;
+            Slot s = c.send;
+            s.step = -2;
+            in(nx, o.hop) = s;
+            c.pending.push_back({false, o.hop});
+        } else if (o.k == K::PASS) {
+            const Slot& f = ag(c, o.part);
+            if (!readable(c, f, set)) { fail(at + "passes a part not here yet"); return false; }
+            if (f.addends != all) fail(at + "passes an unfinished part");
+            if (!writable(ag(nx, o.part), c.seq, at, "the next card's gathered part")) return false;
+            Slot s = f;
+            s.step = -2;
+            s.consumed = false;
+            ag(nx, o.part) = s;
+            c.pending.push_back({true, o.part});
+        } else if (o.k == K::SIGNAL) {
+            if (o.step < 0 || o.step >= steps) { fail(at + "a flag past PF_RING_STEPS"); return false; }
+            nx.flag[(size_t) (set * steps + o.step)] = c.seq;
+            for (const Copied& p : c.pending) (p.ag ? ag(nx, p.i) : in(nx, p.i)).step = o.step;
+            c.pending.clear();
+        } else if (o.k == K::OUT) {
+            for (int k = 0; k < n; ++k) {
+                Slot& s = ag(c, k);
+                if (!readable(c, s, set) || s.addends != all) {
+                    fail(at + "the sum read out without part " + std::to_string(k) + " finished and covered");
+                    return false;
+                }
+                s.consumed = true;
+            }
+            if (!c.pending.empty()) { fail(at + "copied after its last flag"); return false; }
+        }
+        if (++c.pc == plan[g].size()) {
+            c.pc = 0;
+            ++c.seq;
         }
     }
-    for (int g = 0; g < n; ++g) {
-        if (!cd[g].done) fail(tag + "card " + std::to_string(g) + " stuck at op " + std::to_string(cd[g].pc));
-        if (!cd[g].pending_in.empty() || !cd[g].pending_ag.empty()) fail(tag + "card " + std::to_string(g) + " copied after its last flag");
-    }
+    return true;
 }
 
 int main() {
@@ -149,16 +194,20 @@ int main() {
         for (int g = 0; g < n; ++g)
             if (fnx::pf_ring_plan(n, g) != written(n, g))
                 fail(std::to_string(n) + " cards, card " + std::to_string(g) + ": the plan is not the written sequence");
+    constexpr int SUMS = 8, ORDERS = 500;
     int counts = 0;
     for (int n = 2; n <= fnx::NCARD_MAX; ++n)
         if (fnx::ncard_ok(n)) {
-            simulate(n);
+            for (unsigned seed = 0; seed < ORDERS; ++seed)
+                if (!simulate(n, SUMS, seed)) break;
             ++counts;
         }
     if (fails) {
         std::printf("%d failures\n", fails);
         return 1;
     }
-    std::printf("pf ring plan: two and three cards as written; %d counts (2 to %d) sum complete\n", counts, fnx::NCARD_MAX);
+    std::printf("pf ring plan: two and three cards as written; %d counts (2 to %d): %d sums in a row over the two buffer "
+                "sets complete, %d random orders each\n",
+                counts, fnx::NCARD_MAX, SUMS, ORDERS);
     return 0;
 }

@@ -64,13 +64,13 @@ It also builds for **four, six or eight** cards (`make FNX_NCARD=4`; `serve/sfnx
 quarters, sixths or eighths by the same rule as two and three. Those are the counts the model's shapes allow: the
 attention's 24 query heads and the 48 recurrent value heads divide evenly, every card keeps at least one 32-value block
 of each expert's FF width, and every card can be a CUDA peer of every other (eight peers a card at most). Five and seven
-are refused at build time; twelve and twenty-four would leave some cards one FF block or none, and need more peers
-than CUDA gives.
+are refused at build time; twelve would leave some cards a single FF block and needs more peers than CUDA gives;
+twenty-four would leave some cards none.
 
 **Nobody has run these counts.** They compile, and two checks run on the CPU: the split rule reproduces the two- and
 three-card splits exactly and covers every head and FF block on every supported count (static checks in
-`src/card_split.hpp`), and the prompt path's ring plan matches the two- and three-card step sequences and completes a
-sum on every supported count (`bin/pf_ring_plan_test`). Decode's sums go between cards as fp32 by default on these
+`src/card_split.hpp`), and the prompt path's ring plan matches the two- and three-card step sequences and completes
+consecutive sums on every supported count (`bin/pf_ring_plan_test`). Decode's sums go between cards as fp32 by default on these
 counts (`FNX_RING_F32`, [docs/config.md](docs/config.md#card-count)), as on two. How to validate a count:
 [docs/verification.md](docs/verification.md#other-card-counts).
 
