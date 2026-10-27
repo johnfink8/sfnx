@@ -116,6 +116,12 @@ To validate count n (n cards, `iommu=pt` or the IOMMU off, and peer access betwe
 
 A failure in step 4 with the rest clean points at the arithmetic (the sums' precision, a split); a hang, a `ring` or
 `attn` error, or a timeout in the log at the transport (peer access, the IOMMU, a buffer sized for fewer cards).
+One place rests on timing rather than flags: with `FNX_PF_OVERLAP=1` (the default) the attention exchange takes a
+sequence number between two ring sums, so two attention layers' sums can use the same buffer set back to back
+(`bin/pf_ring_plan_test` does not model it). A hang or a wrong long64 that goes away with `FNX_PF_OVERLAP=0` points
+there. Six cards put four key heads on two cards each, and eight give each card the smallest slices (FF 64 or 96
+wide); a count that fails where four passes points at those. Above three cards the engine says at start that the
+count has not run on hardware yet.
 
 ## The test inventory
 
