@@ -776,7 +776,10 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
         }
         const std::string prompt = pic ? "ref/img/sphinx.bin" : std::string("ref/") + p + ".bin",
                           tag = long64 ? "" : std::string("-") + p;
-        std::string llama_s = long64 && std::getenv("FNX_EXACT_REF") ? std::getenv("FNX_EXACT_REF")
+        // FNX_ROPE_SCALE: the teacher must run with the same scaling (ref/fnx_logref honours it too), else the
+        // comparison measures the rope change itself rather than the port's exactness
+        std::string llama_s = std::getenv("FNX_ROPE_SCALE") ? "ref/lgr/llama_yarn_" + std::string(std::getenv("FNX_ROPE_SCALE")) + "_" + std::string(p) + ".lgr"
+                              : long64 && std::getenv("FNX_EXACT_REF") ? std::getenv("FNX_EXACT_REF")
                               : pic                                  ? "ref/img/sphinx.lgr"
                               : q4                                   ? "ref/lgr/llama_cuda_" + std::string(p) + ".lgr"
                               : q8                                   ? "ref/lgr/llama_cpu_q8w_" + std::string(p) + ".lgr"
