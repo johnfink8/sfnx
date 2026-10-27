@@ -2,7 +2,8 @@
 #   make            the engine and the picture encoder (bin/sfnx, bin/sfnx-vision; llama.cpp's libraries first if missing)
 #   make install    the systemd unit (serve/sfnx.service.in for this checkout and user, port 8080), enabled at boot
 #   make test-bin   the test programs (bin/fnx_run, bin/batch_test, bin/cache_test, bin/sample_test, bin/gguf_test,
-#                   bin/topk_test, bin/sfnx_input_test, bin/batch_plan_test, bin/stage_test)
+#                   bin/topk_test, bin/sfnx_input_test, bin/batch_plan_test, bin/stage_test,
+#                   bin/pf_ring_plan_test)
 #   make ref        llama.cpp's reference tools (ref/fnx_ref, ref/fnx_logref, ref/img_logref, ref/mmid_bench)
 #   make trace      the CUPTI kernel tracer for `tools/lab.sh trace` and the *_trace.sh scripts
 #   LLAMA=path      llama.cpp at a37cc46 somewhere other than ./llama.cpp
@@ -20,7 +21,7 @@ MAKEFLAGS += --no-builtin-rules
 .SUFFIXES:
 build: bin/sfnx bin/sfnx-vision
 test-bin: bin/fnx_run bin/batch_test bin/cache_test bin/sample_test bin/gguf_test bin/topk_test bin/sfnx_input_test bin/batch_plan_test \
-          bin/stage_test
+          bin/stage_test bin/pf_ring_plan_test
 install: build
 	sed -e "s|@ROOT@|$(CURDIR)|g" -e "s|@USER@|$$(id -un)|" -e "s|@GROUP@|$$(id -gn)|" serve/sfnx.service.in \
 	    | sudo tee /etc/systemd/system/sfnx.service > /dev/null
@@ -49,6 +50,9 @@ bin/sfnx_input_test: tools/sfnx_input_test.cpp tools/sfnx_input.hpp
 # the batched drafts' row plan, on the CPU alone
 bin/batch_plan_test: tools/batch_plan_test.cpp src/batch_plan.hpp
 	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -o $@ tools/batch_plan_test.cpp
+# the prompt path's ring plan against the two- and three-card sequences, and every supported count's sum, on the CPU
+bin/pf_ring_plan_test: tools/pf_ring_plan_test.cpp src/pf_ring_plan.hpp src/card_split.hpp src/model.hpp
+	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -DFNX_NCARD=$(FNX_NCARD) -o $@ tools/pf_ring_plan_test.cpp
 
 # one object per source in build/ (headers tracked by nvcc's own dependency files), so a change recompiles only the
 # objects it touches; every engine program and the lab's library link the same objects (position independent).

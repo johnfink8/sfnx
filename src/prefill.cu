@@ -10,6 +10,7 @@
 #include "engine.hpp"
 #include "engine_impl.hpp"
 #include "env.hpp"
+#include "pf_ring_plan.hpp"
 
 #include <cublas_v2.h>
 #include <cuda.h>
@@ -321,16 +322,21 @@ unsigned grid_for(size_t n) { return (unsigned) std::min<size_t>(4096, (n + 255)
 }  // namespace
 
 // ---------------------------------------------------------------- per-card buffers
-// the chunk sums on the copy engines: f16 rows (thirds of the chunk's rows), two sets by the sum's
-// parity, flags [2 sets][4 steps] set by the previous card's stream; n*: the next card's
+// the chunk sums on the copy engines: f16 rows (parts of the chunk's rows, one a card), two sets by the sum's parity,
+// a receive slot per reduce hop, flags [2 sets][PF_RING_STEPS] set by the previous card's stream; n*: the next card's;
+// plan: this card's steps (pf_ring_plan.hpp)
 struct Engine::PfRing {
-    __half *send, *in0[2], *in1[2], *ag[2];
-    __half *nin0[2], *nin1[2], *nag[2];
+    __half *send, *in[NCARD - 1][2], *ag[2];
+    __half *nin[NCARD - 1][2], *nag[2];
     unsigned *flags, *nflags;
     int next_dev = 0;
+    std::vector<PfRingOp> plan;
 };
 
 constexpr int ATT_PIECES_MAX = 8;   // the attention exchange's pieces at most (FNX_PF_ATT_PIECES)
+// the attention exchange's receive slots a card's flags are laid out for: one per other card, two at least (two cards
+// keep three cards' layout)
+constexpr int ATT_SLOTS = NCARD - 1 > 2 ? NCARD - 1 : 2;
 
 struct Engine::Pf {
     cublasHandle_t blas = nullptr;
@@ -349,14 +355,14 @@ struct Engine::Pf {
     float *qkvz, *ab, *y32;
     float *gdn_xc, *gdn_sq;           // the recurrent core's conv outputs (rows of ch) and output square sums
     float* gdn_ch;                    // its sub-chunks' state-free parts (gdn_prompt_work_floats)
-    // the chunk sums on the copy engines (FNX_PF_RING_SM=1: the SM ring instead): f16 rows in thirds of the chunk,
-    // two sets by the sum's parity; flags [2 sets][4 steps], set by the previous card's stream (seq: the sum's number)
+    // the chunk sums on the copy engines (FNX_PF_RING_SM=1: the SM ring instead): f16 rows in parts of the chunk,
+    // two sets by the sum's parity; flags [2 sets][PF_RING_STEPS], set by the previous card's stream (seq: the sum's number)
     bool ring_sm = false;
     PfRing ring_ce;                   // the chunk sums on the copy engines
     int dev = 0;
     unsigned seq = 0;
-    // attention partials (attn_prompt's blocks per owner card) and the two received from the other cards; each card's
-    // receive slots and flags (slot 0: from card + 1, slot 1: from card + 2). FNX_PF_ATTN_DEC=1: the decode attention
+    // attention partials (attn_prompt's blocks per owner card) and those received from the other cards; each card's
+    // receive slots and flags (slot k: from card + k + 1). FNX_PF_ATTN_DEC=1: the decode attention
     bool attn_dec = false;
     // two sets by the chunk's parity: with the overlap a chunk's merge waits until the next chunk's hc read is issued
     // (its exchange meanwhile on the links), so the next chunk's exchange must not land in the same buffers
@@ -540,18 +546,17 @@ void cud(CUresult e, const char* what) {
 }
 
 // one direction's sum of x (C rows of N) over the cards, on stream s; this card is at position g of the direction's
-// ring (its next card: g + 1 there). Thirds of the rows: card g sends third g to g + 1, which adds its own and sends it
-// on to g + 2, which adds its own: finished there (card g finishes third g + 1). The finished thirds go round twice.
-// Two cards: halves, card g sends half g to the other, which adds its own: finished, and sent back.
-// Each step: a copy into the next card, then a flag there; the step after waits on this card's flag (stream memory
-// operations: no SM time, no host)
-constexpr int PF_RING_STEPS = 4;   // flags a set holds: three cards' four steps (two cards use two)
-static_assert(2 * NCARD - 2 <= PF_RING_STEPS, "the copy-engine ring's flags hold PF_RING_STEPS steps a set");
+// ring (its next card: g + 1 there). Parts of the rows, one a card: card g sends part g to g + 1, each card after adds
+// its own and sends it on, until the card before g, which finishes it (card g finishes part g + 1); the finished parts
+// go round n - 1 times. Three cards: thirds, two hops to finish and two to spread; two cards: halves, one each.
+// The steps are r.plan (pf_ring_plan.hpp, checked by tools/pf_ring_plan_test.cpp). Each copy into the next card is
+// followed by a flag there; the step after waits on this card's flag (stream memory operations: no SM time, no host)
+constexpr int PF_RING_STEPS = pf_ring_steps(NCARD);   // flags a set holds
 void pf_ring_dir(Engine::PfRing& r, int dev, int g, float* x, int C, unsigned seq, unsigned* err, cudaStream_t s) {
+    if (r.plan.empty() || r.plan.front().part != g) throw std::runtime_error("prefill: the ring's plan is not card " + std::to_string(g) + "'s");
     const int set = (int) (seq & 1u);
     auto r0 = [&](int k) { return k * C / NCARD; };
     auto rows = [&](int k) { return r0(k + 1) - r0(k); };
-    const int a = g, b = (g + NCARD - 1) % NCARD, c = (g + 1) % NCARD;
     CUstream cs = (CUstream) s;
     auto signal = [&](int step) {
         cud(cuStreamWriteValue32(cs, (CUdeviceptr) (r.nflags + set * PF_RING_STEPS + step), seq, 0), "ring flag");
@@ -562,42 +567,30 @@ void pf_ring_dir(Engine::PfRing& r, int dev, int g, float* x, int C, unsigned se
     auto copy = [&](__half* dst, const __half* src, int nrows) {
         ckc(cudaMemcpyPeerAsync(dst, r.next_dev, src, dev, (size_t) nrows * N * sizeof(__half), s), "ring copy");
     };
-    // a third can be empty (a chunk of 1 or 2 rows: a read cut at a checkpoint): its kernels are skipped, its copies
-    // move nothing, its flags still step
-    auto add = [&](const __half* in, int third, __half* out) {
-        if (rows(third) == 0) return;
-        k_pfr_add<<<grid_for((size_t) rows(third) * N / 2), 256, 0, s>>>((const __half2*) in, (const float2*) (x + (size_t) r0(third) * N),
-                                                                        rows(third) * N / 2, (__half2*) out, err);
+    // a part can be empty (a chunk of fewer rows than cards: a read cut at a checkpoint): its kernels are skipped, its
+    // copies move nothing, its flags still step
+    auto add = [&](const __half* in, int part, __half* out) {
+        if (rows(part) == 0) return;
+        k_pfr_add<<<grid_for((size_t) rows(part) * N / 2), 256, 0, s>>>((const __half2*) in, (const float2*) (x + (size_t) r0(part) * N),
+                                                                       rows(part) * N / 2, (__half2*) out, err);
     };
-    if (rows(a) > 0)
-        k_pfr_pack<<<grid_for((size_t) rows(a) * N / 2), 256, 0, s>>>((const float2*) (x + (size_t) r0(a) * N), rows(a) * N / 2,
-                                                                      (__half2*) r.send, err);
-    copy(r.nin0[set], r.send, rows(a));
-    signal(0);
-    if constexpr (NCARD == 2) {
-        wait(0);   // half c (= b) from the other card: add mine, finished; keep it, send it back
-        __half* fin = r.ag[set] + (size_t) r0(c) * N;
-        add(r.in0[set], c, fin);
-        copy(r.nag[set] + (size_t) r0(c) * N, fin, rows(c));
-        signal(1);
-        wait(1);   // half a arrived finished: both here
-        k_pfr_out<<<grid_for((size_t) C * N / 2), 256, 0, s>>>((const __half2*) r.ag[set], (float2*) x, C * N / 2);
-        return;
+    for (const PfRingOp& o : r.plan) {
+        switch (o.k) {
+            case PfRingOp::PACK:
+                if (rows(o.part) > 0)
+                    k_pfr_pack<<<grid_for((size_t) rows(o.part) * N / 2), 256, 0, s>>>((const float2*) (x + (size_t) r0(o.part) * N),
+                                                                                       rows(o.part) * N / 2, (__half2*) r.send, err);
+                break;
+            case PfRingOp::ADD: add(r.in[o.hop][set], o.part, o.fin ? r.ag[set] + (size_t) r0(o.part) * N : r.send); break;
+            case PfRingOp::SEND: copy(r.nin[o.hop][set], r.send, rows(o.part)); break;
+            case PfRingOp::PASS: copy(r.nag[set] + (size_t) r0(o.part) * N, r.ag[set] + (size_t) r0(o.part) * N, rows(o.part)); break;
+            case PfRingOp::SIGNAL: signal(o.step); break;
+            case PfRingOp::WAIT: wait(o.step); break;
+            case PfRingOp::OUT:
+                k_pfr_out<<<grid_for((size_t) C * N / 2), 256, 0, s>>>((const __half2*) r.ag[set], (float2*) x, C * N / 2);
+                break;
+        }
     }
-    wait(0);   // third b from card g - 1: add mine, on to g + 1
-    add(r.in0[set], b, r.send);
-    copy(r.nin1[set], r.send, rows(b));
-    signal(1);
-    wait(1);   // third c with two addends: add mine, finished; keep it, send it on
-    __half* fin = r.ag[set] + (size_t) r0(c) * N;
-    add(r.in1[set], c, fin);
-    copy(r.nag[set] + (size_t) r0(c) * N, fin, rows(c));
-    signal(2);
-    wait(2);   // third a arrived finished: forward it
-    copy(r.nag[set] + (size_t) r0(a) * N, r.ag[set] + (size_t) r0(a) * N, rows(a));
-    signal(3);
-    wait(3);   // third b arrived forwarded: all three here
-    k_pfr_out<<<grid_for((size_t) C * N / 2), 256, 0, s>>>((const __half2*) r.ag[set], (float2*) x, C * N / 2);
 }
 
 // the sum of x (C rows of N) over the cards on card g, one way round (each card's link is busy both ways already: it
@@ -610,7 +603,7 @@ void pf_ring(Engine::Pf& p, int g, float* x, int C, const RingMoe* m, unsigned* 
 }
 
 // the attention partials to their heads' cards: block k of apart to card k (into its slot for this card), then wait
-// for the two blocks of this card's heads. One receive set: a card's next exchange comes after a chunk sum that
+// for the other cards' blocks of this card's heads. One receive set: a card's next exchange comes after a chunk sum that
 // needs every card past its merge
 // rows [r0, r0 + nr) of the partials to their heads' cards (piece i of the exchange, flag [slot][i] there)
 void pf_attn_send(Engine::Pf& p, int set, int g, int C, int r0, int nr, int i, unsigned seq, cudaStream_t s) {
@@ -670,7 +663,7 @@ void Engine::pf_seq_reset(unsigned start) {
         if (p.att_pend >= 0) throw std::runtime_error("prefill: sequence numbers restarted with an attention merge pending");
         ckc(cudaSetDevice(p.dev), "set");
         ckc(cudaMemset(p.ring_ce.flags, 0, 2 * PF_RING_STEPS * sizeof(unsigned)), "prompt ring flags");
-        for (unsigned* f : p.aflags) ckc(cudaMemset(f, 0, 2 * ATT_PIECES_MAX * sizeof(unsigned)), "attention exchange flags");
+        for (unsigned* f : p.aflags) ckc(cudaMemset(f, 0, ATT_SLOTS * ATT_PIECES_MAX * sizeof(unsigned)), "attention exchange flags");
         p.seq = p.att_seq[0] = p.att_seq[1] = start;
     }
     for (CardBuf* b : cb_) { ckc(cudaSetDevice(b->dev), "set"); ckc(cudaDeviceSynchronize(), "prompt sequence reset sync"); }
@@ -791,7 +784,7 @@ void Engine::prefill_alloc() {
         p->ctl = palloc<int>((size_t) (1 + (pf_c_ / MAXT)) * 2);
         p->ring_sm = env_flag("FNX_PF_RING_SM");
         if (p->ring_sm && b.ring.f32)
-            throw std::runtime_error("FNX_PF_RING_SM: the SM ring carries fp16 only, and the ring is fp32 (FNX_RING_F32, 1 by default on two cards)");
+            throw std::runtime_error("FNX_PF_RING_SM: the SM ring carries fp16 only, and the ring is fp32 (FNX_RING_F32, 1 by default on every count but three)");
         p->ring = b.ring;
         if (p->ring_sm) {   // ~140 MB a card at 1,024 rows a chunk
             p->ring.rows = pf_c_;
@@ -804,8 +797,7 @@ void Engine::prefill_alloc() {
             const size_t share = (size_t) (pf_c_ + NCARD - 1) / NCARD * N;   // a card's share of the rows
             r.send = palloc<__half>(share);
             for (int k = 0; k < 2; ++k) {
-                r.in0[k] = palloc<__half>(share);
-                if (NCARD == 3) r.in1[k] = palloc<__half>(share);   // the second hop's slot: two cards have one hop
+                for (int h = 0; h < NCARD - 1; ++h) r.in[h][k] = palloc<__half>(share);   // a slot per reduce hop
                 r.ag[k] = palloc<__half>((size_t) pf_c_ * N);
             }
             r.flags = palloc<unsigned>(2 * PF_RING_STEPS);
@@ -815,7 +807,7 @@ void Engine::prefill_alloc() {
         p->apart[1] = palloc<float>(NCARD * attn_prompt_block_floats(pf_c_));   // set 0 is in the attention phase's region
         for (int s = 0; s < 2; ++s) {
             p->arecv[s] = palloc<float>((NCARD - 1) * attn_prompt_block_floats(pf_c_));
-            p->aflags[s] = palloc<unsigned>(2 * ATT_PIECES_MAX);   // [slot][piece]
+            p->aflags[s] = palloc<unsigned>(ATT_SLOTS * ATT_PIECES_MAX);   // [slot][piece]
         }
         if (const char* ap = std::getenv("FNX_PF_ATT_PIECES")) {
             char* end = nullptr;
@@ -899,12 +891,12 @@ void Engine::prefill_alloc() {
         p.ring.next_flags = n.ring.flags;
         PfRing& r = p.ring_ce;
         for (int k = 0; k < 2; ++k) {
-            r.nin0[k] = n.ring_ce.in0[k];
-            r.nin1[k] = n.ring_ce.in1[k];
+            for (int h = 0; h < NCARD - 1; ++h) r.nin[h][k] = n.ring_ce.in[h][k];
             r.nag[k] = n.ring_ce.ag[k];
         }
         r.nflags = n.ring_ce.flags;
         r.next_dev = n.dev;
+        r.plan = pf_ring_plan(NCARD, c);
     }
     // the flags as cudaMalloc left them could hold anything, and a wait passes on any flag >= its number
     const long long seq0 = env_int("FNX_PF_SEQ_START", 0);
