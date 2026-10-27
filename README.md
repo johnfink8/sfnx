@@ -42,6 +42,22 @@ A range is the spread across runs, not a confidence interval; the 382 in the hea
 code-edit runs. The gap between the first row and the third is the drafts: one verify window costs about the same
 whether it accepts one token or sixteen, and code drafts where prose does not.
 
+## Fewer cards
+
+Three cards are what sFNX is made for. It also builds for **two** (`make FNX_NCARD=2`, `serve/sfnx-2card.json`): each
+layer split in halves, a third of the experts in RAM, chosen by the engine at start. Exact to the same bar, and ahead
+of Strata on the same two cards, by less than on three:
+
+| One request, two cards | sFNX | Strata |
+| --- | --- | --- |
+| Code edit | 153–154 tok/s | 131–135 |
+| New code | 107–112 tok/s | 94–99 |
+| Prose, prod's sampling | 90–94 tok/s | 65–68 |
+| 114k-token prompt, cold read | 42.7 s | 53.7 s |
+
+For **one** card, use Strata: it computes part of the experts a card cannot hold on the CPU, and was 2–3x sFNX's
+decode and 4–5x its prompt reading there. Both, with the method: [docs/benchmarks.md](docs/benchmarks.md#two-cards-and-one-card).
+
 ## Running it
 
 Needs CUDA 12.9, g++-14, llama.cpp at a37cc46 checked out (or linked) as `llama.cpp/` (`make LLAMA=path` for
@@ -60,7 +76,8 @@ sudo systemctl start sfnx    # ~80 s to load; the API is on port 8080
 ```
 
 `serve/run.sh` runs the same config as a transient unit on port 8095; `serve/run.sh serve/sfnx-q8.json` the Q8_0
-build. Engine settings, and the files they read: [docs/config.md](docs/config.md).
+build. For two cards: `make FNX_NCARD=2 -j32 bin/sfnx`, then `serve/run.sh serve/sfnx-2card.json` (a build refuses
+to start on any other number of cards). Engine settings, and the files they read: [docs/config.md](docs/config.md).
 
 ## Layout
 
@@ -75,7 +92,8 @@ build. Engine settings, and the files they read: [docs/config.md](docs/config.md
 
 ## Limits
 
-- One model, one box: three `sm_70` cards, no FP8 and no CUDA 13 — the kernels are written for this generation.
+- One model, one box: three `sm_70` cards (or two), no FP8 and no CUDA 13 — the kernels are written for this
+  generation.
 - Not tied to one quantization, but a GGUF has to keep its embeddings, shared expert and draft-layer projections at
   Q8_0, and its routed experts in a type the kernels have ([docs/design.md](docs/design.md)); anything else throws at
   load. Both quants above are held to the same exactness bar ([docs/verification.md](docs/verification.md)).

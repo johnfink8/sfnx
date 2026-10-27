@@ -108,6 +108,49 @@ files with its prod settings. Settings and the arena side of Q8: [docs/memory.md
 Both start in ~310 s. Lab decode at 58 GiB with lookup drafts up to 15: code edit 137.8 tok/s (130.4 with lookup capped
 at 7), new code 111.5.
 
+## Two cards and one card
+
+The same engine built for fewer cards (`make FNX_NCARD=2`; [docs/config.md](config.md)), on GPUs 0 and 1, against
+Strata on the same cards (upstream `011c9e60` plus four commits of ours, the build this box ran as its service):
+prod's Strata flags without `--batch`, `--batch-groups` or vision, so its one request gets every slot; adding
+`--vram-reserve-later-mib` and `--spec 6` changed nothing. One request through each front end
+(`serve/solo_decode.sh`, `serve/prompt_read.py`, `serve/long_prompt.py`), 2026-10-26. **One Strata config on our
+hardware at one point in time**, as above.
+
+Two cards hold 15,806 of the 24,576 experts (64%; the engine moves the rest to RAM by itself at start), which serve
+97% of decode's picks on the routing profile. The sums between cards are fp32 there by default: with fp16 pairs the
+code and edit prompts are 1.25x over the exactness bar ([docs/verification.md](verification.md)); that column is
+shown for what it costs.
+
+| One request | sFNX, 2 cards | sFNX, 2 cards, fp16 sums | Strata, 2 cards |
+| --- | --- | --- | --- |
+| Code edit, greedy | **152.7–154.4 tok/s** | 209.3–211.2 | 130.6–134.7 |
+| New code, greedy | **107.0–112.2** | 136.5–162.9 | 93.8–98.7 |
+| Prose reasoning, prod's sampling | **90.0–93.8** | 108.9–119.1 | 64.5–68.2 |
+| 3k random words, cold read | **1,543–1,564 tok/s** | 1,512–1,565 | 934–952 |
+| 32k random words, cold read | **2,814–2,885** | 2,827–2,837 | 2,071–2,120 |
+| 114k prompt of source code, cold read | **42.7 s** | 42.1 s | 53.7 s |
+| After it, decode | **78.0 tok/s** | 105.4 | 69.6 |
+| Six at once, 1k-word prompts (over the run / best 3 s) | 125.8 / 170.9 tok/s | 157.7 / 249.3 | |
+| GPUs | 53% / 53% | 48% / 48% | 27% / 32% |
+
+Exactness on two cards, against llama.cpp CUDA (`lab.sh exact`): KL mean 5.73e-4 code, 3.14e-6 edit, 4.01e-3 on the
+62k prompt, 7.89e-3 on the picture, every prompt within the bar; windows of 1–16 rows and batched lanes give the same
+tokens as 5-row windows and lanes alone. fp32 sums cost a quarter to a third of one request's decode where the bytes
+they add should cost microseconds a sum: not traced yet.
+
+**One card: use Strata.** Built and run once (6,415 experts in VRAM, 26%: 73% of decode's picks), sFNX reads every
+expert it lacks over the card's one PCIe link and loses to Strata, which computes part of the misses on the CPU next
+to the RAM:
+
+| One request, one card | sFNX | Strata |
+| --- | --- | --- |
+| Code edit / new code / prose | 37.9–38.7 / 33.6–34.4 / 36.9–39.4 tok/s | 109.7–110.8 / 80.8–81.1 / 60.7–64.2 |
+| 3k / 32k random words, cold read | 210–215 / 246–247 tok/s | 597–603 / 1,285–1,308 |
+| 114k prompt, cold read; decode after | 446 s; 28.8 tok/s | 98.9 s; 58.0 |
+
+The one-card build is not in this repo; `FNX_NCARD` takes 2 or 3.
+
 ## The reference implementation on the same cards
 
 Upstream llama.cpp (a37cc46, same model, all layers on the three cards, `llama-bench`): 46.9 tok/s decode and 439 tok/s

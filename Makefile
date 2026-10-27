@@ -32,7 +32,7 @@ NVCC := /usr/local/cuda/bin/nvcc
 LLAMA ?= $(CURDIR)/llama.cpp
 GG := $(LLAMA)/ggml
 NVFLAGS := -DFNX_DIR='"$(CURDIR)"' -O3 --use_fast_math -std=c++17 -arch=sm_70 -ccbin g++-14 -Wno-deprecated-gpu-targets -I$(GG)/src/ggml-cuda -I$(GG)/src -I$(GG)/include --expt-relaxed-constexpr
-# the cards every layer is split across (src/model.hpp): 3, or 2 (make FNX_NCARD=2 ...: an experiment). build/ncard
+# the cards every layer is split across (src/model.hpp): 3 (prod), or 2 (make FNX_NCARD=2 ...). build/ncard
 # holds the count the objects in build/ were made for; a different count rewrites it, which rebuilds them all
 FNX_NCARD ?= 3
 $(if $(filter 2 3,$(FNX_NCARD)),,$(error FNX_NCARD: 2 or 3, not '$(FNX_NCARD)'))

@@ -68,7 +68,9 @@ for GPU work and start it again when the work is done.
 The lab (`tools/lab.sh`, usage at its top) holds the model once (`fnx_hold`) and runs `fnx_run`'s commands in a
 worker, so a code change costs a library rebuild and `cmd reload`, not a model load. `set VAR=value` / `unset VAR`
 change engine settings and are kept for replacement workers. `lab.sh cmd` (and so `exact`, `batch`, `decode`, `trace`)
-exits with the worker's result code.
+exits with the worker's result code. The lab shows the build as many cards as it was made for (`build/ncard`). For two
+cards: `make FNX_NCARD=2 lab` and a lab directory of their own (`FNX_LAB_DIR=/tmp/fnx-lab-$UID-2card` on every
+`lab.sh` call), since their bases differ from three cards'; switching counts rebuilds everything.
 
 Measure speed with `lab.sh decode` (edit1 and code1 greedy, prose2 and code1s with prod's sampling, seeds fixed) and
 `lab.sh batch`; trace with `lab.sh trace`. A `kbench` win is not a win until the real window shows it. Sample GPU
