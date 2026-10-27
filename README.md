@@ -97,7 +97,7 @@ to start on any other number of cards). Engine settings, and the files they read
 - Not tied to one quantization, but a GGUF has to keep its embeddings, shared expert and draft-layer projections at
   Q8_0, and its routed experts in a type the kernels have ([docs/design.md](docs/design.md)); anything else throws at
   load. Both quants above are held to the same exactness bar ([docs/verification.md](docs/verification.md)).
-- VRAM is essentially full at idle: 284 MiB free on cards 0 and 1, 2,540 MiB on card 2 beside the picture encoder.
+- VRAM is essentially full at idle: 238 MiB free on cards 0 and 1, 2,492 MiB on card 2 beside the picture encoder.
 - Prompts are read one at a time; the other lanes keep decoding between a read's chunks.
 - Six lanes of temperature-1.0 prose decode ~5% under one-row-a-lane batching (`FNX_BATCH_DRAFTS=0`).
 - A prompt re-read on a lane that held another conversation can differ in its last bits (~1e-4 first-token KL), and
