@@ -12,7 +12,7 @@ lands off by default until the GPU checks pass ([docs/verification.md](verificat
 | `serve/sfnx-q8.json` | the Q8_0 build: 58 GiB of experts in RAM, int8 K/V, a 64 GiB conversation cache ([docs/memory.md](memory.md)) |
 | `serve/sfnx-gap.json` | a check config: prod's 262k context with a 440-page own pool (`FNX_ARENA_BASE_PAGES`), so reads and decodes lend |
 | `serve/sfnx-pool.json` | a check config: 32k context, `--spec 4`, `--lookup 7`, no env of its own — the arena is on, only the context is small |
-| `serve/sfnx-2card.json` | two cards (`"gpu": [0, 1]`), for an engine built with `make FNX_NCARD=2`: prod's settings without vision, a 32 GiB conversation cache, port 8095. The engine puts as many experts in RAM as the cards need at start; fp16 sums between the cards, 1.25x over the exactness bar on two (`FNX_RING_F32=1`: fp32, within it and ~30% slower; [docs/benchmarks.md](benchmarks.md#two-cards-and-one-card)) |
+| `serve/sfnx-2card.json` | two cards (`"gpu": [0, 1]`), for an engine built with `make FNX_NCARD=2`: prod's settings without vision, a 32 GiB conversation cache, port 8095. The engine puts as many experts in RAM as the cards need at start; fp16 sums between the cards, over the exactness bar (code 1.2x, edit 1.4x) on two (`FNX_RING_F32=1`: fp32, within it and ~30% slower; [docs/benchmarks.md](benchmarks.md#two-cards-and-one-card)) |
 | `serve/sfnx-4card.json` | four cards (`"gpu": [0, 1, 2, 3]`), for an engine built with `make FNX_NCARD=4`: prod's settings with vision on card 3, a 32 GiB conversation cache, port 8095. Untested on hardware ([Card count](#card-count)) |
 | `serve/sfnx.service.in` | the systemd unit's template: `make install` fills in the checkout (`@ROOT@`) and whoever runs it (`@USER@`, `@GROUP@`) and writes `/etc/systemd/system/sfnx.service`. It overrides the config's port with `--port 8080` |
 | `serve/run.sh [CONFIG]` | the same as a transient unit on the config's own port (8095 for `sfnx.json`), with `LimitMEMLOCK` raised |
@@ -97,7 +97,7 @@ The ones that change results or are worth knowing. The rest are kernel-level tun
 
 | Setting | Effect |
 | --- | --- |
-| `FNX_RING_F32=0` or `1` | decode's sums between cards as fp16 pairs (0) or fp32 (1); the prompt path's stay fp16. Default 0 on every count: fp32 costs ~30% of one request's decode on two cards (lab: new code 141 → 98 tok/s, prose 113 → 90). fp32 is the more exact: on three cards it takes the code prompt's KL from 5.75e-4 to 4.38e-4, both within the bar; on two, fp16 pairs leave code and edit 1.25x over the exactness bar (code 7.48e-4 against 6.06e-4; fp32 5.73e-4), so `exact base` there passes only with 1. Four, six and eight are unmeasured; each hop rounds a partial sum to f16 again, so their KL with 0 is the first thing to check |
+| `FNX_RING_F32=0` or `1` | decode's sums between cards as fp16 pairs (0) or fp32 (1); the prompt path's stay fp16. Default 0 on every count: fp32 costs ~30% of one request's decode on two cards (lab: new code 141 → 98 tok/s, prose 113 → 90). fp32 is the more exact: on three cards it takes the code prompt's KL from 5.75e-4 to 4.38e-4, both within the bar; on two, fp16 pairs leave code and edit over the exactness bar (code 1.2x, edit 1.4x; code 7.48e-4 against 6.06e-4; fp32 5.73e-4), so `exact base` there passes only with 1. Four, six and eight are unmeasured; each hop rounds a partial sum to f16 again, so their KL with 0 is the first thing to check |
 
 **The lab**
 
