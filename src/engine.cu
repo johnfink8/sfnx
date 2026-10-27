@@ -124,8 +124,8 @@ void require_identity_iommu(int dev) {
 
 Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
     // rope scaling for a context past the trained length: FNX_ROPE_SCALE=S (S > 1) applies llama.cpp's YaRN with
-    // its defaults: ext_factor 1, beta_fast 32, beta_slow 1, mscale 1 (with those, llama.cpp's net yarn_attn_factor
-    // is exactly 1.0 — see its llama-context.cpp get_mscale and the cancellation there). n_ctx_orig is
+    // its defaults: ext_factor 1, beta_fast 32, beta_slow 1, with llama.cpp's net attention magnitude
+    // (its get_mscale, see below). n_ctx_orig is
     // FNX_YARN_ORIG_CTX, else the model's context_length. Set once here, before any graph capture.
     rope_scaled_.base = m_.rope_base;
     if (const char* e = std::getenv("FNX_ROPE_SCALE")) {
@@ -139,9 +139,14 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         rope_scaled_.c_low = fmaxf(0.0f, floorf(corr(32.0f)));
         rope_scaled_.c_high = fminf((float) (NROT - 1), ceilf(corr(1.0f)));
         rope_scaled_.inv_scale = (float) (1.0 / S);
+        // the magnitude on cos/sin: llama.cpp's rope kernels multiply (1 + 0.1*log(1/freq_scale)) and
+        // llama-context.cpp divides the same out of yarn_attn_factor, leaving get_mscale(S, 1) =
+        // 1 + 0.1*log(S) (HF's _yarn_get_mscale). A model carrying its own rope mscale would need that
+        // value instead (none measured; this GGUF has no rope scaling keys).
+        rope_scaled_.mscale = 1.0f + 0.1f * logf((float) S);
         rope_scaled_.scaled = true;
-        std::fprintf(stderr, "fnx: rope scaling YaRN x%.4f: n_ctx_orig %d, dims %.0f..%.0f scaled (pairs %d, mscale 1)\n",
-                     S, orig, rope_scaled_.c_low, rope_scaled_.c_high, NROT / 2);
+        std::fprintf(stderr, "fnx: rope scaling YaRN x%.4f: n_ctx_orig %d, dims %.0f..%.0f scaled (pairs %d, mscale %.4f)\n",
+                     S, orig, rope_scaled_.c_low, rope_scaled_.c_high, NROT / 2, rope_scaled_.mscale);
         if (max_ctx <= orig)
             std::fprintf(stderr, "fnx: note: scaling %d < trained %d: the blend applies but nothing needs the extra length\n", max_ctx, orig);
     }
