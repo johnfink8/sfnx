@@ -47,13 +47,6 @@ constexpr int MAXT = 16;                               // rows per window
 constexpr int QSA_KEY = 128;
 constexpr int QSA_HEADS = 4;                             // indexer query heads: the qk projection is QSA_HEADS + 1 of these
 constexpr int QSA_TOP_K = 2048;                          // indexer positions kept (metadata top_k): qsa.cuh's QSA_TOP is this over the pool
-// the hc read's grid (src/hc.cuh's H_BLOCKS, held to this there): every block resident at once, one an SM, so a card
-// with fewer SMs is refused at load (src/card_check.hpp)
-#if FNX_27B
-constexpr int HC_READ_BLOCKS = 1;   // the 27B has no hyper-connections: no grid that must be resident
-#else
-constexpr int HC_READ_BLOCKS = 80;
-#endif
 constexpr int PLE_LAYER = 1, PLE_ORDERS = 3, PLE_HEADS = 16, PLE_DIM = 160;
 
 }  // namespace fnx

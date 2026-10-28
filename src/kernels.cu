@@ -1016,6 +1016,36 @@ int hc1_rows() {
     return rows;
 }
 
+int hc_blocks() { return H_BLOCKS; }
+
+// the read's grid on each card (0: hc_prepare not run there)
+constexpr int HC_MAXDEV = 64;
+int hc_grid_[HC_MAXDEV] = {};
+
+int hc_dev() {
+    int dev = -1;
+    const cudaError_t e = cudaGetDevice(&dev);
+    if (e != cudaSuccess) throw std::runtime_error(std::string("hc: cudaGetDevice: ") + cudaGetErrorString(e));
+    if (dev < 0 || dev >= HC_MAXDEV) throw std::runtime_error("hc: card " + std::to_string(dev) + " past the " + std::to_string(HC_MAXDEV) + " it tracks");
+    return dev;
+}
+
+int hc_grid() {
+    const int dev = hc_dev();
+    if (!hc_grid_[dev]) throw std::runtime_error("hc_read: hc_prepare was not run on card " + std::to_string(dev));
+    return hc_grid_[dev];
+}
+
+int hc_prepare() {
+    const int dev = hc_dev();
+    int sms = 0;
+    const cudaError_t e = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    if (e != cudaSuccess) throw std::runtime_error(std::string("hc_prepare: SM count: ") + cudaGetErrorString(e));
+    if (sms <= 0) throw std::runtime_error("hc_prepare: card " + std::to_string(dev) + " reports " + std::to_string(sms) + " SMs");
+    hc_grid_[dev] = std::min(sms, H_BLOCKS);
+    return hc_grid_[dev];
+}
+
 void hc_read(float* R, const float* bo, const float* inj_prev, const float* w_norm, const Q8S& w_down, const Q8S& w_up,
              const uint16_t* w_inj, float eps, float* mixed, float* inject, float* scratch, unsigned* err, int T, void* st,
              void* q8) {
@@ -1030,32 +1060,34 @@ void hc_read(float* R, const float* bo, const float* inj_prev, const float* w_no
     if (q8) twin_of(q8, N, a.tq, a.td);
     cudaStream_t s = (cudaStream_t) st;
     const bool one = T <= hc1_rows();
+    const int grid = hc_grid();
     switch (T) {
-        case 1: hc_launch<1>(a, s, one); break;
-        case 2: hc_launch<2>(a, s, one); break;
-        case 3: hc_launch<3>(a, s, one); break;
-        case 4: hc_launch<4>(a, s, one); break;
-        case 5: hc_launch<5>(a, s, one); break;
-        case 6: hc_launch<6>(a, s, one); break;
-        case 7: hc_launch<7>(a, s, one); break;
-        case 8: hc_launch<8>(a, s, one); break;
-        case 9: hc_launch<9>(a, s, one); break;
-        case 10: hc_launch<10>(a, s, one); break;
-        case 11: hc_launch<11>(a, s, one); break;
-        case 12: hc_launch<12>(a, s, one); break;
-        case 13: hc_launch<13>(a, s, one); break;
-        case 14: hc_launch<14>(a, s, one); break;
-        case 15: hc_launch<15>(a, s, one); break;
-        case 16: hc_launch<16>(a, s, one); break;
+        case 1: hc_launch<1>(a, s, one, grid); break;
+        case 2: hc_launch<2>(a, s, one, grid); break;
+        case 3: hc_launch<3>(a, s, one, grid); break;
+        case 4: hc_launch<4>(a, s, one, grid); break;
+        case 5: hc_launch<5>(a, s, one, grid); break;
+        case 6: hc_launch<6>(a, s, one, grid); break;
+        case 7: hc_launch<7>(a, s, one, grid); break;
+        case 8: hc_launch<8>(a, s, one, grid); break;
+        case 9: hc_launch<9>(a, s, one, grid); break;
+        case 10: hc_launch<10>(a, s, one, grid); break;
+        case 11: hc_launch<11>(a, s, one, grid); break;
+        case 12: hc_launch<12>(a, s, one, grid); break;
+        case 13: hc_launch<13>(a, s, one, grid); break;
+        case 14: hc_launch<14>(a, s, one, grid); break;
+        case 15: hc_launch<15>(a, s, one, grid); break;
+        case 16: hc_launch<16>(a, s, one, grid); break;
         default: throw std::runtime_error("hc_read: T out of range");
     }
     ck_launch("hc_read");
 }
 
 void hc_preset_barrier(float* scratch, unsigned barriers_left) {
-    if (barriers_left == 0 || barriers_left > H_BAR_MOD / H_BLOCKS)
-        throw std::runtime_error("hc_preset_barrier: barriers_left must be 1.." + std::to_string(H_BAR_MOD / H_BLOCKS));
-    const unsigned v = H_BAR_MOD - barriers_left * (unsigned) H_BLOCKS;
+    const unsigned g = (unsigned) hc_grid(), mod = hc_bar_mod(g);
+    if (barriers_left == 0 || barriers_left > mod / g)
+        throw std::runtime_error("hc_preset_barrier: barriers_left must be 1.." + std::to_string(mod / g));
+    const unsigned v = mod - barriers_left * g;
     const cudaError_t e = cudaMemcpy(scratch + hc_scratch_floats(MAXT) - 1, &v, sizeof v, cudaMemcpyHostToDevice);
     if (e != cudaSuccess) throw std::runtime_error(std::string("hc_preset_barrier: ") + cudaGetErrorString(e));
 }

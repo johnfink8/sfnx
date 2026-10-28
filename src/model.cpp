@@ -99,7 +99,7 @@ void check_cards() {
     for (int dev = 0; dev < NCARD; ++dev) {
         cudaDeviceProp prop;
         ck(cudaGetDeviceProperties(&prop, dev), "cudaGetDeviceProperties");
-        require_card_arch(dev, prop.name, prop.major, prop.minor, prop.multiProcessorCount, FNX_ARCH, HC_READ_BLOCKS);
+        require_card_arch(dev, prop.name, prop.major, prop.minor, FNX_ARCH);
         const std::string bdf = card_bdf(dev), dir = "/sys/bus/pci/devices/" + bdf;
         require_identity_iommu(dev, dir);
         if (!skip_bar1) check_bar1(dev, bdf, dir, prop);

@@ -12,7 +12,7 @@ the verification and the settings.
 - **`src/`**: the engine. CUDA kernels and headers (`.cuh`), `engine.cu`, `prefill.cu`, `model.cpp`, `session.cpp`,
   `batch.cpp` (batched windows with drafts), `batch_plan.hpp` (their row plan), `card_split.hpp` (how a layer
   divides over the cards, for any supported count), `pf_ring_plan.hpp` (the prompt path's ring steps),
-  `card_check.hpp` (what a card must be for the build: arch, SMs, BAR1, checked as the model loads),
+  `card_check.hpp` (what a card must be for the build: arch, BAR1, checked as the model loads),
   `peer_probe.cu` / `.hpp` (every link written and watched before the engine uses it, and the report and failure text
   it prints). `kernels.cu`
   compiles as nine objects (`-DFNX_KPART=0..8`), each holding its share of the launchers.

@@ -98,6 +98,7 @@ static void route_from_logits(const float* logits, int T, int* topi, float* topw
 int main() {
     std::mt19937 rng(1);
     cudaSetDevice(2);
+    hc_prepare();
     for (int T : {1, 2, 3, 4, 5, 8, 16}) {
         {   // dense: card 2's qkvz (5 key heads: 5120 rows) and ssm_out (2560 x 1920), Q8_0; the f32 router and ab
             void* xq;

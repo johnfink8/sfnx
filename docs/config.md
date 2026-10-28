@@ -207,12 +207,11 @@ V100s, and `build/arch` records the one `build/` was made for (another rebuilds 
 | 70 | V100 | prod |
 | 86 | RTX 3090, A6000, A40 | run on RTX 3090s at a tester's; logits not yet checked ([docs/verification.md](verification.md#rtx-3090s)) |
 | 80, 89, 90, 100, 120 | A100; RTX 4090, L40S, RTX 6000 Ada; H100; B200; RTX 5090, RTX PRO 6000 Blackwell | every object compiles (nvcc 12.9); never run |
-| 75 | Turing | refused: the prompt path's recurrent kernel takes ~73 KB of shared memory a block, Turing gives 64 (and no Turing card has 80 SMs) |
+| 75 | Turing | refused: the prompt path's recurrent kernel takes ~73 KB of shared memory a block, Turing gives 64 |
 
 What a card must be beyond its arch is checked when the engine starts, not at build. As the model loads, the engine
 refuses a card that is not the build's arch exactly (the driver would otherwise compile the kernels' PTX for it at
-load, unchecked) or has fewer SMs than the hc read keeps resident (`HC_READ_BLOCKS` in `src/model.hpp`, 80: an RTX
-3080's 68, an RTX 4080's 76 and an A10's 72 are too few); before the first window it tries every link ([Boot
+load, unchecked); before the first window it tries every link ([Boot
 requirement](#boot-requirement)). On the arches that never ran, the one Volta-tuned instruction the experts use
 (`mma.sync.m8n8k4`, `src/moe_mma.cuh`) compiles, and NVIDIA's PTX documentation says it runs on later arches,
 possibly much slower: speed there is unknown until measured. llama.cpp's libraries are built for the same arch, and a
