@@ -23,7 +23,8 @@
   "FNX_MTP_EXPERTS": "q2_0",
   "FNX_EXPERT_RAM_GIB": "28",
   "FNX_EXPERT_PROFILE": "data/expert-routes.bin",
-  "FNX_KV8": "1"
+  "FNX_KV8": "1",
+  "FNX_ARENA_BASE_PAGES": "366"
  },
  "tokenizer": "data/tokenizer",
  "model_name": "qwen3.8-flash-next-ud-q4-k-xl-bench",
