@@ -4801,6 +4801,61 @@ def read_config(path) -> dict:
                          '"--ple-io", "mmap",) and that no entry is followed by a comma at the end of a list.') from None
 
 
+def check_config(path) -> None:
+    """SystemExit on what the front end would refuse at start with this config, before it loads anything: the JSON,
+    its keys, the engine's arguments as engine_args builds them, the sampling defaults, the engine's silence limit,
+    the context and rope scale given as numbers it takes, and the tokenizer, engine and vision files it names. `make
+    install` runs it (python -m front.check_config). The context's limit against the model's trained length needs the
+    model itself: the engine refuses that one when it starts."""
+    cfg = read_config(path)
+    if not isinstance(cfg, dict):
+        raise SystemExit(f"[sfnx] {path}: a config is a JSON object, not {type(cfg).__name__}")
+    check_config_keys(cfg, path)
+    checkout_paths(cfg)
+    for k in ("exe", "args"):
+        if k not in cfg:
+            raise SystemExit(f'[sfnx] {path}: no "{k}" (the engine to run and its arguments)')
+    args = engine_args(cfg)
+    try:
+        sampling_defaults_from_config(cfg)
+        engine_silence_s(cfg)
+    except ValueError as e:
+        raise SystemExit(f"[sfnx] {path}: {e}") from None
+
+    def arg(name):
+        return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else None
+
+    ctx = arg("--max-context")
+    if ctx is not None and not (ctx.isdigit() and int(ctx) > 0):
+        raise SystemExit(f"[sfnx] {path}: --max-context {ctx!r} is not a number of positions")
+    scales = {s for s in (arg("--rope-scale"), (cfg.get("env") or {}).get("FNX_ROPE_SCALE")) if s is not None}
+    if len(scales) > 1:
+        raise SystemExit(f"[sfnx] {path}: --rope-scale and env FNX_ROPE_SCALE disagree ({' / '.join(sorted(scales))})")
+    for s in scales:
+        try:
+            ok = math.isfinite(float(s)) and float(s) >= 1.0
+        except ValueError:
+            ok = False
+        if not ok:
+            raise SystemExit(f"[sfnx] {path}: rope scale {s!r}: want 1 (off) or a number above 1")
+    cwd = cfg["cwd"]
+    tok = Path(cfg.get("tokenizer") or "")
+    files = {f"tokenizer's {n}": tok / n for n in ("vocab.json", "merges.txt", "token_type.json")}
+    files["exe"] = Path(cwd) / cfg["exe"]
+    vision = cfg.get("vision") or {}
+    files.update({f"vision.{k}": Path(cwd) / vision[k] for k in ("exe", "cpu_exe", "mmproj", "model") if isinstance(vision.get(k), str)})
+    # the engine's own files, as it resolves them against cwd: the model's first shard, the draft layer's directory,
+    # the draft vocabulary
+    for flag in ("--native", "--draft-vocab"):
+        if arg(flag) is not None:
+            files[flag] = Path(cwd) / arg(flag)
+    missing = [f"{what} {p}" for what, p in files.items() if not p.is_file()]
+    if arg("--mtp") is not None and not (Path(cwd) / arg("--mtp")).is_dir():
+        missing.append(f"--mtp {Path(cwd) / arg('--mtp')}")
+    if missing:
+        raise SystemExit(f"[sfnx] {path}: missing {'; '.join(missing)}")
+
+
 # #1819: llama.cpp clients call the repetition penalty and its window repeat_penalty / repeat_last_n; they are the
 # same settings as repetition_penalty / penalty_last_n (the /props answer already reports them under those names)
 SAMPLING_ALIASES = {"repeat_penalty": "repetition_penalty", "repeat_last_n": "penalty_last_n"}

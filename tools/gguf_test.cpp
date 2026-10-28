@@ -1,8 +1,10 @@
 // Host-only test of the GGUF reader's header checks: writes tiny GGUF files, one valid and several malformed, and
-// expects the valid one to load and each malformed one to be refused with a message naming the tensor.
+// expects the valid one to load and each malformed one to be refused with a message naming the tensor; and the rotary
+// scaling a model's keys come to (model_rope), each llama.cpp reading of them followed or refused.
 // make bin/gguf_test && bin/gguf_test [DIR [MODEL.gguf ...]]   (DIR for the files, default /tmp; each MODEL, a real
-// model's first shard, must load too: only its headers are read)
+// model's first shard, must load too, with a rotary sFNX follows: only its headers are read)
 #include "../src/gguf.hpp"
+#include "../src/rope_gguf.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -12,8 +14,30 @@
 
 namespace {
 
+// metadata entries as GGUF lays them out: a string, a uint32 and a float32 key (types 8, 4 and 6)
+struct Kv {
+    std::vector<uint8_t> b;
+    uint64_t n = 0;
+    void put(const void* p, size_t len) { b.insert(b.end(), (const uint8_t*) p, (const uint8_t*) p + len); }
+    void key(const std::string& k, uint32_t type) {
+        const uint64_t len = k.size();
+        put(&len, 8);
+        put(k.data(), k.size());
+        put(&type, 4);
+        ++n;
+    }
+    void str(const std::string& k, const std::string& v) {
+        key(k, 8);
+        const uint64_t len = v.size();
+        put(&len, 8);
+        put(v.data(), v.size());
+    }
+    void u32(const std::string& k, uint32_t v) { key(k, 4); put(&v, 4); }
+    void f32(const std::string& k, float v) { key(k, 6); put(&v, 4); }
+};
+
 // one F32 tensor "w" with the given n_dims and sizes, its data at offset 0 of the data section, data_bytes of data
-std::vector<uint8_t> make(uint32_t n_dims, const std::vector<uint64_t>& ne, uint64_t data_bytes, uint64_t offset = 0) {
+std::vector<uint8_t> make(uint32_t n_dims, const std::vector<uint64_t>& ne, uint64_t data_bytes, uint64_t offset = 0, const Kv& kv = {}) {
     std::vector<uint8_t> b;
     auto put = [&](const void* p, size_t n) { b.insert(b.end(), (const uint8_t*) p, (const uint8_t*) p + n); };
     auto u32 = [&](uint32_t v) { put(&v, 4); };
@@ -21,7 +45,8 @@ std::vector<uint8_t> make(uint32_t n_dims, const std::vector<uint64_t>& ne, uint
     u32(0x46554747u);   // "GGUF"
     u32(3);             // version
     u64(1);             // tensors
-    u64(0);             // metadata keys
+    u64(kv.n);          // metadata keys
+    put(kv.b.data(), kv.b.size());
     const std::string name = "w";
     u64(name.size());
     put(name.data(), name.size());
@@ -80,6 +105,74 @@ int main(int argc, char** argv) {
         std::remove(path.c_str());
     }
 
+    {   // a model's YaRN keys as the loader reads them (Model, choose_rope): a string type, numbers in either width
+        Kv kv;
+        kv.str("a.rope.scaling.type", "yarn");
+        kv.f32("a.rope.scaling.factor", 4.0f);
+        kv.u32("a.rope.scaling.original_context_length", 32768);
+        const std::string path = write(dir, "keys", make(2, {8, 3}, 8 * 3 * 4, 0, kv));
+        try {
+            fnx::Gguf g(path);
+            const bool ok = g.has_key("a.rope.scaling.type") && g.s("a.rope.scaling.type") == "yarn" && g.num("a.rope.scaling.factor") == 4.0 &&
+                            g.num("a.rope.scaling.original_context_length") == 32768.0 && g.i("a.rope.scaling.original_context_length") == 32768 &&
+                            !g.has_key("a.rope.scaling.alpha");
+            std::printf("%s keys: string, float and integer metadata read back\n", ok ? "ok  " : "FAIL");
+            failures += !ok;
+        } catch (const std::runtime_error& e) {
+            std::printf("FAIL keys: %s\n", e.what());
+            ++failures;
+        }
+        std::remove(path.c_str());
+    }
+
+    {   // model_rope: what llama.cpp makes of the keys, followed (factor, orig) or refused (the message holds `refused`)
+        struct Case {
+            const char* tag;
+            void (*keys)(Kv&);
+            double factor;
+            int orig;
+            const char* refused;
+        };
+        const Case cases[] = {
+            {"rope_none_at_all", [](Kv&) {}, 0, 0, nullptr},
+            {"rope_yarn", [](Kv& k) { k.str("a.rope.scaling.type", "yarn"); k.f32("a.rope.scaling.factor", 4); k.u32("a.rope.scaling.original_context_length", 32768); }, 4, 32768, nullptr},
+            {"rope_yarn_no_orig", [](Kv& k) { k.str("a.rope.scaling.type", "yarn"); k.f32("a.rope.scaling.factor", 2); }, 2, 0, nullptr},
+            {"rope_yarn_factor_1", [](Kv& k) { k.str("a.rope.scaling.type", "yarn"); k.f32("a.rope.scaling.factor", 1); }, 0, 0, nullptr},
+            {"rope_none_with_factor", [](Kv& k) { k.str("a.rope.scaling.type", "none"); k.f32("a.rope.scaling.factor", 4); }, 0, 0, nullptr},
+            {"rope_linear_factor_1", [](Kv& k) { k.str("a.rope.scaling.type", "linear"); k.f32("a.rope.scaling.factor", 1); }, 0, 0, nullptr},
+            {"rope_yarn_default_betas", [](Kv& k) { k.str("a.rope.scaling.type", "yarn"); k.f32("a.rope.scaling.factor", 2); k.f32("a.rope.scaling.yarn_beta_fast", 32); }, 2, 0, nullptr},
+            // no type is linear to llama.cpp, so a bare factor scales linearly there
+            {"rope_bare_factor", [](Kv& k) { k.f32("a.rope.scaling.factor", 4); }, 0, 0, "llama.cpp takes that as linear"},
+            {"rope_bare_scale_linear", [](Kv& k) { k.f32("a.rope.scale_linear", 2); }, 0, 0, "llama.cpp takes that as linear"},
+            {"rope_linear_4", [](Kv& k) { k.str("a.rope.scaling.type", "linear"); k.f32("a.rope.scaling.factor", 4); }, 0, 0, "follows yarn only"},
+            {"rope_longrope", [](Kv& k) { k.str("a.rope.scaling.type", "longrope"); }, 0, 0, "rope scaling is longrope"},
+            {"rope_compress", [](Kv& k) { k.str("a.rope.scaling.type", "yarn"); k.f32("a.rope.scaling.factor", 0.5f); }, 0, 0, "compress"},
+            {"rope_beta_fast_16", [](Kv& k) { k.str("a.rope.scaling.type", "yarn"); k.f32("a.rope.scaling.factor", 2); k.f32("a.rope.scaling.yarn_beta_fast", 16); }, 0, 0, "yarn_beta_fast"},
+            {"rope_log_mul", [](Kv& k) { k.f32("a.rope.scaling.yarn_log_multiplier", 0.1f); }, 0, 0, "yarn_log_multiplier"},
+            {"rope_attn_factor", [](Kv& k) { k.f32("a.rope.scaling.attn_factor", 0.5f); }, 0, 0, "attn_factor"},
+            {"rope_section_order", [](Kv& k) { k.str("a.rope.section_order", "tzyx"); }, 0, 0, "section_order"},
+        };
+        for (const Case& c : cases) {
+            Kv kv;
+            c.keys(kv);
+            const std::string path = write(dir, c.tag, make(2, {8, 3}, 8 * 3 * 4, 0, kv));
+            std::string got;
+            bool ok;
+            try {
+                fnx::Gguf g(path);
+                const fnx::ModelRope r = fnx::model_rope(g, "a.");
+                got = "x" + std::to_string(r.yarn_factor) + " from " + std::to_string(r.yarn_orig);
+                ok = !c.refused && r.yarn_factor == c.factor && r.yarn_orig == c.orig;
+            } catch (const std::runtime_error& e) {
+                got = e.what();
+                ok = c.refused && std::strstr(e.what(), c.refused);
+            }
+            std::printf("%s %s: %s\n", ok ? "ok  " : "FAIL", c.tag, got.c_str());
+            failures += !ok;
+            std::remove(path.c_str());
+        }
+    }
+
     expect_refused(dir, "dims0", make(0, {}, 64), "0 dimensions");
     expect_refused(dir, "dims5", make(5, {1, 1, 1, 1, 1}, 64), "5 dimensions");
     expect_refused(dir, "dims_huge", make(0xffffffffu, {1}, 64), "4294967295 dimensions");
@@ -95,7 +188,8 @@ int main(int argc, char** argv) {
     for (int a = 2; a < argc; ++a) {
         try {
             fnx::Gguf g(argv[a]);
-            std::printf("ok   %s: loads\n", argv[a]);
+            const fnx::ModelRope r = fnx::model_rope(g, g.s("general.architecture") + ".");
+            std::printf("ok   %s: loads, rotary %s\n", argv[a], r.yarn_factor ? ("its own YaRN x" + std::to_string(r.yarn_factor)).c_str() : "unscaled");
         } catch (const std::runtime_error& e) {
             std::printf("FAIL %s: %s\n", argv[a], e.what());
             ++failures;

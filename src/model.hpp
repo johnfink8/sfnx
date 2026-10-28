@@ -193,7 +193,9 @@ struct Model {
     int64_t ple_eos = 0;
     int64_t ple_image = 0;   // what the PLE n-grams read for an image cell
     float eps = 1e-6f, rope_base = 1e7f;
-    int ctx_train = 0;   // the GGUF's context_length: the length the rotary was trained at (YaRN's n_ctx_orig)
+    int ctx_train = 0;   // the GGUF's context_length: the longest context the engine takes unscaled, and YaRN's n_ctx_orig
+    double yarn_factor = 0;   // the GGUF's own YaRN (rope.scaling.type yarn): its factor, 0 for none
+    int yarn_orig = 0;        // and its original_context_length, 0 when it names none (choose_rope, src/rope.hpp)
     int vocab = 0;
     // [NL][NEXP]: the routed experts in VRAM at the start (empty: all, no ExpertCache). FNX_EXPERT_RAM_GIB=G (default 3;
     // off: no cache) leaves the coldest G GiB of them (whole experts, all cards' slices) out, ranked by

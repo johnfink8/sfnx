@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -46,8 +47,13 @@ public:
     const Tensor* find(const std::string& name) const;
     // metadata of the first shard: integers, floats, strings, and integer arrays
     bool has(const std::string& key) const;
+    // any key of the first shard, whatever its type (has() answers only for the types read above)
+    bool has_key(const std::string& key) const { return keys_.count(key) != 0; }
     int64_t i(const std::string& key) const;
     double f(const std::string& key) const;
+    const std::string& s(const std::string& key) const;   // a string key
+    // a number key, integer or float, as GGUF writers differ on which
+    double num(const std::string& key) const { return ints_.count(key) ? (double) i(key) : f(key); }
     std::vector<int64_t> ia(const std::string& key) const;
     const std::map<std::string, Tensor>& tensors() const { return tensors_; }
     int shards() const { return (int) maps_.size(); }
@@ -62,6 +68,8 @@ private:
     std::map<std::string, int64_t> ints_;
     std::map<std::string, double> floats_;
     std::map<std::string, std::vector<int64_t>> int_arrays_;
+    std::map<std::string, std::string> strs_;
+    std::set<std::string> keys_;
     void load_shard(const std::string& path, bool meta);
 };
 

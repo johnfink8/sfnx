@@ -77,7 +77,8 @@ sudo systemctl start sfnx    # ~80 s to load; the API is on port 8080
 
 `serve/run.sh` runs the same config as a transient unit on port 8095; `serve/run.sh serve/sfnx-q8.json` the Q8_0
 build. For two cards: `make FNX_NCARD=2 -j32 bin/sfnx`, then `serve/run.sh serve/sfnx-2card.json` (a build refuses
-to start on any other number of cards). Engine settings, and the files they read: [docs/config.md](docs/config.md).
+to start on any other number of cards). A config of your own lives outside the checkout: `make install
+CONFIG=/etc/sfnx/sfnx.json` (or `~/sfnx.json`, any path) makes it the service's. Engine settings, and the files they read: [docs/config.md](docs/config.md).
 
 ## Layout
 

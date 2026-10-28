@@ -128,9 +128,11 @@ void Gguf::load_shard(const std::string& path, bool meta) {
     uint64_t align = 32;
     for (uint64_t i = 0; i < n_kv; ++i) {
         const std::string key = c.str();
+        if (meta) keys_.insert(key);
         const uint32_t vt = c.get<uint32_t>();
         if (vt == 8) {
-            c.str();
+            std::string v = c.str();
+            if (meta) strs_[key] = std::move(v);
         } else if (vt == 9) {
             const uint32_t et = c.get<uint32_t>();
             const uint64_t n = c.get<uint64_t>();
@@ -221,6 +223,11 @@ int64_t Gguf::i(const std::string& key) const {
 double Gguf::f(const std::string& key) const {
     auto it = floats_.find(key);
     if (it == floats_.end()) throw std::runtime_error("gguf: no float key " + key);
+    return it->second;
+}
+const std::string& Gguf::s(const std::string& key) const {
+    auto it = strs_.find(key);
+    if (it == strs_.end()) throw std::runtime_error("gguf: no string key " + key);
     return it->second;
 }
 std::vector<int64_t> Gguf::ia(const std::string& key) const {

@@ -87,13 +87,19 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--conversation-cache-mib") a.cache_mib = std::stol(val());
         else if (k == "--batch") a.batch = std::stoi(val());
         else if (k == "--layer-split") val();   // Strata's layer split; sFNX splits every layer across the cards
-        else if (k == "--rope-scale") ::setenv("FNX_ROPE_SCALE", val().c_str(), 1);   // YaRN for a longer context
+        else if (k == "--rope-scale") {   // YaRN for a longer context: the engine reads it as FNX_ROPE_SCALE
+            const std::string s = val();
+            if (const char* e = std::getenv("FNX_ROPE_SCALE"); e && s != e)
+                throw std::runtime_error("--rope-scale " + s + " and FNX_ROPE_SCALE=" + e + " disagree");
+            ::setenv("FNX_ROPE_SCALE", s.c_str(), 1);
+        }
         else if (k == "--vision") a.vision = true;
         else throw std::runtime_error("unknown argument " + k);
     }
     if (!serve) throw std::runtime_error("sfnx runs as --serve");
     if (a.gguf.empty() || a.mtp_dir.empty()) throw std::runtime_error("--native and --mtp are required");
     if (a.batch < 1 || a.batch > MAX_SLOTS) throw std::runtime_error("--batch must be 1.." + std::to_string(MAX_SLOTS));
+    fnx::rope_scale();   // a bad scale stops here, not after the minute of loading (the context's limit needs the model)
     return a;
 }
 

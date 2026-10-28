@@ -33,6 +33,9 @@ BatchDrafts batch_drafts();
 // FNX_RING_F32: decode's sums between cards as fp32 (true) or fp16 pairs; default fp32 on two cards, fp16 on three.
 // Read at each call (an Engine reads it when it is made; the lab's identity records reads it too); not 0 or 1 throws
 bool ring_f32();
+// FNX_ROPE_SCALE=S: YaRN over the trained length, so the context can reach trained x S; 0 when it is not set or 1.
+// Read at each call like ring_f32 (the Engine and the lab's identity record); anything else not above 1 throws
+double rope_scale();
 
 class Engine {
 public:
@@ -182,10 +185,10 @@ public:
 private:
     Model& m_;
     int max_ctx_, pos_ = 0;
-    // rope scaling set at engine construction (before any graph capture: the constants ride into the graphs as
-    // kernel arguments). rope_of hands a kernel the constants with that call's M-RoPE table
-    Rope rope_scaled_;
-    Rope rope_of(const int* tab) const { Rope r = rope_scaled_; r.tab = tab; return r; }
+    // the rotary's constants, YaRN's included when scaled, set at construction (before any graph capture: they ride
+    // into the graphs as kernel arguments). rope_of hands a kernel them with that call's M-RoPE table
+    Rope rope_;
+    Rope rope_of(const int* tab) const { Rope r = rope_; r.tab = tab; return r; }
     unsigned tag_ = 1;            // the current lane's last window tag (its parity: the recurrent history half)
     unsigned tag_max_ = 1;        // the largest tag any window has used (tags rise across lanes: the ring sums tell
                                   // windows apart by them)

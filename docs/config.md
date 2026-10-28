@@ -13,12 +13,22 @@ lands off by default until the GPU checks pass ([docs/verification.md](verificat
 | `serve/sfnx-gap.json` | a check config: prod's 262k context with a 440-page own pool (`FNX_ARENA_BASE_PAGES`), so reads and decodes lend |
 | `serve/sfnx-pool.json` | a check config: 32k context, `--spec 4`, `--lookup 7`, no env of its own — the arena is on, only the context is small |
 | `serve/sfnx-2card.json` | two cards (`"gpu": [0, 1]`), for an engine built with `make FNX_NCARD=2`: prod's settings without vision, a 32 GiB conversation cache, port 8095. The engine puts as many experts in RAM as the cards need at start; fp32 sums between the cards ([docs/benchmarks.md](benchmarks.md#two-cards-and-one-card)) |
-| `serve/sfnx.service.in` | the systemd unit's template: `make install` fills in the checkout (`@ROOT@`) and whoever runs it (`@USER@`, `@GROUP@`) and writes `/etc/systemd/system/sfnx.service`. It overrides the config's port with `--port 8080` |
+| `serve/sfnx.service.in` | the systemd unit's template: `make install` fills in the checkout (`@ROOT@`), the config (`@CONFIG@`: `serve/sfnx.json`, or `make install CONFIG=path`) and whoever runs it (`@USER@`, `@GROUP@`) and writes `/etc/systemd/system/sfnx.service`. It overrides the config's port with `--port 8080` |
 | `serve/run.sh [CONFIG]` | the same as a transient unit on the config's own port (8095 for `sfnx.json`), with `LimitMEMLOCK` raised |
 
 Every path in these configs is relative to the checkout — `cwd` is `.`, the engine is `bin/sfnx`, the log is
 `serve/sfnx.log` — so a second worktree serves from its own tree. The GGUFs come through a `models` link in the
 checkout, pointing at the folder holding `UD-Q4_K_XL/`, `Q8_0/` and `mmproj-F16.gguf`.
+
+**Your own config.** Keep it outside the checkout (`/etc/sfnx/sfnx.json` or `~/sfnx.json`, any path the service's
+user can read), starting from a copy of `serve/sfnx.json`: its relative paths still resolve against the checkout,
+wherever the file lives, so a pull never conflicts with it. `serve/run.sh /etc/sfnx/sfnx.json` tries it;
+`make install CONFIG=/etc/sfnx/sfnx.json` makes it the service's from its next restart
+(`sudo systemctl restart sfnx`), after checking it as a start would before touching the cards: its JSON and keys, the
+sampling values, and the tokenizer, engine and vision files it names (`python -m front.check_config FILE` runs the same
+check alone). A link stays a link, so repointing it switches configs at the next restart. The path may hold letters,
+digits and `. _ / + -` only, as the unit's `ExecStart` takes it as is. The repository's configs are this
+box's prod and the checks'.
 
 Engine arguments in the JSON: `--native` (the model's first shard), `--mtp` (the draft layer's runtime files),
 `--draft-vocab`, `--max-context`, `--spec` (draft tokens a round), `--lookup` (the longest n-gram draft), `--batch`
@@ -76,6 +86,14 @@ The ones that change results or are worth knowing. The rest are kernel-level tun
 | Setting | Effect |
 | --- | --- |
 | `FNX_RING_F32=0` or `1` | decode's sums between cards as fp16 pairs (0) or fp32 (1); the prompt path's stay fp16. Default 0 on three cards (fp32 took the code prompt's KL from 5.75e-4 to 4.38e-4, and is slower) and 1 on two, where fp16 pairs leave code and edit 1.25x over the exactness bar (code 7.48e-4 against 6.06e-4; fp32 5.73e-4) and fp32 costs ~30% of one request's decode (lab: new code 141 → 98 tok/s, prose 113 → 90) |
+
+**Context past the trained 262,144**
+
+| Setting | Effect |
+| --- | --- |
+| `FNX_ROPE_SCALE=S` (`--rope-scale S` in a config's args) | YaRN over the trained length, as llama.cpp's: `--max-context` may reach the GGUF's `context_length` (262,144) × S, and the engine refuses more — and more than 262,144 unscaled. Off by default (1 is off too). It changes the rotary at every position, so it costs some quality on every request, short ones included ([docs/verification.md](verification.md#rope-scaling)): set it only when the length is needed. The K/V pool does not grow with it ([docs/memory.md](memory.md)) |
+| `FNX_YARN_ORIG_CTX=N` | the trained length YaRN scales from in place of the GGUF's `context_length`; only with `FNX_ROPE_SCALE` |
+| (the GGUF's own YaRN) | a model whose GGUF sets `rope.scaling.type` yarn runs scaled by its `factor` from its `original_context_length` with no setting, as llama.cpp runs it; `FNX_ROPE_SCALE` and `FNX_YARN_ORIG_CTX` may repeat those values and are refused if they differ (`FNX_YARN_ORIG_CTX` past the trained length is refused too). A rotary sFNX cannot follow is refused at load (`src/rope_gguf.hpp`, tested by `bin/gguf_test`): another scaling type with a factor that scales — a factor with no type included, which llama.cpp takes as linear — llama.cpp's other rope keys at values that are not its defaults, a section order other than tyxz, a `rope_freqs` table |
 
 **The lab**
 

@@ -81,11 +81,11 @@ done.
 
 | Check | What it proves | How it fails |
 | --- | --- | --- |
-| `lab.sh exact` | logits within the bar against llama.cpp CUDA (code, edit, a 62k prompt, the logo picture), byte for byte against the base, 1 / 2 / 3 / 11 / 16-row windows identical to 5-row ones | `FAIL: ...`, exit 1 |
+| `lab.sh exact` | logits within the bar against llama.cpp CUDA (code, edit, a 62k prompt, the logo picture), byte for byte against the base, 1 / 2 / 3 / 11 / 16-row windows identical to 5-row ones. With `FNX_ROPE_SCALE` the llama.cpp comparison is against a scaled teacher and measured, not held to the bar (docs/verification.md, "Rope scaling") | `FAIL: ...`, exit 1 |
 | `lab.sh exact base` | writes a new base, only when every prompt passes; `MODEL-base.id` records the build | `NOT written`, exit 1 |
 | `lab.sh batch` | batched windows (with their drafts) give each lane its tokens alone | MISMATCH, exit 1 |
 | `bin/sample_test` | speculative sampling matches plain sampling in distribution | MISMATCH, exit 1 |
-| `bin/topk_test`, `bin/batch_plan_test`, `bin/sfnx_input_test` | the top-k ties, the batched row planner, the engine's stdin handling (the last two CPU only) | non-zero exit |
+| `bin/topk_test`, `bin/batch_plan_test`, `bin/sfnx_input_test`, `bin/rope_test` | the top-k ties, the batched row planner, the engine's stdin handling, YaRN's constants against ggml's (the last three CPU only) | non-zero exit |
 | `serve/api_smoke.py`, `serve/image_test.py` | the API surface and pictures through the front end | `N failed` |
 | `.venv/bin/python -m pytest -q front/` | the front end (CPU only) | pytest |
 
@@ -95,9 +95,9 @@ new one.
 ## Deploying
 
 The service runs from this checkout (`serve/sfnx.json`, `serve/sfnx.service.in`, port 8080; `make install` installs the
-unit). After merging to master: stop the unit, `make -j32 lab bin/sfnx`, start it (~60 s warm), then
+unit, `make install CONFIG=path` with another config, kept outside the checkout). After merging to main: stop the unit, `make -j32 lab bin/sfnx`, start it (~60 s warm), then
 `serve/api_smoke.py http://127.0.0.1:8080`, `serve/image_test.py http://127.0.0.1:8080/v1` and
-`serve/solo_decode.sh`. Rollback: the previous master commit, rebuilt the same way.
+`serve/solo_decode.sh`. Rollback: the previous main commit, rebuilt the same way.
 
 ## Conventions
 
