@@ -1,9 +1,10 @@
 # fnx build: CUDA 12.9, sm_70, gcc-14
 #   make            the engine and the picture encoder (bin/sfnx, bin/sfnx-vision; llama.cpp's libraries first if missing)
-#   make install    the systemd unit (serve/sfnx.service.in for this checkout and user, port 8080), enabled at boot
+#   make install    the systemd unit (serve/sfnx.service.in for this checkout and user, port 8080), enabled at boot;
+#                   CONFIG=path runs that config instead of serve/sfnx.json (it may live outside the checkout)
 #   make test-bin   the test programs (bin/fnx_run, bin/batch_test, bin/cache_test, bin/sample_test, bin/gguf_test,
 #                   bin/topk_test, bin/sfnx_input_test, bin/batch_plan_test, bin/stage_test,
-#                   bin/pf_ring_plan_test)
+#                   bin/pf_ring_plan_test, bin/rope_test)
 #   make ref        llama.cpp's reference tools (ref/fnx_ref, ref/fnx_logref, ref/img_logref, ref/mmid_bench)
 #   make trace      the CUPTI kernel tracer for `tools/lab.sh trace` and the *_trace.sh scripts
 #   LLAMA=path      llama.cpp at a37cc46 somewhere other than ./llama.cpp
@@ -21,12 +22,25 @@ MAKEFLAGS += --no-builtin-rules
 .SUFFIXES:
 build: bin/sfnx bin/sfnx-vision
 test-bin: bin/fnx_run bin/batch_test bin/cache_test bin/sample_test bin/gguf_test bin/topk_test bin/sfnx_input_test bin/batch_plan_test \
-          bin/stage_test bin/pf_ring_plan_test
+          bin/stage_test bin/pf_ring_plan_test bin/rope_test
+CONFIG ?= serve/sfnx.json
+# The config is checked as the front end checks it before loading anything (front.check_config), so a config it would
+# refuse stops the install rather than a boot; what needs the model (the context against its trained length) the engine
+# refuses when it starts. Its path is made absolute but a link is kept a link (repointing it then
+# switches configs at the next restart), and it may hold only what sed and systemd's ExecStart take as is. The unit is
+# written whole to build/ first and moved into place only once nothing in it is left unfilled.
 install: build
-	sed -e "s|@ROOT@|$(CURDIR)|g" -e "s|@USER@|$$(id -un)|" -e "s|@GROUP@|$$(id -gn)|" serve/sfnx.service.in \
-	    | sudo tee /etc/systemd/system/sfnx.service > /dev/null
+	cfg=$$(realpath -s "$(CONFIG)") && [ -f "$$cfg" ] || { echo "install: no config $(CONFIG)" >&2; exit 1; }; \
+	for p in "$$cfg" "$(CURDIR)"; do case "$$p" in *[!A-Za-z0-9._/+-]*) \
+	    echo "install: $$p has characters a unit's ExecStart cannot hold as is (letters, digits, . _ / + - only)" >&2; exit 1;; esac; done; \
+	.venv/bin/python -m front.check_config "$$cfg" && \
+	sed -e "s|@ROOT@|$(CURDIR)|g" -e "s|@CONFIG@|$$cfg|" -e "s|@USER@|$$(id -un)|" -e "s|@GROUP@|$$(id -gn)|" \
+	    serve/sfnx.service.in > build/sfnx.service && \
+	if grep -n '@[A-Z]*@' build/sfnx.service; then echo "install: build/sfnx.service has unfilled fields" >&2; exit 1; fi && \
+	sudo install -m 644 build/sfnx.service /etc/systemd/system/sfnx.service
 	sudo systemctl daemon-reload
 	sudo systemctl enable sfnx
+	@echo "install: the unit runs $(CONFIG); a running sfnx keeps its old config until sudo systemctl restart sfnx"
 
 NVCC := /usr/local/cuda/bin/nvcc
 # llama.cpp at a37cc46 (its ggml headers; its libraries for the picture encoder): a checkout in llama.cpp/, or LLAMA=path
@@ -42,7 +56,7 @@ $(if $(filter 2 3 4 6 8,$(FNX_NCARD)),,$(error FNX_NCARD: 2, 3, 4, 6 or 8 (the 2
 NVFLAGS += -DFNX_NCARD=$(FNX_NCARD)
 $(shell mkdir -p build && { [ "$$(cat build/ncard 2>/dev/null)" = "$(FNX_NCARD)" ] || echo $(FNX_NCARD) > build/ncard; })
 
-bin/gguf_test: tools/gguf_test.cpp src/gguf.cpp src/gguf.hpp
+bin/gguf_test: tools/gguf_test.cpp src/gguf.cpp src/gguf.hpp src/rope_gguf.hpp
 	mkdir -p bin && g++-14 -O2 -std=c++17 -o $@ tools/gguf_test.cpp src/gguf.cpp
 bin/stage_test: tools/stage_test.cpp src/gguf.cpp src/gguf.hpp
 	mkdir -p bin && g++-14 -O2 -std=c++17 -o $@ tools/stage_test.cpp src/gguf.cpp -lpthread
@@ -54,6 +68,9 @@ bin/batch_plan_test: tools/batch_plan_test.cpp src/batch_plan.hpp
 # the prompt path's ring plan against the two- and three-card sequences, and every supported count's sum, on the CPU
 bin/pf_ring_plan_test: tools/pf_ring_plan_test.cpp src/pf_ring_plan.hpp src/card_split.hpp src/model.hpp src/gguf.hpp build/ncard
 	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -DFNX_NCARD=$(FNX_NCARD) -o $@ tools/pf_ring_plan_test.cpp
+# YaRN's band, angles and magnitude against ggml's, on the CPU alone
+bin/rope_test: tools/rope_test.cpp src/rope.hpp
+	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -o $@ tools/rope_test.cpp
 
 # one object per source in build/ (headers tracked by nvcc's own dependency files), so a change recompiles only the
 # objects it touches; every engine program and the lab's library link the same objects (position independent).
@@ -131,9 +148,9 @@ bin/sfnx-vision: vision/sfnx_vision.cpp vision/*.h $(LU)/build/bin/libmtmd.so
 
 # the llama.cpp reference tools (ref/): logits and tensor dumps the exactness checks compare against
 LLFLAGS = -O2 -std=c++17 -I$(LU)/include -I$(GG)/include -L$(LU)/build/bin -Wl,-rpath,$(LU)/build/bin
-ref/fnx_ref ref/fnx_logref: ref/%: ref/%.cpp $(LU)/build/bin/libmtmd.so
+ref/fnx_ref ref/fnx_logref: ref/%: ref/%.cpp ref/logref_yarn.hpp src/env.hpp $(LU)/build/bin/libmtmd.so
 	g++-14 $(LLFLAGS) -o $@ $< -lllama -lggml -lggml-base
-ref/img_logref: ref/img_logref.cpp $(LU)/build/bin/libmtmd.so
+ref/img_logref: ref/img_logref.cpp ref/logref_yarn.hpp src/env.hpp $(LU)/build/bin/libmtmd.so
 	g++-14 $(LLFLAGS) -I$(LU)/tools/mtmd -o $@ $< -lmtmd -lllama -lggml -lggml-base
 ref/mmid_bench: ref/mmid_bench.cpp $(LU)/build/bin/libmtmd.so
 	g++-14 $(LLFLAGS) -o $@ $< -lggml -lggml-base -lggml-cuda

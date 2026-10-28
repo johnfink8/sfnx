@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "llama.h"
+#include "logref_yarn.hpp"
 #include "mtmd-helper.h"
 #include "mtmd.h"
 
@@ -153,6 +154,7 @@ int main(int argc, char** argv) {
 
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx = (uint32_t) (cells.size() + N + 64);
+        apply_yarn(cp);   // a scaled build's picture teacher
         cp.n_batch = cp.n_ubatch = 512;
         llama_context* ctx = llama_init_from_model(model, cp);
         if (!ctx) return 1;

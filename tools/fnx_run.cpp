@@ -352,9 +352,17 @@ static std::string loaded_code() {
     }
     return file_line(path);
 }
-// what the logits depend on besides the model and the code's sums: the card count it was built for and decode's ring
-static std::string build_line(int ncard, bool f32) {
-    return "build ncard " + std::to_string(ncard) + " ring " + (f32 ? "fp32" : "fp16-pairs");
+// what the logits depend on besides the model and the code's sums: the card count it was built for, decode's ring and
+// rope scaling (named only when on, so an unscaled build's line is the one its bases recorded)
+static std::string build_line(int ncard, bool f32, double rope_scale = 0.0) {
+    std::string l = "build ncard " + std::to_string(ncard) + " ring " + (f32 ? "fp32" : "fp16-pairs");
+    if (rope_scale) {
+        char s[64];
+        std::snprintf(s, sizeof s, " rope yarn x%.9g", rope_scale);
+        l += s;
+        if (const char* o = std::getenv("FNX_YARN_ORIG_CTX")) l += std::string(" orig ") + o;
+    }
+    return l;
 }
 static std::string run_identity(const char* model) {
     std::string id;
@@ -369,7 +377,7 @@ static std::string run_identity(const char* model) {
     }
     while (!rev.empty() && (rev.back() == '\n' || rev.back() == ' ')) rev.pop_back();
     id += "tree " FNX_DIR " " + rev + "\n";
-    id += build_line(fnx::NCARD, fnx::ring_f32()) + "\n";
+    id += build_line(fnx::NCARD, fnx::ring_f32(), fnx::rope_scale()) + "\n";
     std::vector<std::string> env;
     for (char** e = environ; *e; ++e)
         if (!std::strncmp(*e, "FNX_", 4)) env.emplace_back(*e);
@@ -736,9 +744,11 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
         std::string theirs = id_line(base_id, "build");
         if (theirs.empty()) theirs = build_line(3, id_line(base_id, "env").find(" FNX_RING_F32=1") != std::string::npos);
         if (theirs != id_line(me, "build")) {
+            const char* rs = std::getenv("FNX_ROPE_SCALE");
             std::printf("exact: the base in %s is another build's (%s; this one: %s): give this build a lab directory of its own, "
-                        "FNX_LAB_DIR=/tmp/fnx-lab-%u-%dcard\n",
-                        dir.c_str(), theirs.c_str(), id_line(me, "build").c_str(), (unsigned) getuid(), fnx::NCARD);
+                        "FNX_LAB_DIR=/tmp/fnx-lab-%u-%dcard%s%s\n",
+                        dir.c_str(), theirs.c_str(), id_line(me, "build").c_str(), (unsigned) getuid(), fnx::NCARD, rs ? "-yarn" : "",
+                        rs ? rs : "");
             return 1;
         }
     }
@@ -776,7 +786,24 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
         }
         const std::string prompt = pic ? "ref/img/sphinx.bin" : std::string("ref/") + p + ".bin",
                           tag = long64 ? "" : std::string("-") + p;
+        // a scaled build is held to llama.cpp run with the same scaling (ref/fnx_logref and ref/img_logref read the same
+        // settings), else the comparison measures the rope change itself; the file names the scale, the trained length
+        // it scales from when set, and the model unless it is Q4's
+        const double scale = fnx::rope_scale();
+        std::string scaled_env, yarn_tag;
+        if (scale) {
+            char s[64];
+            std::snprintf(s, sizeof s, "%.9g", scale);
+            scaled_env = std::string("FNX_ROPE_SCALE=") + s + " ";
+            yarn_tag = std::string("llama_yarn_") + s;
+            if (const char* oc = std::getenv("FNX_YARN_ORIG_CTX")) {
+                scaled_env += std::string("FNX_YARN_ORIG_CTX=") + oc + " ";
+                yarn_tag += std::string("_orig") + oc;
+            }
+            if (!q4) yarn_tag += "_" + stem;
+        }
         std::string llama_s = long64 && std::getenv("FNX_EXACT_REF") ? std::getenv("FNX_EXACT_REF")
+                              : scale                                ? "ref/lgr/" + yarn_tag + "_" + p + ".lgr"
                               : pic                                  ? "ref/img/sphinx.lgr"
                               : q4                                   ? "ref/lgr/llama_cuda_" + std::string(p) + ".lgr"
                               : q8                                   ? "ref/lgr/llama_cpu_q8w_" + std::string(p) + ".lgr"
@@ -784,12 +811,14 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
         if (std::FILE* f = std::fopen(llama_s.c_str(), "rb")) std::fclose(f);
         else {
             if (pic)
-                std::fprintf(stderr, "exact: no llama.cpp reference %s for %s; make it with\n  ref/img_logref %s MMPROJ.gguf "
-                             "ref/img/sphinx.png 'What does this picture show? Answer in two sentences.' 200 ref/img/sphinx\n",
-                             llama_s.c_str(), stem.c_str(), argv[1]);
+                std::fprintf(stderr, "exact: no llama.cpp reference %s for %s; make it with\n  %sref/img_logref %s MMPROJ.gguf "
+                             "ref/img/sphinx.png 'What does this picture show? Answer in two sentences.' 200 %s\n",
+                             llama_s.c_str(), stem.c_str(), scaled_env.c_str(), argv[1],
+                             scale ? llama_s.substr(0, llama_s.size() - 4).c_str() : "ref/img/sphinx");
             else
-                std::fprintf(stderr, "exact: no llama.cpp reference %s for %s; make it with\n  ref/fnx_logref %s %s %d %s\n",
-                             llama_s.c_str(), stem.c_str(), argv[1], prompt.c_str(), long64 ? 200 : 300, llama_s.c_str());
+                std::fprintf(stderr, "exact: no llama.cpp reference %s for %s; make it with\n  %sref/fnx_logref %s %s %d %s\n",
+                             llama_s.c_str(), stem.c_str(), scaled_env.c_str(), argv[1], prompt.c_str(), long64 ? 200 : 300,
+                             llama_s.c_str());
             std::printf("exact %s %s: FAIL: no llama.cpp reference %s\n", name.c_str(), p, llama_s.c_str());
             rc = 1;
             continue;
@@ -815,8 +844,17 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
         load_lgr(out, mine);
         const LgrCmp vs_llama = lgr_compare(ref, mine);
         std::printf("  vs llama.cpp %s: %s\n", q8 ? "CPU" : "CUDA", vs_llama.str().c_str());
-        if (!q4 && !q8) fail("no documented bar for " + stem + ": the numbers above are not judged");
-        else if (const std::string why = breach(p, vs_llama); !why.empty()) fail("outside the exactness bar: " + why);
+        if (!std::isfinite(vs_llama.kl_mean)) fail("KL is not a number: one side's logits are broken");
+        else if (!q4 && !q8) fail("no documented bar for " + stem + ": the numbers above are not judged");
+        else if (scale) {
+            // YaRN moves the model's own outputs (docs/verification.md, "Rope scaling"), and llama.cpp's backends part
+            // differently under it, so the bar is not held here: only a port that is plainly broken fails, at 10x the
+            // bar's KL or 5 points of top-1 under it. The byte-for-byte base comparison below still judges
+            std::printf("  scaled: measured against a scaled llama.cpp, not held to the bar\n");
+            for (const Bar& b : BARS)
+                if (p == std::string(b.prompt) && (vs_llama.kl_mean > 10 * b.kl_mean || vs_llama.top1_pct() < b.top1_pct - 5))
+                    fail("far outside the bar for a scaled build (10x its KL or 5 points of top-1): a broken port, not YaRN's shift");
+        } else if (const std::string why = breach(p, vs_llama); !why.empty()) fail("outside the exactness bar: " + why);
         verdicts += std::string("llama.cpp ") + p + " " + vs_llama.str() + "\n";
         if (std::string(p) == "code1" || std::string(p) == "edit1")
             for (int T : {1, 2, 3, 11, 16}) {

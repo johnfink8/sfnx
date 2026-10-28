@@ -1,5 +1,6 @@
 #include "model.hpp"
 #include "env.hpp"
+#include "rope_gguf.hpp"
 
 #include "store.hpp"
 
@@ -860,6 +861,18 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
     }
     eps = (float) g.f(p + "attention.layer_norm_rms_epsilon");
     rope_base = (float) g.f(p + "rope.freq_base");
+    // the trained length bounds the context (Engine refuses past it, or past it x FNX_ROPE_SCALE), so a model must name it
+    {
+        const int64_t n = g.i(p + "context_length");
+        if (n <= 0 || n > INT32_MAX) throw std::runtime_error("fnx: " + p + "context_length " + std::to_string(n) + " is not a context length");
+        ctx_train = (int) n;
+    }
+    // the model's own rotary scaling, which Engine runs by default (choose_rope); what sFNX cannot follow throws here
+    {
+        const ModelRope mr = model_rope(g, p);
+        yarn_factor = mr.yarn_factor;
+        yarn_orig = mr.yarn_orig;
+    }
     tok_embd = &g.t("token_embd.weight");
     ple_table = &g.t("per_layer_token_embd.weight");
     if (tok_embd->type != T_Q8_0) throw std::runtime_error("fnx: token_embd.weight is not Q8_0 (the host's embedding reads Q8_0)");

@@ -123,6 +123,51 @@ there. Six cards put four key heads on two cards each, and eight give each card 
 wide); a count that fails where four passes points at those. Above three cards the engine says at start that the
 count has not run on hardware yet.
 
+## Rope scaling
+
+`FNX_ROPE_SCALE=S` ([docs/config.md](config.md)) is llama.cpp's YaRN, so a scaled build is compared with llama.cpp
+run with the same scaling: `ref/fnx_logref` and `ref/img_logref` read `FNX_ROPE_SCALE` and `FNX_YARN_ORIG_CTX` by the
+engine's rules, and with them set `exact` compares against `ref/lgr/llama_yarn_S[_origN][_MODEL]_PROMPT.lgr` (its
+hint for a missing one carries the setting). A scaled build's lab identity names the scaling, so it needs a lab
+directory of its own, as another card count does; without the setting the identity, the logits and the speed are an
+unscaled build's, byte for byte.
+
+**A scaled build is measured, not held to the bar.** YaRN moves the model's own outputs (below), and llama.cpp's
+backends part more under it — its CPU against its CUDA on code: 3.47e-4 scaled, 4.85e-4 not — so `exact` prints the
+scaled comparison as "measured, not held to the bar" and fails only a port that is plainly broken: 10× the bar's KL,
+5 points of top-1 under it, or a KL that is not a number. Byte for byte against the scaled build's own base still
+judges, so `exact base` works for it as for any build.
+
+**The ramp is checked on the CPU; the long prompt shows it.** On a ~1k-token prompt the dimensions YaRN rescales
+hardly turn, so a wrong ramp scores the same there: at YaRN×2 the right one gave code 6.60e-4 and a ramp moved by 1.4
+dimensions (`FNX_YARN_ORIG_CTX=131072`) 6.09e-4. On the 62k prompt they part: 1.88e-3 for the right one, 4.44e-3 for
+the moved one (unscaled sFNX against unscaled llama.cpp there: 2.31e-3). `bin/rope_test` pins the band, every pair's
+angle and the magnitude against ggml's formulas, the moved ramp as its counter-case.
+
+| YaRN×2 against llama.cpp CUDA YaRN×2 | Top-1 agrees | KL mean |
+| --- | --- | --- |
+| Code, 300 steps | 99.00% | 6.60e-4 (llama.cpp CPU YaRN×2 against it: 3.47e-4) |
+| Code edit, 300 steps | 100.00% | 5.10e-6 |
+| 62k prompt, 200 steps | 97.50% | 1.88e-3 |
+| The logo picture, 200 steps (teacher: `ref/img_logref` with the scaling) | 99.50% | 5.49e-3 (unscaled: 99.00% / 5.96e-3) |
+
+Batched windows (`lab.sh batch`, YaRN×2) give each lane its tokens alone,
+at the unscaled window times: six lanes 19.31 ms a window against 19.16, one lane 11.60 against 11.61. One run by hand
+(no script in the repository): six concurrent 807k-token prompts at YaRN×4 and a 1,048,576 context each found a code
+planted at their top, reads of 466–508 s (~1,650 tok/s) one after another.
+
+**What scaling costs.** It changes every position's rotary, so outputs move at any length. llama.cpp with the scaling
+against itself without, teacher-forced on the same tokens:
+
+| | Code, top-1 / KL | Code edit, KL | 62k prompt, top-1 / KL |
+| --- | --- | --- | --- |
+| YaRN×2 | 99.67% / 8.2e-4 | 5.1e-6 | 98.0% / 7.2e-3 |
+| YaRN×4 | 99.00% / 1.8e-3 | 5.0e-6 | 98.0% / 1.6e-2 |
+| for scale: llama.cpp CPU against CUDA (62k: sFNX against llama.cpp) | 98.33% / 4.9e-4 | 4.1e-6 | 97.5% / 2.3e-3 |
+
+The picks barely move; the distributions move by a few times the backends' own difference, more with S and with
+length, and an edit not at all.
+
 ## The test inventory
 
 | What | How |
@@ -137,6 +182,7 @@ count has not run on hardware yet.
 | Batched drafts' sampler against plain sampling, in distribution (3 lanes, open1, 600 seeds: every p ≥ 0.34) | `SAMPLE_TEST_LANES=3 bin/sample_test` |
 | The batched-draft row plan against a brute force over every split | `bin/batch_plan_test` |
 | The prompt path's ring steps: two and three cards' sequences, and consecutive sums over both buffer sets on every supported count (CPU) | `bin/pf_ring_plan_test` |
+| YaRN's band, per-pair angles and magnitude against ggml's formulas, and the settings it refuses | `bin/rope_test` |
 | The top-k ties | `bin/topk_test` |
 | The engine's stdin handling | `bin/sfnx_input_test` |
 | The conversation cache where prompts share much: two conversations alternating on a lane, a system prompt changed near its end | `tools/lab.sh cmd cache2` |

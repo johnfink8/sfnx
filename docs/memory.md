@@ -21,7 +21,8 @@ The arena is on unless something turns it off: `serve/sfnx.json` sets nothing fo
   the same.
 - When a lane needs pages the free list lacks, the pool lends the next slots — at least 64 pages at a time, with every
   card idle for it, 0.1–1.3 ms. Their experts point back at their copies in page-locked RAM, and a window that picks
-  one copies it into a slot first, as the Q8_0 build does. The pool can grow to ~2.9M positions.
+  one copies it into a slot first, as the Q8_0 build does. The pool can grow to ~3.5M positions (3,550,464 free on three
+  cards at 262k, vision on; the engine prints it at start).
 - Slots come back once the top pages are free and no lend came in 30 s, refilled at once with the hottest experts that
   are out. While experts are lent, a lane idle for 120 s is parked to host memory to free its pages. With nothing lent,
   every expert is in a slot and the windows skip the cache's kernels.

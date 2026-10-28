@@ -964,10 +964,10 @@ void Engine::prefill_draft(int C, int set) {
         } else {
             pf_dense(p, L.idx_qk.s, qsa_rows(), N, p.mixed, C, p.yidx, qsa_rows(), s);
         }
-        qsa_index(p.yidx, L.idx_qn, L.idx_kn, b.mtp_qsa_ring, b.mtp_qsa_pooled, b.pg, p.qidx, p.ctl, C, eps, Rope{m_.rope_base, b.mrope}, s);
+        qsa_index(p.yidx, L.idx_qn, L.idx_kn, b.mtp_qsa_ring, b.mtp_qsa_pooled, b.pg, p.qidx, p.ctl, C, eps, rope_of(b.mrope), s);
         pf_dense(p, L.wk.s, NKVH * HD, N, p.mixed, C, p.k, NKVH * HD, s);
         pf_dense(p, L.wv.s, NKVH * HD, N, p.mixed, C, p.v, NKVH * HD, s);
-        attn_prep(nullptr, p.k, L.q_norm, L.k_norm, 0, NKVH, p.ctl, C, eps, Rope{m_.rope_base, b.mrope}, s);
+        attn_prep(nullptr, p.k, L.q_norm, L.k_norm, 0, NKVH, p.ctl, C, eps, rope_of(b.mrope), s);
         kv_append(p.k, p.v, b.mtp_kc, b.mtp_vc, b.pg, b.att_ring.card, C, p.ctl, s);
         ckc(cudaGetLastError(), "draft layer (prompt)");
     }
@@ -1187,13 +1187,13 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                     pf_dense(p, L.wq.s, NQH * 2 * HD, N, p.mixed, C, p.qg, NQH * 2 * HD, s);
                     pf_dense_xh(p, L.wk.s, NKVH * HD, N, C, p.k, NKVH * HD, s);
                     pf_dense_xh(p, L.wv.s, NKVH * HD, N, C, p.v, NKVH * HD, s);
-                    attn_prep(p.qg, p.k, L.q_norm, L.k_norm, NQH, NKVH, p.ctl, C, eps, Rope{m_.rope_base, b.mrope}, s);
+                    attn_prep(p.qg, p.k, L.q_norm, L.k_norm, NQH, NKVH, p.ctl, C, eps, rope_of(b.mrope), s);
                     kv_append(p.k, p.v, b.kc[l], b.vc[l], b.pg, b.att_ring.card, C, p.ctl, s);
                     // the indexer: bf16 projections as f32 (llama.cpp's choice past 8 rows on a V100)
                     k_bf16_f32<<<grid_for((size_t) 512 * N), 256, 0, s>>>(L.idx_wq, (size_t) 512 * N, p.widx);
                     k_bf16_f32<<<grid_for((size_t) 128 * N), 256, 0, s>>>(L.idx_wk, (size_t) 128 * N, p.widx + (size_t) 512 * N);
                     pf_sgemm(p, p.widx, qsa_rows(), N, p.mixed, C, p.yidx, qsa_rows());
-                    qsa_index(p.yidx, L.idx_qn, L.idx_kn, b.qsa_ring[l], b.qsa_pooled[l], b.pg, p.qidx, p.ctl, C, eps, Rope{m_.rope_base, b.mrope}, s);
+                    qsa_index(p.yidx, L.idx_qn, L.idx_kn, b.qsa_ring[l], b.qsa_pooled[l], b.pg, p.qidx, p.ctl, C, eps, rope_of(b.mrope), s);
                     // groups of rows (each with the position and tag of its first MAXT group) for QSA's block selection:
                     // qsa_pf_rows (FNX_PF_QSA_ROWS), or attn_rows() when the decode attention takes the groups too
                     const int AR = p.attn_dec ? attn_rows() : p.qsa_pf_rows;

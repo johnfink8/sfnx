@@ -10,6 +10,7 @@
 #include <string>
 
 #include "model.hpp"
+#include "rope.hpp"  // Rope, rope_pos, rope_unit_freq
 
 namespace fnx {
 
@@ -110,16 +111,6 @@ void gdn_prompt(const float* qkvz, const float* ab, float* hist, const float* co
                 float* sq, float* y32, float* chw, void* st);
 size_t gdn_prompt_work_floats(int C, int nv);
 
-// rotary positions: the base, and the image path's table. tab null: a row's rotary position is its cell. Else int32
-// [cells][3] (t, h, w) per cell, and pair i of a rotation takes stream i % 3 (interleaved M-RoPE, sections 11/11/10:
-// llama.cpp's IMROPE): an image's cells share t and differ in h and w, and the text after it runs on from there
-struct Rope {
-    float base = 1e7f;
-    const int* tab = nullptr;
-};
-#ifdef __CUDACC__
-__device__ __forceinline__ int rope_pos(const Rope& r, int cell, int pair) { return r.tab ? r.tab[(size_t) cell * 3 + pair % 3] : cell; }
-#endif
 
 // attention: per-head RMS norms and NEOX rotary on the first NROT dims, then causal attention over [0, pos+t]
 // pos0: the window's first position, in device memory (graphs replay with the value it holds at launch)

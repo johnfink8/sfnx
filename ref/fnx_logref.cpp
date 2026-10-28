@@ -10,6 +10,7 @@
 // OUT.lgr: "LGR1", u32 K, i32 n_prompt, i32 prompt[n_prompt], i32 n_steps, then per step i (the distribution of the
 // token after prompt + steps 0..i-1): i32 token taken, f32 lse, K x (i32 id, f32 logit) by logit descending.
 #include "llama.h"
+#include "logref_yarn.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -106,6 +107,7 @@ int main(int argc, char** argv) {
         const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx = (uint32_t) (prompt.size() + N + 16);
+        apply_yarn(cp);   // a scaled build's teacher
         // FNX_LOGREF_UBATCH: the prompt's batch size (1: the prompt through the decode path, token by token)
         cp.n_batch = cp.n_ubatch = std::getenv("FNX_LOGREF_UBATCH") ? std::atoi(std::getenv("FNX_LOGREF_UBATCH")) : 512;
         // FNX_LOGREF_KV=q8_0: the K/V cache as q8_0 (a quantized V cache needs flash attention)
