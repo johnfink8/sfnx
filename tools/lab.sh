@@ -21,7 +21,7 @@
 #   tools/lab.sh stop                 the worker (the holder keeps the model)
 #   tools/lab.sh unload               the worker and the holder
 # make build/libfnx_lab.so between commands, then "reload" (set/unset reload by themselves); a change to the loader
-# (model.*, gguf.*, store.*, lab_proto.hpp) needs `make lab`, then unload + start: the holder refuses a worker built
+# (model.*, card_split.hpp, gguf.*, store.*, lab_proto.hpp) needs `make lab`, then unload + start: the holder refuses a worker built
 # from other loader sources. cmd and the checks exit with the worker's result (0 passed, 1 failed, 70 a broken worker).
 cd "$(dirname "$0")/.." || exit 1
 DIR=${FNX_LAB_DIR:-/tmp/fnx-lab-$(id -u)}

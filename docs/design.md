@@ -18,9 +18,16 @@ third of **every** layer:
 - **Output head.** A third of the vocabulary per card.
 - **Copied on every card.** The hyper-connection mixes, the router, the embeddings.
 
-Between the cards: two sums per layer, 96 per window, passed around a ring as fp16 pairs (three cards; a two-card
-build's decode sends fp32). A value past fp16's range is an error, never a silent overflow. `FNX_RING_F32=1` sends
-them as fp32 on three cards too (KL 5.75e-4 → 4.38e-4 on the code prompt).
+That is three cards. The split follows one rule for any count the build allows (`src/card_split.hpp`; 2, 3, 4, 6 or 8,
+[docs/config.md](config.md#card-count)): the value heads in key-head order dealt in equal runs, a key head on two cards
+when a run starts inside its value heads; the FF width in 32-value blocks, the first cards one block more when the
+count does not divide 20; the query heads and K/V blocks 1/n each, the vocabulary in ranges of ceil(vocab / n), the last shorter. Only two
+and three cards have run.
+
+Between the cards: two sums per layer, 96 per window, passed around a ring as fp16 pairs. On n cards a sum takes n - 1 hops
+to reduce and n - 1 to spread. A value past fp16's range is an error, never a silent overflow. `FNX_RING_F32=1` sends
+decode's sums as fp32, at ~30% of one request's decode: KL 5.75e-4 → 4.38e-4 on the code prompt on three cards, and on
+two it is what brings code and edit within the exactness bar.
 
 Decode moves the sums with the GPU's own threads; prompts move them with the copy engines. The ring kernels take ~4.5 ms
 of a 22.5 ms six-row window on card 0, waiting for the slowest card included.

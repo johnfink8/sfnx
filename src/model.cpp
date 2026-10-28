@@ -892,24 +892,17 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
     ple_eos = g.i(p + "ple.eos_token_id");
     ple_image = g.i(p + "ple.image_token_id");
     cards.resize(NCARD);
-#if FNX_NCARD == 3
-    // key heads per card (their q and k) and value heads (s * NKH + k): 16 value heads each; key heads 5 and 10 have
-    // value heads on two cards
-    const int kparts[NCARD][2] = {{0, 6}, {5, 6}, {10, 6}};
-    const std::vector<std::vector<int>> vparts = {
-        {0, 1, 2, 3, 4, 5, 16, 17, 18, 19, 20, 32, 33, 34, 35, 36},
-        {6, 7, 8, 9, 10, 21, 22, 23, 24, 25, 26, 37, 38, 39, 40, 41},
-        {11, 12, 13, 14, 15, 27, 28, 29, 30, 31, 42, 43, 44, 45, 46, 47}};
-    const int ffparts[NCARD][2] = {{0, 224}, {224, 448}, {448, 640}};
-#else
-    // two cards: key heads 0-7 and 8-15, each with all three of its value heads (s * NKH + k): 24 value heads a card,
-    // no key head on both; half the FF width each (10 blocks of 32)
-    const int kparts[NCARD][2] = {{0, 8}, {8, 8}};
-    const std::vector<std::vector<int>> vparts = {
-        {0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 32, 33, 34, 35, 36, 37, 38, 39},
-        {8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31, 40, 41, 42, 43, 44, 45, 46, 47}};
-    const int ffparts[NCARD][2] = {{0, 320}, {320, 640}};
-#endif
+    // key heads per card (their q and k), value heads (numbered s * NKH + k, listed ascending: the order the card's
+    // slices are laid out in) and FF slices, by card_split.hpp's rule
+    int kparts[NCARD][2], ffparts[NCARD][2];
+    std::vector<std::vector<int>> vparts(NCARD);
+    for (int c = 0; c < NCARD; ++c) {
+        kparts[c][0] = khead_first(NCARD, c);
+        kparts[c][1] = khead_count(NCARD, c);
+        ffparts[c][0] = ff_lo(NCARD, c);
+        ffparts[c][1] = ff_hi(NCARD, c);
+    }
+    for (int v = 0; v < NVH; ++v) vparts[(size_t) vhead_card(NCARD, v)].push_back(v);
     for (int c = 0; c < NCARD; ++c) {
         const std::string slice = "card " + std::to_string(c) + "'s FF slice [" + std::to_string(ffparts[c][0]) + ", " +
                                   std::to_string(ffparts[c][1]) + ")";

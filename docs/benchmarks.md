@@ -118,26 +118,39 @@ prod's Strata flags without `--batch`, `--batch-groups` or vision, so its one re
 hardware at one point in time**, as above.
 
 Two cards hold 15,806 of the 24,576 experts (64%; the engine moves the rest to RAM by itself at start), which serve
-97% of decode's picks on the routing profile. The sums between cards are fp32 there by default: with fp16 pairs the
-code and edit prompts are 1.25x over the exactness bar ([docs/verification.md](verification.md)); that column is
-shown for what it costs.
+97% of decode's picks on the routing profile. The sums between cards are fp16 pairs by default, as on three; with them the
+code and edit prompts are slightly over the exactness bar (code KL 7.5e-4 against 6.1e-4, edit 7.1e-6 against 5.2e-6; the same top-1 as fp32; [docs/verification.md](verification.md)). fp32 sums
+(`FNX_RING_F32=1`) are within it, at the cost shown.
 
-| One request | sFNX, 2 cards | sFNX, 2 cards, fp16 sums | Strata, 2 cards |
+| One request | sFNX, 2 cards, fp16 sums | sFNX, 2 cards, fp32 sums | Strata, 2 cards |
 | --- | --- | --- | --- |
-| Code edit, greedy | **152.7–154.4 tok/s** | 209.3–211.2 | 130.6–134.7 |
-| New code, greedy | **107.0–112.2** | 136.5–162.9 | 93.8–98.7 |
-| Prose reasoning, prod's sampling | **90.0–93.8** | 108.9–119.1 | 64.5–68.2 |
-| 3k random words, cold read | **1,543–1,564 tok/s** | 1,512–1,565 | 934–952 |
-| 32k random words, cold read | **2,814–2,885** | 2,827–2,837 | 2,071–2,120 |
-| 114k prompt of source code, cold read | **42.7 s** | 42.1 s | 53.7 s |
-| After it, decode | **78.0 tok/s** | 105.4 | 69.6 |
-| Six at once, 1k-word prompts (over the run / best 3 s) | 125.8 / 170.9 tok/s | 157.7 / 249.3 | |
-| GPUs | 53% / 53% | 48% / 48% | 27% / 32% |
+| Code edit, greedy | **209.3–211.2 tok/s** | 152.7–154.4 | 130.6–134.7 |
+| New code, greedy | **136.5–162.9** | 107.0–112.2 | 93.8–98.7 |
+| Prose reasoning, prod's sampling | **108.9–119.1** | 90.0–93.8 | 64.5–68.2 |
+| 3k random words, cold read | **1,512–1,565 tok/s** | 1,543–1,564 | 934–952 |
+| 32k random words, cold read | **2,827–2,837** | 2,814–2,885 | 2,071–2,120 |
+| 114k prompt of source code, cold read | **42.1 s** | 42.7 s | 53.7 s |
+| After it, decode | **105.4 tok/s** | 78.0 | 69.6 |
+| Six at once, 1k-word prompts (over the run / best 3 s) | 157.7 / 249.3 tok/s | 125.8 / 170.9 | |
+| GPUs | 48% / 48% | 53% / 53% | 27% / 32% |
 
-Exactness on two cards, against llama.cpp CUDA (`lab.sh exact`): KL mean 5.73e-4 code, 3.14e-6 edit, 4.01e-3 on the
+Exactness on two cards with fp32 sums, against llama.cpp CUDA (`lab.sh exact`): KL mean 5.73e-4 code, 3.14e-6 edit, 4.01e-3 on the
 62k prompt, 7.89e-3 on the picture, every prompt within the bar; windows of 1–16 rows and batched lanes give the same
 tokens as 5-row windows and lanes alone. fp32 sums cost a quarter to a third of one request's decode where the bytes
 they add should cost microseconds a sum: not traced yet.
+
+With the fp16 default (`lab.sh exact base`, 2026-10-27):
+
+| Prompt | Top-1 | KL mean, fp16 | fp32 | Bar (1.25x llama.cpp's CPU against CUDA; 62k: 1.0x) |
+| --- | --- | --- | --- | --- |
+| Code | 297/300 | 7.48e-4, over | 5.73e-4 | 6.06e-4 |
+| Edit | 300/300 | 7.14e-6, over | 3.14e-6 | 5.15e-6 |
+| 62k prompt | 195/200 | 3.73e-3 | 4.01e-3 | within |
+| Picture | 197/200 | 4.38e-3 | 7.89e-3 | within |
+
+Top-1 is the same as fp32's on every prompt, and on the 62k prompt and the picture fp16 is the closer of the two.
+Windows of 1–16 rows and batched lanes (with drafts, and sampled) give the same tokens as 5-row windows and lanes
+alone.
 
 **One card: use Strata.** Built and run once (6,415 experts in VRAM, 26%: 73% of decode's picks), sFNX reads every
 expert it lacks over the card's one PCIe link and loses to Strata, which computes part of the misses on the CPU next
