@@ -237,7 +237,8 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
                           "FNX_ARENA_CHURN", "FNX_HC1", "FNX_HC_BAR_WRAP", "FNX_NO_TWIN", "FNX_RING_TAG_START", "FNX_PF_OVERLAP",
                           "FNX_PF_PASS", "FNX_PF_STAGE_ROWS", "FNX_PF_STAGE_MIB", "FNX_PF_RING_SM", "FNX_PF_ATT_PIECES", "FNX_PF_QSA_ROWS",
                           "FNX_PF_ATTN_DEC", "FNX_PF_F16ACC", "FNX_PF_MOE_Q8", "FNX_PF_DRAFT8", "FNX_ROUTE_COUNT", "FNX_ROUTE_TRACE",
-                          "FNX_PREFETCH_PROBE", "FNX_PF_SEQ_START"})
+                          "FNX_PREFETCH_PROBE", "FNX_PF_SEQ_START", "FNX_QSA_DENSE", "FNX_MTP_EXPERTS", "FNX_PF_GEMM_LOG",
+                          "FNX_PF_HC_CHECK"})
         if (std::getenv(k)) throw std::runtime_error(std::string(k) + " is Flash-Next's: the 27B has nothing it sets");
     const long long pf_rows = env_int("FNX_PF_ROWS", pf_c_);
     if (pf_rows < MAXT || pf_rows > 8192 || pf_rows % MAXT)
