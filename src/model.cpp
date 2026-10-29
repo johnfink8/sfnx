@@ -181,12 +181,23 @@ void lock_in_ram(const Tensor& t) {
 // the stager's groups for load_card: group l every tensor of layer l, group NL the output head's. The head is read
 // through the page cache: the draft layer (Mtp) takes its rows of output.weight from the mapping after the load
 std::vector<Stager::Group> stage_groups(const Gguf& g) {
+#if FNX_27B
+    // and group NL + 1 the draft layer, blk.NL (Flash-Next's comes from separate files, Mtp)
+    std::vector<Stager::Group> gs(NL + 2);
+    for (const auto& kv : g.tensors()) {
+        int l = -1, n = 0;
+        if (std::sscanf(kv.first.c_str(), "blk.%d.%n", &l, &n) == 1 && n > 0 && l >= 0 && l <= NL)
+            gs[(size_t) (l < NL ? l : NL + 1)].names.push_back(kv.first);
+    }
+    gs[NL].names = {"output_norm.weight", "output.weight"};
+#else
     std::vector<Stager::Group> gs(NL + 1);
     for (const auto& kv : g.tensors()) {
         int l = -1, n = 0;
         if (std::sscanf(kv.first.c_str(), "blk.%d.%n", &l, &n) == 1 && n > 0 && l >= 0 && l < NL) gs[(size_t) l].names.push_back(kv.first);
     }
     gs[NL].names = {"output_hc_norm.weight", "output_hc_down.weight", "output_hc_up.weight", "output.weight"};
+#endif
     gs[NL].cached = true;
     return gs;
 }
@@ -439,6 +450,25 @@ struct Up {
         w.p = put<uint8_t>(h.data(), h.size());
         return w;
     }
+#if FNX_27B
+    // rows r1 of t1, r2 of t2, then r3 of t3, one matrix
+    DW rows3(const Tensor& t1, const std::vector<int>& r1, const Tensor& t2, const std::vector<int>& r2, const Tensor& t3,
+             const std::vector<int>& r3) {
+        for (const Tensor* t : {&t2, &t3})
+            if (t1.type != t->type || t1.ne[0] != t->ne[0]) throw std::runtime_error(t1.name + " and " + t->name + " do not stack");
+        DW w;
+        w.type = t1.type;
+        w.n_in = (int) t1.ne[0];
+        w.n_out = (int) (r1.size() + r2.size() + r3.size());
+        w.row_bytes = t1.row_bytes();
+        std::vector<uint8_t> h((size_t) w.n_out * w.row_bytes);
+        size_t o = 0;
+        for (const auto& [t, rs] : {std::pair{&t1, &r1}, std::pair{&t2, &r2}, std::pair{&t3, &r3}})
+            for (int r : *rs) { std::memcpy(&h[o], t->data + (size_t) r * w.row_bytes, w.row_bytes); o += w.row_bytes; }
+        w.p = put<uint8_t>(h.data(), h.size());
+        return w;
+    }
+#endif
     // rows `rows` of t1 then of t2 as f32 (F32 rows as they are, Q8_0 rows dequantized)
     float* f32_rows2(const Tensor& t1, const Tensor& t2, const std::vector<int>& rows) {
         std::vector<float> h;
@@ -546,6 +576,76 @@ std::vector<int> range(int a, int b) {
     return v;
 }
 
+#if FNX_27B
+// The 27B's layers on a card, from load_card's channel lists: the recurrent layers as Flash-Next's; attention split by
+// heads (K/V too: each card keeps its own heads' cache, src/s27_attn.cuh), q | gate, K and V stacked in one matrix;
+// the dense FFN by FF width; then the head, and the draft layer (blk.NL, stage group NL + 1). Every matrix q8s reads
+// is Q8_0: the 27B's path has no other matvec
+void load_layers_27b(Stager& st, CardW& c, Up& up, const std::vector<int>& conv_rows, const std::vector<int>& zrows,
+                     const std::vector<int>& vblocks, const std::vector<int>& qrows, const std::vector<int>& kvrows,
+                     const std::vector<int>& woblocks) {
+    auto L = [&](int l, const char* s) -> const Tensor& { return st.t(l, "blk." + std::to_string(l) + "." + s); };
+    const std::vector<int>& vheads = c.vheads;
+    auto q8 = [](const DW& d, const std::string& what) {
+        if (!d.s.q) throw std::runtime_error("27b: " + what + " is not Q8_0 (the 27B's matvecs read Q8_0 only)");
+    };
+    auto attn = [&](LayerW& w, auto&& T) {
+        w.wq = up.dense(up.rows3(T("attn_q.weight"), qrows, T("attn_k.weight"), kvrows, T("attn_v.weight"), kvrows));
+        w.wo = up.dense(up.cols(T("attn_output.weight"), woblocks));
+        w.q_norm = up.f32(T("attn_q_norm.weight"));
+        w.k_norm = up.f32(T("attn_k_norm.weight"));
+    };
+    auto ffn = [&](LayerW& w, auto&& T) {
+        w.attn_norm = up.f32(T("attn_norm.weight"));
+        w.ffn_norm = up.f32(T("post_attention_norm.weight"));
+        w.ffn_gu = up.dense(up.rows2(T("ffn_gate.weight"), range(c.fd0, c.fd1), T("ffn_up.weight"), range(c.fd0, c.fd1)));
+        w.ffn_down = up.dense(up.cols(T("ffn_down.weight"), range(c.fd0 / 32, c.fd1 / 32)));
+    };
+    c.L.resize(NL);
+    for (int l = 0; l < NL; ++l) {
+        LayerW& w = c.L[l];
+        auto T = [&](const char* s) -> const Tensor& { return L(l, s); };
+        if (!is_attn(l)) {
+            w.qkvz = up.dense(up.rows2(T("attn_qkv.weight"), conv_rows, T("attn_gate.weight"), zrows));
+            w.ab = up.f32_rows2(T("ssm_alpha.weight"), T("ssm_beta.weight"), vheads);
+            w.ssm_out = up.dense(up.cols(T("ssm_out.weight"), vblocks));
+            w.conv = up.f32_rows(T("ssm_conv1d.weight"), conv_rows);
+            std::vector<float> a, dt;
+            const size_t nh = (size_t) *std::max_element(vheads.begin(), vheads.end()) + 1;
+            const float* af = f32_data(T("ssm_a"), nh);
+            const float* df = f32_data(T("ssm_dt.bias"), nh);
+            for (int h : vheads) { a.push_back(af[h]); dt.push_back(df[h]); }
+            w.ssm_a = up.put<float>(a.data(), a.size() * 4);
+            w.dt_bias = up.put<float>(dt.data(), dt.size() * 4);
+            w.ssm_norm = up.f32(T("ssm_norm.weight"));
+            q8(w.qkvz, "layer " + std::to_string(l) + "'s qkv | gate"), q8(w.ssm_out, "layer " + std::to_string(l) + "'s ssm_out");
+        } else {
+            attn(w, T);
+            q8(w.wq, "layer " + std::to_string(l) + "'s q | k | v"), q8(w.wo, "layer " + std::to_string(l) + "'s attn_output");
+        }
+        ffn(w, T);
+        q8(w.ffn_gu, "layer " + std::to_string(l) + "'s gate | up"), q8(w.ffn_down, "layer " + std::to_string(l) + "'s down");
+        st.done(l);
+    }
+    c.out_norm = up.f32(st.t(NL, "output_norm.weight"));
+    c.out = up.dense(up.rows(st.t(NL, "output.weight"), range(c.v0, c.v1)));
+    c.mtp_head = up.dense(up.rows(st.t(NL, "output.weight"), c.dvrows));   // this card's share of the draft vocabulary
+    q8(c.out, "output.weight");
+    st.done(NL);
+    {
+        auto T = [&](const char* s) -> const Tensor& { return st.t(NL + 1, "blk." + std::to_string(NL) + "." + s); };
+        attn(c.mtp, T);
+        ffn(c.mtp, T);
+        c.mtp_eh = up.dense(up.rows(T("nextn.eh_proj.weight"), range(0, N)));   // every card the whole of it
+        c.mtp_enorm = up.f32(T("nextn.enorm.weight"));
+        c.mtp_hnorm = up.f32(T("nextn.hnorm.weight"));
+        c.mtp_head_norm = up.f32(T("nextn.shared_head_norm.weight"));
+        for (const DW* d : {&c.mtp.wq, &c.mtp.wo, &c.mtp.ffn_gu, &c.mtp.ffn_down, &c.mtp_eh}) q8(*d, "a draft layer matrix");
+        st.done(NL + 1);
+    }
+}
+#endif
+
 // The tensors come from st: group l is layer l's, group NL the output head's (stage_groups); each group is given back
 // once this card is through with it.
 // host_experts: every routed expert to a host copy (an ExpertCache, or the lab's holder); store: the holder's shared memory
@@ -587,6 +687,11 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
     }
     for (int h = c.kv0; h < c.kv0 + c.nkv; ++h)
         for (int i = 0; i < HD; ++i) kvrows.push_back(h * HD + i);
+#if FNX_27B
+    (void) resident, (void) arena_score, (void) host_experts;
+    load_layers_27b(st, c, up, conv_rows, zrows, vblocks, qrows, kvrows, woblocks);
+    return;
+#endif
     // the K/V cache is split by position: every card projects q for every head and k/v for both KV heads
     std::vector<int> qrows_all, kvrows_all;
     for (int i = 0; i < NQH * 2 * HD; ++i) qrows_all.push_back(i);
@@ -722,7 +827,9 @@ struct MtpFiles {
         constexpr size_t ROW_GU = H / 4, ROW_D = F / 4, SC_GU = H / 64, SC_D = F / 64;
         constexpr size_t O_D = 2ull * F * ROW_GU, O_GS = O_D + (size_t) H * ROW_D, O_DS = O_GS + 2ull * F * SC_GU * 2;
         constexpr size_t BLOB = O_DS + (size_t) H * SC_D * 2;
+#if !FNX_27B
         static_assert(BLOB == 1382400, "Strata's Q2_0 expert blob");
+#endif
         std::FILE* f = std::fopen(path.c_str(), "rb");
         if (!f) throw std::runtime_error("mtp: cannot open " + path);
         const size_t qrow_gu = (size_t) H / 32 * 18, qrow_d = (size_t) F / 32 * 18;
@@ -933,6 +1040,15 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
                                      " of them, or build for " + std::to_string(ndev) + " (make FNX_NCARD=" + std::to_string(ndev) + ")");
         check_cards();
     }
+#if FNX_27B
+    const std::string p = "qwen35.";
+    // block_count holds the draft (nextn) layer too
+    if (g.i(p + "block_count") != NL + g.i(p + "nextn_predict_layers") || g.i(p + "nextn_predict_layers") != 1 ||
+        g.i(p + "embedding_length") != N || g.i(p + "feed_forward_length") != FFD || g.i(p + "ssm.group_count") != NKH ||
+        g.i(p + "ssm.time_step_rank") != NVH || g.i(p + "attention.head_count") != NQH ||
+        g.i(p + "attention.head_count_kv") != NKVH || g.i(p + "full_attention_interval") != 4)
+        throw std::runtime_error("27b: this GGUF's geometry is not Qwen3.8-27B's");
+#else
     const std::string p = "qwen4exp.";
     if (g.i(p + "block_count") != NL || g.i(p + "embedding_length") != N || g.i(p + "expert_count") != NEXP ||
         g.i(p + "ssm.group_count") != NKH || g.i(p + "ssm.time_step_rank") != NVH || g.i(p + "attention.head_count") != NQH ||
@@ -945,6 +1061,7 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
         if (g.t(b + "ffn_gate_shexp.weight").ne[1] != FF || g.t(b + "ffn_up_shexp.weight").ne[1] != FF || g.t(b + "ffn_down_shexp.weight").ne[0] != FF)
             throw std::runtime_error("fnx: layer " + std::to_string(l) + "'s shared expert is not " + std::to_string(FF) + " wide");
     }
+#endif
     eps = (float) g.f(p + "attention.layer_norm_rms_epsilon");
     rope_base = (float) g.f(p + "rope.freq_base");
     // the trained length bounds the context (Engine refuses past it, or past it x FNX_ROPE_SCALE), so a model must name it
@@ -960,6 +1077,16 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
         yarn_orig = mr.yarn_orig;
     }
     tok_embd = &g.t("token_embd.weight");
+#if FNX_27B
+    if (tok_embd->type != T_Q8_0) throw std::runtime_error("27b: token_embd.weight is not Q8_0 (the host's embedding reads Q8_0)");
+    vocab = (int) tok_embd->ne[1];
+    {   // the host gathers its rows every window: a row read from the disk costs milliseconds, so keep it in RAM
+        const auto t0 = std::chrono::steady_clock::now();
+        lock_in_ram(*tok_embd);
+        std::fprintf(stderr, "27b: %s (%.1f GB) locked in RAM in %.1f s\n", tok_embd->name.c_str(), tok_embd->nbytes / 1e9,
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
+#else
     ple_table = &g.t("per_layer_token_embd.weight");
     if (tok_embd->type != T_Q8_0) throw std::runtime_error("fnx: token_embd.weight is not Q8_0 (the host's embedding reads Q8_0)");
     if (ple_table->type != T_IQ4_NL && ple_table->type != T_Q8_0)
@@ -977,6 +1104,7 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
     for (int64_t v : g.ia(p + "ple.head_vocab_sizes")) ple_vocab.push_back((uint64_t) v);
     ple_eos = g.i(p + "ple.eos_token_id");
     ple_image = g.i(p + "ple.image_token_id");
+#endif
     cards.resize(NCARD);
     // key heads per card (their q and k), value heads (numbered s * NKH + k, listed ascending: the order the card's
     // slices are laid out in) and FF slices, by card_split.hpp's rule
@@ -1029,6 +1157,34 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
         cw.v0 = c * vstep;
         cw.v1 = std::min(vocab, (c + 1) * vstep);
     }
+#if FNX_27B
+    for (int c = 0; c < NCARD; ++c) cards[c].fd0 = ffd_lo(NCARD, c), cards[c].fd1 = ffd_lo(NCARD, c + 1);
+    if (cards[NCARD - 1].fd1 != FFD) throw std::runtime_error("27b: the cards' dense FF slices do not cover its width");
+    {   // the draft vocabulary (int32 token ids): FNX_DRAFT_VOCAB, default the one prod's Flash-Next drafts with
+        const char* dp = std::getenv("FNX_DRAFT_VOCAB");
+        const std::string path = dp ? dp : "data/draft_vocab_en.bin";
+        std::FILE* f = std::fopen(path.c_str(), "rb");
+        if (!f) throw std::runtime_error("27b: cannot open the draft vocabulary " + path);
+        int32_t id;
+        while (std::fread(&id, 4, 1, f) == 1) {
+            if (id < 0 || id >= vocab) {
+                std::fclose(f);
+                throw std::runtime_error("27b: " + path + " holds a token outside the vocabulary");
+            }
+            dvocab.push_back(id);
+        }
+        std::fclose(f);
+        if (dvocab.empty()) throw std::runtime_error("27b: " + path + " is empty");
+        const int dstep = ((int) dvocab.size() + NCARD - 1) / NCARD;
+        for (int c = 0; c < NCARD; ++c) {
+            CardW& cw = cards[c];
+            cw.dv0 = std::min((int) dvocab.size(), c * dstep);
+            cw.dv1 = std::min((int) dvocab.size(), (c + 1) * dstep);
+            cw.dvrows.assign(dvocab.begin() + cw.dv0, dvocab.begin() + cw.dv1);
+        }
+    }
+    if (how != Load::PLAIN) throw std::runtime_error("27b: plain loads only (the lab's holder does not hold the 27B)");
+#endif
     if (how == Load::ATTACH) {   // a lab worker: the holder's weights are mapped already; take its tables, place the experts
         if (!image) throw std::runtime_error("fnx: attaching needs the holder's image");
         if (!store) throw std::runtime_error("fnx: attaching needs the store the holder's memory is mapped in");
@@ -1037,7 +1193,9 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
         return;
     }
     if (how == Load::HOLD && !store) throw std::runtime_error("fnx: holding needs a store");
+#if !FNX_27B
     if (how == Load::PLAIN) choose_residency();   // the holder leaves that to its workers: every expert to a host copy
+#endif
     const auto t0 = std::chrono::steady_clock::now();
     Stager st(g, stage_groups(g), NCARD);
     std::vector<std::thread> th;
@@ -1212,7 +1370,9 @@ void card_fields(CardW& c, F f) {
     f(c.vmap), f(c.head_norm), f(c.head_down), f(c.head_up), f(c.out), f(c.ple_key), f(c.ple_value), f(c.ple_norm_key),
         f(c.ple_norm_query), f(c.ple_norm_conv), f(c.ple_conv), f(c.bytes), f(c.host_bytes);
 }
+#if !FNX_27B   // the 27B has no holder (plain loads only)
 static_assert(sizeof(CardW) == 896, "CardW changed: put what load_card stores in card_fields, then update this size");
+#endif
 // every address load_card stores, in a card and in a layer: a worker moves them to where it mapped the holder's memory
 template <typename F>
 void card_ptrs(CardW& c, F f) {
@@ -1231,7 +1391,9 @@ void card_ptrs(CardW& c, F f) {
     for (const char*& p : c.ec_host_gu) f(p);
     for (const char*& p : c.ec_host_dn) f(p);
 }
+#if !FNX_27B
 static_assert(sizeof(LayerW) == 952, "LayerW changed: put its new addresses in card_ptrs, then update this size");
+#endif
 }  // namespace
 
 std::string Model::image() const {

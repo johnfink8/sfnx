@@ -19,14 +19,34 @@ namespace fnx {
 #error "FNX_NCARD is unset: build through the Makefile (make FNX_NCARD=2, 3, 4, 6 or 8)"
 #endif
 constexpr int NCARD = FNX_NCARD;
+// the model a build is for (make FNX_MODEL=27b: Qwen3.8-27B, dense, src/s27.*; the default: Flash-Next). Unset is a
+// build made outside the Makefile, as with FNX_NCARD
+#ifndef FNX_27B
+#error "FNX_27B is unset: build through the Makefile (make FNX_MODEL=fnx or 27b)"
+#endif
+#if FNX_27B
+constexpr int N = 5120, HC = 4, D = N * HC, LR = 320;
+constexpr int NL = 64, NEXP = 512, TOPK = 10, FF = 640, FF_SH = 640;
+constexpr int NKH = 16, NVH = 48, HS = 128;            // recurrent: key heads, value heads, head size
+constexpr int NQH = 24, NKVH = 4, HD = 256, NROT = 64; // attention
+constexpr int FFD = 17408;                             // the dense FFN's width
+// a card's dense FF slice: whole 32-value blocks, the first cards one block wider (544 blocks: 182 / 181 / 181)
+constexpr int ffd_lo(int n, int c) { return 32 * (c * (FFD / 32 / n) + (c < FFD / 32 % n ? c : FFD / 32 % n)); }
+constexpr int FFD_CARD_MAX = (FFD + 32 * NCARD - 1) / (32 * NCARD) * 32;
+#else
 constexpr int N = 2560, HC = 4, D = N * HC, LR = 320;
 constexpr int NL = 48, NEXP = 512, TOPK = 10, FF = 640, FF_SH = 640;
 constexpr int NKH = 16, NVH = 48, HS = 128;            // recurrent: key heads, value heads, head size
 constexpr int NQH = 24, NKVH = 2, HD = 256, NROT = 64; // attention
+#endif
 constexpr int MAXT = 16;                               // rows per window
 // the hc read's grid (src/hc.cuh's H_BLOCKS, held to this there): every block resident at once, one an SM, so a card
 // with fewer SMs is refused at load (src/card_check.hpp)
+#if FNX_27B
+constexpr int HC_READ_BLOCKS = 1;   // the 27B has no hyper-connections: no grid that must be resident
+#else
 constexpr int HC_READ_BLOCKS = 80;
+#endif
 constexpr int PLE_LAYER = 1, PLE_HEADS = 16, PLE_DIM = 160;
 
 }  // namespace fnx
@@ -126,6 +146,12 @@ struct LayerW {
     DW gu_e, down_e;                   // per expert: [gate; up] [2 ff][N], down [N][ff]; expert stride = rows * row_bytes
     size_t gu_e_stride = 0, down_e_stride = 0;
     DW sh_gu, sh_down;                 // shared expert ff range, gate and up stacked the same way
+#if FNX_27B
+    // pre-norms (copied) and the dense FFN's slice [fd0, fd1): gate rows then up rows; down's input columns
+    const float* attn_norm = nullptr;
+    const float* ffn_norm = nullptr;
+    DW ffn_gu, ffn_down;
+#endif
 };
 
 struct CardW {
@@ -141,6 +167,19 @@ struct CardW {
     int kv0 = 0, nkv = 0;              // KV heads [kv0, kv0 + nkv)
     // ff split
     int ff0 = 0, ff1 = 0;
+#if FNX_27B
+    int fd0 = 0, fd1 = 0;              // the dense FFN's
+    const float* out_norm = nullptr;
+    // the draft (nextn) layer: an attention layer split as the trunk's, its input projection [e | h] -> N (every card
+    // the whole of it), norms, and this card's rows [dv0, dv1) of the draft vocabulary's head
+    LayerW mtp;
+    DW mtp_eh, mtp_head;
+    const float* mtp_enorm = nullptr;
+    const float* mtp_hnorm = nullptr;
+    const float* mtp_head_norm = nullptr;
+    int dv0 = 0, dv1 = 0;
+    std::vector<int> dvrows;           // their token ids: the head's rows
+#endif
     // output vocabulary split
     int v0 = 0, v1 = 0;
     std::vector<LayerW> L;
@@ -208,6 +247,9 @@ struct Model {
     double yarn_factor = 0;   // the GGUF's own YaRN (rope.scaling.type yarn): its factor, 0 for none
     int yarn_orig = 0;        // and its original_context_length, 0 when it names none (choose_rope, src/rope.hpp)
     int vocab = 0;
+#if FNX_27B
+    std::vector<int> dvocab;   // the draft head's rows: token ids
+#endif
     // [NL][NEXP]: the routed experts in VRAM at the start (empty: all, no ExpertCache). FNX_EXPERT_RAM_GIB=G (default 3;
     // off: no cache) leaves the coldest G GiB of them (whole experts, all cards' slices) out, ranked by
     // FNX_EXPERT_PROFILE (FNX_ROUTE_COUNT's tallies; default data/expert-routes.bin)

@@ -437,7 +437,11 @@ __global__ void k_gdn_out_norm(const float* o, const float* z, const float* w, f
     __shared__ float sh[32];
     const float v = o[at];
     const float ms = block_sum(v * v, sh) / (float) HS;
+#if FNX_27B   // the 27B gates with silu(z), Flash-Next with sigmoid(z)
+    y[at] = v * rsqrtf(ms + eps) * w[i] * z[at] * sigm(z[at]);
+#else
     y[at] = v * rsqrtf(ms + eps) * w[i] * sigm(z[at]);
+#endif
 }
 
 #include "gdn_core.cuh"
@@ -2032,7 +2036,15 @@ void q8s_run(const Q8Segs& g, int rows, int cols, const void* y, int T, void* st
         if (rows < 8192) throw std::runtime_error("q8s_gemv_segs: compiled for 8192 rows or more (q, k and v)");
         q8s_launch<4, SEG>(g, rows, cols, yq, T, s);
     } else {
+#if FNX_27B
+        // up to 4 rows by the window (the 27B's windows, bin/s27_run S27_BENCH=1: 1 row 19.4 -> 18.3 ms, 4 rows
+        // 24.5 -> 22.3), past that by the matrix (5 to 16 rows: choosing by the window was no faster)
+        if (T <= 2) q8s_launch<2, SEG>(g, rows, cols, yq, T, s);
+        else if (T <= 4) q8s_launch<1, SEG>(g, rows, cols, yq, T, s);
+        else if (rows >= 8192) q8s_launch<4, SEG>(g, rows, cols, yq, T, s);
+#else
         if (rows >= 8192) q8s_launch<4, SEG>(g, rows, cols, yq, T, s);
+#endif
         else if (rows >= 4096) q8s_launch<2, SEG>(g, rows, cols, yq, T, s);
         else q8s_launch<1, SEG>(g, rows, cols, yq, T, s);
     }

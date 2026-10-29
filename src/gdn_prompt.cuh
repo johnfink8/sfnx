@@ -415,7 +415,11 @@ __global__ void __launch_bounds__(HS) k_gdn_pf_norm_own(const float* __restrict_
 #pragma unroll
     for (int w = 0; w < HS / 32; ++w) sq += red[w];
     const float z = qkvz[(size_t) t * row_stride + ch + lv * HS + c];
+#if FNX_27B   // the 27B gates with silu(z), Flash-Next with sigmoid(z)
+    *y = v * rsqrtf(sq / (float) HS + eps) * nw[c] * z / (1.0f + __expf(-z));
+#else
     *y = v * rsqrtf(sq / (float) HS + eps) * nw[c] / (1.0f + __expf(-z));
+#endif
 }
 
 __global__ void __launch_bounds__(HS) k_gdn_pf_norm(const float* __restrict__ qkvz, const float* __restrict__ nw,
@@ -427,7 +431,11 @@ __global__ void __launch_bounds__(HS) k_gdn_pf_norm(const float* __restrict__ qk
     const float ms = (sqv[0] + sqv[1] + sqv[2] + sqv[3]) / (float) HS;
     float* y = y32 + (size_t) t * nv * HS + lv * HS + c;
     const float z = qkvz[(size_t) t * row_stride + ch + lv * HS + c];
+#if FNX_27B   // the 27B gates with silu(z), Flash-Next with sigmoid(z)
+    *y = *y * rsqrtf(ms + eps) * nw[c] * z / (1.0f + __expf(-z));
+#else
     *y = *y * rsqrtf(ms + eps) * nw[c] / (1.0f + __expf(-z));
+#endif
 }
 
 }  // namespace
