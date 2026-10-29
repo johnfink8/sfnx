@@ -95,7 +95,7 @@ To validate count n (n cards, `iommu=pt` or the IOMMU off, and peer access betwe
 [docs/config.md](config.md#boot-requirement)), with nothing else on the cards:
 
 1. Build: `FNX_NCARD=n make -j lab bin/sfnx test-bin ref`. The CPU checks: `bin/pf_ring_plan_test`,
-   `bin/batch_plan_test`, `bin/sfnx_input_test`.
+   `bin/batch_plan_test`, `bin/sfnx_input_test`, `bin/card_check_test`, `tools/build_guards_check.sh`.
 2. llama.cpp's references, before the lab takes the cards: `ref/fnx_logref MODEL ref/P.bin STEPS ref/lgr/llama_cuda_P.lgr`
    with MODEL the UD-Q4_K_XL GGUF's first shard, for code1 and edit1 (300 steps) and long64 (200). `exact` prints the
    command for any it misses; the picture's reference is in git.
@@ -168,6 +168,36 @@ against itself without, teacher-forced on the same tokens:
 The picks barely move; the distributions move by a few times the backends' own difference, more with S and with
 length, and an edit not at all.
 
+## Other GPUs
+
+`ARCH=80`, `89`, `90`, `100` and `120` ([docs/config.md](config.md#other-gpus)) have never run: every object compiles
+with nvcc 12.9 for each (2026-10-28, on prod's box), nothing more. To validate one, the steps under
+[Other card counts](#other-card-counts) with `ARCH=n` on every make and a lab directory of its own, llama.cpp's
+references made on the same cards; the start-up checks say first whether the cards and links can run it at all.
+
+## RTX 3090s
+
+`make ARCH=86` ([docs/config.md](config.md#other-gpus)) has run on a tester's box: four RTX 3090s on PCIe Gen4 x16, an
+AMD EPYC, no NVLink, driver 595.84 (open kernel modules with the community P2P patch), CUDA 12.9, UD-Q4_K_XL with
+int8 K/V and MTP drafts of 4. Their report, 2026-10-27/28, not measured here:
+
+| Cards | Experts in RAM | Result |
+| --- | --- | --- |
+| 3 (`make ARCH=86`) | 28 GiB, batch 2 | loads in ~85–125 s; `serve/api_smoke.py` 10 of 10; ~178 tok/s one request, ~240 combined for two |
+| 4 (`make ARCH=86 FNX_NCARD=4`) | 12 GiB, context 262,144 | loads in 88 s; greedy output the same as their three-card build; 163–170 tok/s on short generations, 152–200 for one request from 1k to 128k context |
+
+Their prompts and sampling are not given, so these numbers do not line up with [docs/benchmarks.md](benchmarks.md).
+Not run there: `lab.sh exact` against llama.cpp, `exact base`, `lab.sh batch` and `bin/sample_test`. Until they pass,
+an sm_86 build's logits are unchecked, and four cards are as untested as [Other card counts](#other-card-counts) says.
+To check one: the steps there with `ARCH=86` on every make and a lab directory of its own
+(`FNX_LAB_DIR=/tmp/fnx-lab-$UID-sm86-${n}card`), llama.cpp's references made on the same cards.
+
+What differs from a V100, as far as the code goes: the kernels are the same source, compiled for sm_86. The
+`mma.sync.m8n8k4` in `src/moe_mma.cuh` runs there, but NVIDIA documents it as tuned for sm_70 and possibly much slower
+on later cards. The hc read (`src/hc.cuh`) needs its 80 blocks resident at once: a 3090 has 82 SMs, and the engine
+refuses as it loads a card with fewer or of another arch than the build's (`src/card_check.hpp`; `src/hc.cuh`
+holds its grid to `HC_READ_BLOCKS` in `src/model.hpp` at compile time).
+
 ## The test inventory
 
 | What | How |
@@ -183,6 +213,9 @@ length, and an edit not at all.
 | The batched-draft row plan against a brute force over every split | `bin/batch_plan_test` |
 | The prompt path's ring steps: two and three cards' sequences, and consecutive sums over both buffer sets on every supported count (CPU) | `bin/pf_ring_plan_test` |
 | YaRN's band, per-pair angles and magnitude against ggml's formulas, and the settings it refuses | `bin/rope_test` |
+| The card checks at load: a card's compute capability and SMs against the build's arch; PCI addresses; BAR1 from a V100's and an RTX 3090's sysfs text and one made from the 3090's at full ReBAR; the text it refuses, signs and over-wide fields included; which cards pass; the link probe's report (a pair left out refused), slow pairs warned and lost words named (CPU) | `bin/card_check_test` |
+| The link probe on the cards (`src/peer_probe.cu`): its watcher's self-check and the healthy path run at every start, prod's included (the rates measured: [docs/config.md](config.md#boot-requirement)); its failure paths need a broken link and have run nowhere, checked by review only | engine start-up |
+| The Makefile's checks of `ARCH` and `FNX_NCARD`: every bad value refused with its message before a stamp is written, a value padded with spaces the same setting (CPU) | `tools/build_guards_check.sh` |
 | The top-k ties | `bin/topk_test` |
 | The engine's stdin handling | `bin/sfnx_input_test` |
 | The conversation cache where prompts share much: two conversations alternating on a lane, a system prompt changed near its end | `tools/lab.sh cmd cache2` |

@@ -124,15 +124,91 @@ The ones that change results or are worth knowing. The rest are kernel-level tun
 | `FNX_LAB_TIMEOUT=N` | a command's watchdog in seconds (default 600) |
 | `FNX_LAB_GDB=1` | run the worker under gdb |
 
+**Start-up checks**
+
+| Setting | Effect |
+| --- | --- |
+| `FNX_SKIP_BAR1_CHECK=1` | do not refuse a card whose BAR1 is smaller than its memory ([Boot requirement](#boot-requirement)): for a card whose peer access needs no BAR1 that large |
+
 ## Boot requirement
 
-The ring writes between cards, so every card's IOMMU group must be an identity domain. The engine checks at startup and
-refuses to run otherwise: *`the ring's writes between cards need identity domains; boot with iommu=pt`*.
+The engine checks every card as it loads, before it places anything on one (`src/card_check.hpp`, tested by
+`bin/card_check_test` against real cards' numbers and sysfs), so a card it cannot use stops the load in seconds,
+naming the card, rather than after the weights are on the cards.
+
+The ring writes between cards, so every card's IOMMU group must be an identity domain. The engine refuses to run
+otherwise: *`the ring's writes between cards need identity domains; boot with iommu=pt`*.
 
 Every card must also be a CUDA peer of every other, not only of its ring neighbours: the prompt path's attention
 exchange copies into every card and sets flags there. The engine enables peer access for every pair at start and stops
 with `peer access` if one is refused (`nvidia-smi topo -p2p r` shows which pairs can). On this box (two sockets, the
 cards on separate root ports) every pair can, with `iommu=pt`.
+
+CUDA allowing peer access does not prove a link carries data, so before the first window the engine writes 512 KiB
+from each card into a buffer on every other card, by a kernel's stores as the ring makes them (timed) and once by the
+copy engines as the prompt path copies (not timed), and watches for every word on the receiving card
+(`src/peer_probe.cu`; first it checks on each card that its watcher can fail, against words nobody wrote). A pair whose
+words do not all arrive within a second (lost, misplaced, or under 0.5 MB/s) stops the engine with a line naming the
+pair and how it was written, and how to leave the card out. A link that wedges a card can still leave it hung or, as
+one did at a tester's, reset the host; when the probe sees a card still running or faulted it prints that and ends
+the process at once, as nothing on the card can be freed safely. Otherwise the engine prints one line with the kernel
+stores' rates (*`fnx: kernel stores between the cards: N pairs, A to B GB/s (512 KiB a pair)`*) and a warning for each
+pair under 1 GB/s: the engine still runs, the tokens the same but slower, and the warning names the link to check.
+On prod's V100s (PCIe Gen3) the probe measures 5.4 to 7.7 GB/s a pair, 68–97 µs per 512 KiB: 31 lab starts on
+2026-10-28, the same band before its waits were bounded (16, 5.4–7.7) and after (15, 5.7–7.7), and 6.8 to 7.3 at
+prod's first start on the probe's build (`c486d82`). On a tester's RTX 3090s (Gen4) `tools/p2p_store.cu` measured
+~47 µs, ~11 GB/s. What the probe proves is that the words arrive, at its own buffers: not the flag-after-data
+ordering the ring also relies on, and not the ring's addresses, so a fault that depends on either can still pass.
+
+Every card's BAR1 must cover all its memory: the ring's stores into a card go through it. The engine reads each card's
+BAR1 from `/sys/bus/pci/devices/<bdf>/resource` (readable by anyone on a standard kernel; one that hides it stops the
+load at that path) and refuses a smaller one, naming the card and both sizes. A V100-32GB's BAR1 is 32 GiB, all of
+it, so prod's cards pass. `FNX_SKIP_BAR1_CHECK=1` skips this check alone, and the engine says so as it loads.
+
+## Other GPUs
+
+`ARCH` is a build setting like `FNX_NCARD`: the compute capability the kernels are built for, default 70 for prod's
+V100s, and `build/arch` records the one `build/` was made for (another rebuilds everything).
+
+| `ARCH` | Cards | Status |
+| --- | --- | --- |
+| 70 | V100 | prod |
+| 86 | RTX 3090, A6000, A40 | run on RTX 3090s at a tester's; logits not yet checked ([docs/verification.md](verification.md#rtx-3090s)) |
+| 80, 89, 90, 100, 120 | A100; RTX 4090, L40S, RTX 6000 Ada; H100; B200; RTX 5090, RTX PRO 6000 Blackwell | every object compiles (nvcc 12.9); never run |
+| 75 | Turing | refused: the prompt path's recurrent kernel takes ~73 KB of shared memory a block, Turing gives 64 (and no Turing card has 80 SMs) |
+
+What a card must be beyond its arch is checked when the engine starts, not at build. As the model loads, the engine
+refuses a card that is not the build's arch exactly (the driver would otherwise compile the kernels' PTX for it at
+load, unchecked) or has fewer SMs than the hc read keeps resident (`HC_READ_BLOCKS` in `src/model.hpp`, 80: an RTX
+3080's 68, an RTX 4080's 76 and an A10's 72 are too few); before the first window it tries every link ([Boot
+requirement](#boot-requirement)). On the arches that never ran, the one Volta-tuned instruction the experts use
+(`mma.sync.m8n8k4`, `src/moe_mma.cuh`) compiles, and NVIDIA's PTX documentation says it runs on later arches,
+possibly much slower: speed there is unknown until measured. llama.cpp's libraries are built for the same arch, and a
+make of the encoder or the reference tools stops if `llama.cpp/build/bin/libggml-cuda.so` holds kernels for another
+arch or llama.cpp was configured with another nvcc version. `CUDA=/opt/cuda-12.9` takes nvcc, CUPTI and llama.cpp's compiler from a toolkit
+somewhere other than `/usr/local/cuda`; `build/cuda` records the nvcc and its version, so another rebuilds everything.
+
+RTX 3090s have run sFNX at a tester's (four cards, PCIe Gen4, AMD EPYC; [docs/verification.md](verification.md#rtx-3090s)).
+What they needed:
+
+- **Peer access.** GeForce drivers refuse it between cards; the tester ran the open kernel modules with the community
+  P2P patch (aikitoria's fork of open-gpu-kernel-modules, driver 595.84).
+- **Resizable BAR at full size on every card.** The patch maps a pair only when both cards' BAR1 covers their memory.
+  With a smaller one `cudaDeviceCanAccessPeer` still says 1 and `nvidia-smi topo -p2p` still says OK, but stores
+  between the cards are lost: the ring hung, and a probe through such a mapping reset the tester's host. The engine's
+  BAR1 check (above) refuses such a card. `nvidia-smi -q | grep -A3 "BAR1 Memory"` shows the size; if
+  `lspci -vvv -s <bus>`'s Resizable BAR lists nothing as large as the memory, no BIOS setting fixes it: the card
+  needs a ReBAR VBIOS from its maker (one of the tester's four did).
+- **CUDA 12.9.** With 12.8 and driver 595 the engine hung in `cudaGraphInstantiate` at start.
+- **Fewer experts in VRAM.** 24 GB cards hold less than 32 GB ones: `FNX_EXPERT_RAM_GIB` with
+  `FNX_EXPERT_PROFILE` ([docs/memory.md](memory.md)); 28 GiB on three cards, 12 GiB on four at 262,144 context with
+  `FNX_KV8=1`. More is not always better: a card needs at least 2 x 16 x 10 = 320 resident slots a pool, so 42 GiB in
+  RAM on three cards was refused. At 131,072 context on three cards a window graph ran out of memory at its first
+  capture; the tester fixed the K/V pool's own pages instead (`FNX_ARENA_BASE_PAGES=366`). The setting for that is a
+  larger `FNX_ARENA_RESERVE_MIB` (512 was measured on V100s, not on 3090s); `FNX_ARENA_BASE_PAGES` is for the checks.
+
+Such a box's config belongs outside the checkout (above: *Your own config*), with its `"gpu"` list and, for a
+toolkit outside the library path, `"lib_dirs"`.
 
 ## Where this API differs from Strata's
 

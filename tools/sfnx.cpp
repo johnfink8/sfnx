@@ -32,6 +32,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <set>
 #include <sstream>
@@ -996,6 +997,17 @@ void check_test_prompt() {
     std::fprintf(stderr, "sfnx: SFNX_TEST_PROMPT: every text request reads %s instead of its own tokens\n", tp);
 }
 
+// the engine state after a failure part way is unknown: say why and _exit at once (the front end starts it again). No
+// destructors: freeing the conversation cache's pinned memory takes minutes, and the stdin reader thread keeps the
+// process up, while the front end waits for the ERR line or EOF
+[[noreturn]] void fail(const std::exception& ex) {
+    say(std::string("ERR ") + ex.what());
+    std::fprintf(stderr, "sfnx: failed: %s\n", ex.what());
+    std::fflush(stdout);
+    std::fflush(stderr);
+    std::_Exit(1);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1009,31 +1021,29 @@ int main(int argc, char** argv) {
         return 2;
     }
     const auto t_load = std::chrono::steady_clock::now();
-    fnx::Model m(a.gguf.c_str());
-    const fnx::Mtp mtp(m, a.mtp_dir, a.draft_vocab);
-    fnx::Engine e(m, a.max_ctx, a.batch);
-    e.mtp_attach(mtp);
-    Input in;
-    // the engine state after a failure part way is unknown: say why and _exit at once (the front end starts it
-    // again). No destructors: freeing the conversation cache's pinned memory takes minutes, and the stdin reader
-    // thread keeps the process up, while the front end waits for the ERR line or EOF
-    auto fail = [](const std::exception& ex) {
-        say(std::string("ERR ") + ex.what());
-        std::fprintf(stderr, "sfnx: failed: %s\n", ex.what());
-        std::fflush(stdout);
-        std::fflush(stderr);
-        std::_Exit(1);
-    };
+    // made in place and failed like the rest, so a card or link refused at load ends with its reason too
+    std::optional<fnx::Model> m;
+    std::optional<fnx::Mtp> mtp;
+    std::optional<fnx::Engine> e;
     try {
-        Server srv(a, m, e, in);
+        m.emplace(a.gguf.c_str());
+        mtp.emplace(*m, a.mtp_dir, a.draft_vocab);
+        e.emplace(*m, a.max_ctx, a.batch);
+        e->mtp_attach(*mtp);
+    } catch (const std::exception& ex) {
+        fail(ex);
+    }
+    Input in;
+    try {
+        Server srv(a, *m, *e, in);
         std::string vfree;   // each card's, "a / b / c"
-        for (const long v : e.free_vram_mib()) vfree += (vfree.empty() ? "" : " / ") + std::to_string(v);
+        for (const long v : e->free_vram_mib()) vfree += (vfree.empty() ? "" : " / ") + std::to_string(v);
         std::fprintf(stderr,
                      "sfnx: loaded in %.1f s, context %d, MTP K=%d, lookup %d, %d slot(s); %d cards, sums between them %s; K/V pool "
                      "(%s) %d positions free; VRAM free %s MiB\n",
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load).count(), a.max_ctx, a.K, a.lookup, a.batch,
                      fnx::NCARD, fnx::ring_f32() ? "fp32" : "fp16",
-                     fnx::kv_q8() ? "int8" : "f16", e.free_pages() * fnx::KVP_POS, vfree.c_str());
+                     fnx::kv_q8() ? "int8" : "f16", e->free_pages() * fnx::KVP_POS, vfree.c_str());
         if (fnx::NCARD > 3)
             std::fprintf(stderr, "sfnx: %d cards builds and passes the CPU checks but has not been validated on hardware "
                                  "(docs/verification.md, \"Other card counts\")\n", fnx::NCARD);

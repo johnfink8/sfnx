@@ -11,7 +11,10 @@ the verification and the settings.
 
 - **`src/`**: the engine. CUDA kernels and headers (`.cuh`), `engine.cu`, `prefill.cu`, `model.cpp`, `session.cpp`,
   `batch.cpp` (batched windows with drafts), `batch_plan.hpp` (their row plan), `card_split.hpp` (how a layer
-  divides over the cards, for any supported count), `pf_ring_plan.hpp` (the prompt path's ring steps). `kernels.cu`
+  divides over the cards, for any supported count), `pf_ring_plan.hpp` (the prompt path's ring steps),
+  `card_check.hpp` (what a card must be for the build: arch, SMs, BAR1, checked as the model loads),
+  `peer_probe.cu` / `.hpp` (every link written and watched before the engine uses it, and the report and failure text
+  it prints). `kernels.cu`
   compiles as nine objects (`-DFNX_KPART=0..8`), each holding its share of the launchers.
 - **`tools/`**: `sfnx.cpp` is the engine process (a line protocol on stdin, `sfnx_input.hpp`); `fnx_run.cpp` is the
   lab harness; `fnx_hold` / `fnx_lab` + `lab.sh` are the lab; the `*_test` programs and `*_check.sh` scripts are the
@@ -49,8 +52,11 @@ make trace                                             # the CUPTI tracer (tools
   checkout, its other paths are `cwd`'s). The GGUFs come through `models`, a link to the folder holding
   `UD-Q4_K_XL/`, `Q8_0/` and `mmproj-F16.gguf`.
 - llama.cpp at a37cc46 lives in `llama.cpp/` (a checkout or a link; `make LLAMA=path` for elsewhere), built with
-  CUDA for sm_70 by the Makefile on first use. It supplies ggml headers, the picture encoder's libraries and the
+  CUDA for the build's `ARCH` by the Makefile on first use. It supplies ggml headers, the picture encoder's libraries and the
   reference tools.
+- `ARCH=86` builds for RTX 3090s and `CUDA=path` takes another toolkit (`docs/config.md`, "Other GPUs"); prod is the
+  default 70. An sm_86 build has run only at a tester's, its logits unchecked (`docs/verification.md`, "RTX 3090s");
+  80, 89, 90, 100 and 120 build and have never run; 75 is refused.
 - The engine programs and the lab's library link one set of position-independent objects in `build/`.
 - **Building writes `bin/sfnx` in place: stop the service first** (`sudo systemctl stop sfnx`), or build in another
   worktree.
@@ -87,7 +93,7 @@ done.
 | `lab.sh exact base` | writes a new base, only when every prompt passes; `MODEL-base.id` records the build | `NOT written`, exit 1 |
 | `lab.sh batch` | batched windows (with their drafts) give each lane its tokens alone | MISMATCH, exit 1 |
 | `bin/sample_test` | speculative sampling matches plain sampling in distribution | MISMATCH, exit 1 |
-| `bin/topk_test`, `bin/batch_plan_test`, `bin/sfnx_input_test`, `bin/pf_ring_plan_test`, `bin/rope_test` | the top-k ties, the batched row planner, the engine's stdin handling, the prompt path's ring steps on every supported count, YaRN's constants against ggml's (the last four CPU only) | non-zero exit |
+| `bin/topk_test`, `bin/batch_plan_test`, `bin/sfnx_input_test`, `bin/pf_ring_plan_test`, `bin/rope_test`, `bin/card_check_test`, `tools/build_guards_check.sh` | the top-k ties, the batched row planner, the engine's stdin handling, the prompt path's ring steps on every supported count, YaRN's constants against ggml's, the card checks at load against real cards' numbers and sysfs, the link probe's report and failure text, the Makefile's checks of ARCH and FNX_NCARD (the last six CPU only) | non-zero exit |
 | `serve/api_smoke.py`, `serve/image_test.py` | the API surface and pictures through the front end | `N failed` |
 | `.venv/bin/python -m pytest -q front/` | the front end (CPU only) | pytest |
 
