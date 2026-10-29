@@ -96,6 +96,27 @@ has fewer SMs than the hc read keeps resident (80, `HC_READ_BLOCKS`), sits in a 
 smaller than its memory. Before the first window it writes across every link between the cards and stops, naming the
 pair, if anything does not arrive; a link under 1 GB/s gets a warning. What a box needs and what each refusal says: [docs/config.md](docs/config.md#other-gpus).
 
+## The 27B (dense)
+
+`make FNX_MODEL=27b` builds sFNX for Qwen3.8-27B, the family's dense model, at Q8_0 (`serve/sfnx-27b.json`): the same
+front end, lanes, drafts, conversation cache and pictures, from an engine of its own behind the same interface
+([docs/config.md](docs/config.md#model)). Every layer splits across the three cards as Flash-Next's does, except
+attention, which splits by heads: the 27B's 4 KV heads let each card keep the K/V of the heads it reads.
+
+| Workload, one request through the lab's runs unless the row says otherwise | |
+| --- | --- |
+| Code edit, greedy | 318 tok/s |
+| New code, greedy | 157 tok/s |
+| Prose, prod's sampling | 114 tok/s |
+| Six conversations decoding at once, with drafts | 224 tok/s combined (`bin/batch_test`, `ref/long2` and `ref/code1`) |
+| Prompt reading: 8k / 32k / 62k / 114k tokens | 2,435 / 2,264 / 1,965 / 1,602 tok/s |
+
+Its logits are held to llama.cpp's own CPU-against-CUDA distance on the 27B, a bar 5–30x tighter than Flash-Next's.
+Every prompt's top-1 agreement meets it and the code edit's KL does; code, the picture and the 62k prompt sit at 1.3–1.6x
+its KL. llama.cpp decodes the 27B Q8_0 at ~24 tok/s on this box, one request; 1Cat-vLLM's own V100 numbers are 69–98
+alone, 222–225 at six, ~1.3k tok/s reading 96k. Details:
+[docs/benchmarks.md](docs/benchmarks.md#qwen38-27b), [docs/verification.md](docs/verification.md#the-27b).
+
 ## Running it
 
 Needs CUDA 12.9 (`make CUDA=path` for a toolkit other than `/usr/local/cuda`), g++-14, llama.cpp at a37cc46 checked
@@ -134,7 +155,7 @@ and the files they read: [docs/config.md](docs/config.md).
 
 ## Limits
 
-- One model, measured on one box: three `sm_70` cards (or two; four, six or eight build but are untested). RTX 3090s
+- Two models (Flash-Next; the 27B as a build of its own, at Q8_0 only and on three cards only), measured on one box: three `sm_70` cards (or two; four, six or eight build but are untested). RTX 3090s
   (`ARCH=86`) run at a tester's, not yet checked against llama.cpp; 80, 89, 90, 100 and 120 build but have never run,
   and Turing is refused. No FP8, and no CUDA 13 (it drops `sm_70`).
 - Every pair of cards must be CUDA peers over PCIe: GeForce cards need a community driver patch and full Resizable BAR

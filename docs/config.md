@@ -95,8 +95,11 @@ How the 27B splits, on three cards only (the Makefile refuses another count for 
 Its settings: `FNX_KV_RESERVE_MIB` (default 1024: VRAM kept from the K/V pool for graphs, cuBLAS and the lanes' tables;
 the pool takes the rest, ~490k positions at 1024), `FNX_KV_PAGES` (a pool of that many 256-position pages instead),
 `FNX_PF_ROWS` (prompt chunk rows, as Flash-Next), `FNX_PF_SCORE_MIB` (the prompt attention's scores' room a card,
-default 256), `FNX_PF_SCORES=f16` (those scores as f16: [docs/benchmarks.md](benchmarks.md#qwen38-27b)). `FNX_KV8=1`
-and `FNX_RING_F32=1` are refused: its K/V is f16 (llama.cpp's default) and its ring fp16.
+default 256), `FNX_PF_SCORES` (those scores as `f16`, the default, or `f32`: [docs/benchmarks.md](benchmarks.md#qwen38-27b)),
+`FNX_RING_F32=1` (decode's sums as fp32 through Flash-Next's ring; it measured no closer to llama.cpp,
+[docs/verification.md](verification.md#the-27b)), `FNX_PF_WINDOWS=1` (a check: a prompt through decode windows). Its
+K/V is f16 (llama.cpp's default): `FNX_KV8=1` is refused, as is any of Flash-Next's settings for what the 27B has
+not (experts, the arena, hyper-connections, QSA, that prompt path's knobs).
 
 ## Engine settings
 

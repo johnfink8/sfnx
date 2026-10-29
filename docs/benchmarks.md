@@ -164,6 +164,70 @@ to the RAM:
 
 The one-card build is not in this repo; `FNX_NCARD` takes 2 or 3.
 
+## Qwen3.8-27B
+
+The family's dense model at Q8_0 (`make FNX_MODEL=27b`, [docs/config.md](config.md#model)), on the same box,
+2026-10-29.
+
+**One request** (`bin/fnx_run decode`, the lab's runs: edit1 and code1 greedy, prose2 at prod's sampling, seeds 1-5;
+the 27B loads plain, so `fnx_run` stands in for `tools/lab.sh decode`). GPUs 97% busy, 160 W a card.
+
+| Workload | tok/s | Per round |
+| --- | --- | --- |
+| Code edit (`ref/edit1`), greedy | 317.9 | 11.2 tokens, 35.1 ms |
+| New code (`ref/code1`), greedy | 156.9 | 3.5 tokens, 22.4 ms |
+| Prose reasoning (`ref/prose2`), temperature 0.6 | 114.0 | 2.2 tokens, 19.3 ms |
+
+**Several conversations at once** (`bin/batch_test`: `ref/long2`, `ref/code1`, `ref/long2` dealt round the lanes, 64
+tokens each, greedy). Tokens a second, summed over the lanes:
+
+| Lanes | One row a lane | With lookup and draft-layer drafts |
+| --- | --- | --- |
+| 1 | 53.8 | 107.7 |
+| 2 | 104.0 | 170.4 |
+| 3 | 147.4 | 180.1 |
+| 6 | 204.8 | 223.9 |
+
+**Windows by row count** (`S27_BENCH=1 bin/s27_run`, GPU time, median of 15):
+
+| Rows | 1 | 2 | 3 | 4 | 5 | 6 | 8 | 12 | 16 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| ms | 16.1 | 16.9 | 17.9 | 18.9 | 21.1 | 21.9 | 24.8 | 32.1 | 42.8 |
+
+One row reads 9.2 GB a card: ~570 GB/s of the cards' 880.
+
+**Prompts** (`bin/s27_run`: the prompt but its last token through the prompt path). Prompts used: the first 8,192 and
+32,768 tokens of `ref/long64`, then `ref/long64` and `ref/long114` whole. GPUs 98% busy, 182 W a card.
+
+| Prompt | Read in | tok/s |
+| --- | --- | --- |
+| 8,192 tokens | 3.36 s | 2,435 |
+| 32,768 | 14.47 s | 2,264 |
+| 62,794 | 31.95 s | 1,965 |
+| 114,000 | 71.16 s | 1,602 |
+
+**Where a prompt chunk's time goes.** A 4,096-row chunk at the start of `ref/long64`, by part (`FNX_PF_SKIP`, with each
+sum run after its half rather than beside the other chunk):
+
+| Part | Time a chunk |
+| --- | --- |
+| The dense products and the recurrent core | 1.23 s |
+| The sums | 0.65 s |
+| Attention | grows with the position: ~0 at the start, 0.64 s at 28k, 1.3 s at 57k |
+
+With two chunks a pass, each half's sum crosses the links while the other chunk computes: 8,192 rows in 3.2 s at the
+start, against 3.9 s run one after another. f16 scores (the default) read 4–7% faster than f32 (32k: 2,187 against
+2,096 tok/s).
+
+**The other engines, the same model.** llama.cpp (a37cc46, its layer split over the three cards) decodes ~24 tok/s, one
+request. 1Cat-vLLM's own numbers on V100s, not run here:
+
+- FP8 on two cards: 69–73 tok/s without drafts.
+- NVFP4 with DFlash2: 80–98 alone, 222–225 at six.
+- ~1.3k tok/s reading 96k.
+
+1Cat cannot split the 27B's 4 KV heads over three cards.
+
 ## The reference implementation on the same cards
 
 Upstream llama.cpp (a37cc46, same model, all layers on the three cards, `llama-bench`): 46.9 tok/s decode and 439 tok/s

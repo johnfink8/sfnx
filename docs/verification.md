@@ -73,6 +73,83 @@ On the current build at 49 GiB in RAM (the lab's `logits` against the same CPU t
 code edit 100.00% / 2.79e-6 / 2.1e-5. Both inside the Q4 bar above — llama.cpp's CPU backend against its CUDA one,
 4.85e-4 and 4.12e-6 — as sFNX's Q4 path is.
 
+## The 27B
+
+Qwen3.8-27B Q8_0 (`make FNX_MODEL=27b`, [docs/config.md](config.md#model)). Its bar is its own, made the same way:
+llama.cpp (a37cc46) on the 27B, CUDA greedy, against its CPU backend teacher-forced on the CUDA tokens
+(`ref/fnx_logref` with `FNX_LOGREF_GPU=0`). The picture's is the same under llama.cpp's own encoder (`ref/img_logref`,
+`IMG_LOGREF_GPU=0`). For the 62k prompt, where the CPU backend would take hours, it is llama.cpp's q8_0 K/V against
+its f16 K/V, as Flash-Next's long bar.
+
+The dense model's two llama.cpp backends agree far more closely than Flash-Next's do, so the bars are 5–30x tighter
+than Flash-Next's: code KL 8.95e-5 against 4.85e-4, edit 1.48e-7 against 4.12e-6.
+
+`bin/fnx_run MODEL exact`, as `serve/sfnx-27b.json` runs it: f16 K/V, the prompt through the prompt path (f16 scores),
+windows of 5. Measured 2026-10-29:
+
+| Prompt | | Top-1 agrees | KL mean | KL p99 |
+| --- | --- | --- | --- | --- |
+| Code, 300 steps | sFNX | 100.00% | 1.25e-4 | 1.8e-3 |
+| | llama.cpp CPU | 100.00% | 8.95e-5 | 1.8e-3 |
+| Code edit, 300 steps | sFNX | 100.00% | 1.44e-7 | 1.9e-6 |
+| | llama.cpp CPU | 100.00% | 1.48e-7 | 3.0e-6 |
+| The logo's source picture, 200 steps | sFNX | 99.50% | 7.56e-4 | 1.73e-2 |
+| | llama.cpp CPU | 99.50% | 4.69e-4 | 8.2e-3 |
+| 62,794-token prompt (`ref/long64`), 200 steps | sFNX | 100.00% | 2.65e-4 | 2.0e-3 |
+| | llama.cpp q8_0 K/V | 99.50% | 2.08e-4 | 2.4e-3 |
+
+Windows of 1, 2, 3, 11 and 16 rows give the 5-row windows' logits byte for byte.
+
+**It is not within the bar on three of the four, and the exact check says so** (`FAIL`, so no base is written). The
+edit is within it. Every prompt's top-1 agreement is the bar's or better. On KL:
+
+- **Code:** 1.40x the bar, against the 1.25x slack.
+- **Picture:** 1.61x.
+- **long64:** 1.27x, where the slack is 1.0.
+
+How much these move with each choice:
+
+| Setting | Code | Picture | long64 |
+| --- | --- | --- | --- |
+| The default, f16 scores | 1.25e-4 | 7.56e-4 | 2.65e-4 |
+| `FNX_PF_SCORES=f32` | 1.13e-4 | 8.82e-4 | 2.89e-4 |
+| 1,024-row prompt chunks (`FNX_PF_ROWS=1024`) | | | 2.88e-4 |
+| The decode decay through `__expf` (before this build) | 9.48e-5 | | |
+
+Each choice moves the numbers by about as much as the gap, and none brings all three in. The 27B's prompt path
+multiplies in f16 on the tensor cores; llama.cpp reads a Q8_0 prompt with int8 products of quantized activations, and
+its two backends share that.
+
+The fp16 sums between the cards are not it: `FNX_RING_F32=1` moved edit1 by 1.45e-7 and left its distance from
+llama.cpp where it was.
+
+**What the checks found on the way:**
+
+- **Every prompt pass after the first re-read the prompt's start.** long64 took the end-of-text token from its first
+  step: top-1 21.5%, KL 3.67. Fixed: the position-to-token mapping takes the history's length once before the passes,
+  as `prefill.cu` does. Prompts of 8,192 tokens or fewer were never affected.
+- **Decode's recurrent decay went through `__expf`.** A prompt read through windows drifted from llama.cpp: edit1 KL
+  1.1e-6, against 2.25e-7 with the decay through double, as `gdn_prompt` already took it. This is the 27B's only; its
+  build has it behind `#if FNX_27B`.
+
+`bin/fnx_run MODEL exact` runs the set, as `tools/lab.sh exact` does for Flash-Next (the lab holds Flash-Next only).
+The 27B's references are `ref/lgr/llama_cuda_Qwen3.8-27B-Q8_0_<prompt>.lgr` and `ref/img/sphinx_Qwen3.8-27B-Q8_0.*`,
+made locally like the rest of `ref/lgr/`.
+
+Checked on the 27B as on Flash-Next:
+
+- **Batched windows** give each lane its tokens alone, plain and with drafts (`bin/batch_test`, 1 / 2 / 3 / 6 lanes).
+  Each batched row is rotated by its own lane's M-RoPE table.
+- **The speculative sampler** matches plain sampling through three batched lanes with drafts (`SAMPLE_TEST_LANES=3
+  bin/sample_test`, open1, 600 seeds: every p >= 0.116).
+- **The API and pictures through the front end:** `serve/api_smoke.py` 10 of 10, `serve/image_test.py` 6 of 6
+  (three requests at once among them), and `pytest front/` 595 passed.
+
+**A Flash-Next build is main's code.** A Flash-Next build has no `FNX_27B` left in it. Its 20 translation units (the
+nine kernel parts, the engine, the prompt path, the model, the session, the batch, `sfnx`, `fnx_run` and the lab's
+programs) preprocess to text identical to main's, byte for byte, with the same flags. Its logits and speed cannot have
+moved, and its bases stand.
+
 ## Other card counts
 
 Four, six and eight cards build (`make FNX_NCARD=n`, [docs/config.md](config.md#card-count)) but **have never run**:
