@@ -1203,6 +1203,12 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
 #if FNX_27B
     for (int c = 0; c < NCARD; ++c) cards[c].fd0 = ffd_lo(NCARD, c), cards[c].fd1 = ffd_lo(NCARD, c + 1);
     if (cards[NCARD - 1].fd1 != FFD) throw std::runtime_error("27b: the cards' dense FF slices do not cover its width");
+    {   // the image-pad token, whose runs in a prompt are a picture's cells (tools/sfnx.cpp, GENI)
+        const std::vector<std::string>& toks = g.tokens();
+        const auto it = std::find(toks.begin(), toks.end(), "<|image_pad|>");
+        if (it == toks.end()) throw std::runtime_error("27b: the tokenizer has no <|image_pad|> token");
+        ple_image = it - toks.begin();
+    }
     if (how != Load::PLAIN) throw std::runtime_error("27b: plain loads only (the lab's holder does not hold the 27B)");
 #endif
     if (how == Load::ATTACH) {   // a lab worker: the holder's weights are mapped already; take its tables, place the experts

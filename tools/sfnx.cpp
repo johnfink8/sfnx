@@ -1043,7 +1043,11 @@ int main(int argc, char** argv) {
                      "(%s) %d positions free; VRAM free %s MiB\n",
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load).count(), a.max_ctx, a.K, a.lookup, a.batch,
                      fnx::NCARD, fnx::ring_f32() ? "fp32" : "fp16",
+#if FNX_27B
+                     "f16", e->free_pages() * fnx::S27_PP, vfree.c_str());
+#else
                      fnx::kv_q8() ? "int8" : "f16", e->free_pages() * fnx::KVP_POS, vfree.c_str());
+#endif
         if (fnx::NCARD > 3)
             std::fprintf(stderr, "sfnx: %d cards builds and passes the CPU checks but has not been validated on hardware "
                                  "(docs/verification.md, \"Other card counts\")\n", fnx::NCARD);

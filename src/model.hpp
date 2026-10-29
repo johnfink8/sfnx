@@ -242,7 +242,7 @@ struct Model {
     const Tensor* ple_table = nullptr;
     std::vector<uint64_t> ple_mult, ple_off, ple_vocab;
     int64_t ple_eos = 0;
-    int64_t ple_image = 0;   // what the PLE n-grams read for an image cell
+    int64_t ple_image = 0;   // what the PLE n-grams read for an image cell (the 27B: its image-pad token)
     float eps = 1e-6f, rope_base = 1e7f;
     int ctx_train = 0;   // the GGUF's context_length: the longest context the engine takes unscaled, and YaRN's n_ctx_orig
     double yarn_factor = 0;   // the GGUF's own YaRN (rope.scaling.type yarn): its factor, 0 for none

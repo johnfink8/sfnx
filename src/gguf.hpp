@@ -55,6 +55,9 @@ public:
     // a number key, integer or float, as GGUF writers differ on which
     double num(const std::string& key) const { return ints_.count(key) ? (double) i(key) : f(key); }
     std::vector<int64_t> ia(const std::string& key) const;
+#if FNX_27B
+    const std::vector<std::string>& tokens() const;   // tokenizer.ggml.tokens (throws when missing)
+#endif
     const std::map<std::string, Tensor>& tensors() const { return tensors_; }
     int shards() const { return (int) maps_.size(); }
     const std::string& shard_path(int s) const { return maps_[(size_t) s].path; }
@@ -69,6 +72,9 @@ private:
     std::map<std::string, double> floats_;
     std::map<std::string, std::vector<int64_t>> int_arrays_;
     std::map<std::string, std::string> strs_;
+#if FNX_27B
+    std::map<std::string, std::vector<std::string>> str_arrays_;
+#endif
     std::set<std::string> keys_;
     void load_shard(const std::string& path, bool meta);
 };
