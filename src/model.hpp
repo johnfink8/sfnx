@@ -33,6 +33,7 @@ constexpr int FFD = 17408;                             // the dense FFN's width
 // a card's dense FF slice: whole 32-value blocks, the first cards one block wider (544 blocks: 182 / 181 / 181)
 constexpr int ffd_lo(int n, int c) { return 32 * (c * (FFD / 32 / n) + (c < FFD / 32 % n ? c : FFD / 32 % n)); }
 constexpr int FFD_CARD_MAX = (FFD + 32 * NCARD - 1) / (32 * NCARD) * 32;
+constexpr int S27_PP = 256;                            // K/V positions a page (s27_attn.cuh)
 #else
 constexpr int N = 2560, HC = 4, D = N * HC, LR = 320;
 constexpr int NL = 48, NEXP = 512, TOPK = 10, FF = 640, FF_SH = 640;

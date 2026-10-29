@@ -17,7 +17,7 @@ namespace fnx {
 constexpr int S27_NQ = NQH / NCARD, S27_NKV = 2;
 constexpr int S27_QKV = S27_NQ * 2 * HD + 2 * S27_NKV * HD;
 constexpr int S27_ASPLIT = 32;   // position splits of a row's attention
-constexpr int S27_PP = 256;      // positions a page
+
 constexpr int S27_SLOTS = NL / 4 + 1;   // the attention layers, then the draft layer
 constexpr size_t S27_ROWH = (size_t) S27_NKV * HD;              // halves a position takes in K (or V)
 constexpr size_t S27_SLOT = (size_t) 2 * S27_PP * S27_ROWH;     // halves of a layer's slot in a page
