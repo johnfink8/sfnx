@@ -57,7 +57,8 @@ void gemv_f32(const float* W, const float* x, float* y, int rows, int n, int T, 
 size_t hc_scratch_floats(int T);
 int hc_blocks();    // the read's blocks of work; a card with fewer SMs runs them on one block per SM
 // sizes the read's grid to the current card (before its first hc_read or hc_preset_barrier); returns it. cap > 0: at most
-// cap blocks, as a card with that many SMs would run (kbench)
+// cap blocks, as a card with that many SMs would run (kbench). A scratch's barrier counter counts in generations of the
+// grid it ran with: zero it when the grid changes
 int hc_prepare(int cap = 0);
 int hc1_rows();   // FNX_HC1: windows of up to this many rows take the read's one-barrier form (read once; throws if bad)
 void hc_read(float* R, const float* bo_prev, const float* inj_prev, const float* w_norm, const Q8S& w_down,

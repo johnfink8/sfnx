@@ -179,12 +179,14 @@ int main() {
             std::printf("T=%d hc_read       %7.1f us (%5.1f MB, %4.0f GB/s)\n", T, us, mb, mb / us * 1e3);
             for (const int g : {72, 64, 40}) {   // as a card of g SMs runs it (a 72-SM PG500-216)
                 hc_prepare(g);
+                cudaMemset(scratch, 0, hc_scratch_floats(MAXT) * 4);   // its barrier counter, in generations of 80
                 const float ug = time_us([&](cudaStream_t s) {
                     hc_read(R, bo, inj, wn, wd, wu, wi, 1e-6f, mixed, injo, scratch, herr, T, s, q8);
                 });
                 std::printf("T=%d hc_read on %d %7.1f us (x%.2f)\n", T, g, ug, ug / us);
             }
             hc_prepare();
+            cudaMemset(scratch, 0, hc_scratch_floats(MAXT) * 4);
             {   // the same with the down weights pulled into L2 first (not timed)
                 cudaStream_t st;
                 cudaStreamCreate(&st);
