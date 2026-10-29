@@ -2,6 +2,7 @@
 #include "engine.hpp"
 #include "engine_impl.hpp"
 #include "env.hpp"
+#include "peer_probe.hpp"
 
 #include <cuda_runtime.h>
 #include <unistd.h>
@@ -88,37 +89,6 @@ long host_available_mib() {
     std::fclose(f);
     return kb < 0 ? -1 : kb / 1024;
 }
-// the ring stores straight into the next card's memory: with translated IOMMU domains every such write faults
-// (dmesg: "DMAR: ... PTE Write access is not set") and the first window ends in a ring timeout that names nothing.
-// Each card's IOMMU group must be identity (boot with iommu=pt); a card without a group has no IOMMU in the way
-void require_identity_iommu(int dev) {
-    char bus[32];
-    ck(cudaDeviceGetPCIBusId(bus, sizeof bus, dev), "cudaDeviceGetPCIBusId");
-    // CUDA's spelling ("0000:3B:00.0") in sysfs's (lower case, a 4-digit domain)
-    unsigned dom = 0, b = 0, d = 0, fn = 0;
-    if (std::sscanf(bus, "%x:%x:%x.%x", &dom, &b, &d, &fn) != 4)
-        throw std::runtime_error("card " + std::to_string(dev) + ": cannot read its PCI address '" + bus + "'");
-    char bdf_s[32];
-    std::snprintf(bdf_s, sizeof bdf_s, "%04x:%02x:%02x.%x", dom, b, d, fn);
-    const std::string bdf(bdf_s);
-    const std::string dir = "/sys/bus/pci/devices/" + bdf;
-    if (access(dir.c_str(), F_OK) != 0)
-        throw std::runtime_error("card " + std::to_string(dev) + " (" + bdf + "): no " + dir + " to read its IOMMU group from");
-    const std::string path = dir + "/iommu_group/type";
-    if (access((dir + "/iommu_group").c_str(), F_OK) != 0) return;
-    std::FILE* f = std::fopen(path.c_str(), "r");
-    char type[64] = {0};
-    if (!f || !std::fgets(type, sizeof type, f)) {
-        if (f) std::fclose(f);
-        throw std::runtime_error("card " + std::to_string(dev) + " (" + bdf + "): cannot read " + path);
-    }
-    std::fclose(f);
-    std::string t(type);
-    while (!t.empty() && (t.back() == '\n' || t.back() == ' ')) t.pop_back();
-    if (t != "identity")
-        throw std::runtime_error("card " + std::to_string(dev) + " (" + bdf + ") is in an IOMMU group of type '" + t + "' (" + path +
-                                 "): the ring's writes between cards need identity domains; boot with iommu=pt");
-}
 }  // namespace
 
 
@@ -156,7 +126,6 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
     hc1_rows();   // FNX_HC1 checked now, not at the first hc read (inside a graph capture)
     pf_jobs_ = pf_c_ * TOPK / PF_JOB + NEXP;   // jobs of up to PF_JOB pairs per expert, at most
     set_prompt_rows(pf_c_);
-    for (int c = 0; c < NCARD; ++c) require_identity_iommu(m.cards[c].dev);
     const int extra_pages = (std::max(lanes, 1) - 1) * lane_block_pages();
     // the paged K/V pool: pages for the whole context (one more for the block a position past the last one needs)
     // and the extra lanes' blocks. Int8 rows: the context's pages as many as fit in their f16 bytes (the smallest ratio
@@ -304,6 +273,13 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         b->att_ring.in = dalloc<unsigned long long>(att_ring_words());
         b->att_ring.err = b->ring.err;
         cb_.push_back(b);
+    }
+    // every link carries a probe's stores before the ring's (src/peer_probe.hpp): one that drops them stops the engine
+    // here, named, instead of in the first window's ring; a slow one is said and the engine goes on
+    {
+        std::vector<int> devs;
+        for (int c = 0; c < NCARD; ++c) devs.push_back(m.cards[c].dev);
+        for (const std::string& line : peer_report(probe_peer_stores(devs), NCARD)) std::fprintf(stderr, "%s\n", line.c_str());
     }
     for (int c = 0; c < NCARD; ++c) {
         cb_[c]->ring.next_in = cb_[(c + 1) % NCARD]->ring.in;

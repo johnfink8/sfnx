@@ -24,6 +24,9 @@ constexpr int NL = 48, NEXP = 512, TOPK = 10, FF = 640, FF_SH = 640;
 constexpr int NKH = 16, NVH = 48, HS = 128;            // recurrent: key heads, value heads, head size
 constexpr int NQH = 24, NKVH = 2, HD = 256, NROT = 64; // attention
 constexpr int MAXT = 16;                               // rows per window
+// the hc read's grid (src/hc.cuh's H_BLOCKS, held to this there): every block resident at once, one an SM, so a card
+// with fewer SMs is refused at load (src/card_check.hpp)
+constexpr int HC_READ_BLOCKS = 80;
 constexpr int PLE_LAYER = 1, PLE_HEADS = 16, PLE_DIM = 160;
 
 }  // namespace fnx

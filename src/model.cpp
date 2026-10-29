@@ -1,4 +1,5 @@
 #include "model.hpp"
+#include "card_check.hpp"
 #include "env.hpp"
 #include "rope_gguf.hpp"
 
@@ -7,6 +8,7 @@
 #include <cuda_runtime.h>
 
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -30,6 +32,78 @@ namespace {
 
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
+}
+
+// a card's PCI address in sysfs's spelling
+std::string card_bdf(int dev) {
+    char bus[32];
+    ck(cudaDeviceGetPCIBusId(bus, sizeof bus, dev), "cudaDeviceGetPCIBusId");
+    try {
+        return sysfs_bdf(bus);
+    } catch (const std::exception& e) {
+        throw std::runtime_error("card " + std::to_string(dev) + ": " + e.what());
+    }
+}
+// the ring stores straight into the next card's memory: with translated IOMMU domains every such write faults
+// (dmesg: "DMAR: ... PTE Write access is not set") and the first window ends in a ring timeout that names nothing.
+// Each card's IOMMU group must be identity (boot with iommu=pt); a card whose iommu_group link is absent has no IOMMU
+// in the way. Only absent: a link that cannot be read or points nowhere (iommu_groups hidden from this process) is
+// refused, as a translated domain behind it would look the same
+void require_identity_iommu(int dev, const std::string& dir) {
+    if (access(dir.c_str(), F_OK) != 0)
+        throw std::runtime_error("card " + std::to_string(dev) + ": no " + dir + " to read its IOMMU group from");
+    const std::string link = dir + "/iommu_group", path = link + "/type";
+    struct stat st;
+    if (lstat(link.c_str(), &st) != 0) {
+        if (errno == ENOENT) return;
+        throw std::runtime_error("card " + std::to_string(dev) + ": cannot read " + link + ": " + std::strerror(errno));
+    }
+    std::FILE* f = std::fopen(path.c_str(), "r");
+    char type[64] = {0};
+    if (!f || !std::fgets(type, sizeof type, f)) {
+        if (f) std::fclose(f);
+        throw std::runtime_error("card " + std::to_string(dev) + ": cannot read " + path);
+    }
+    std::fclose(f);
+    std::string t(type);
+    while (!t.empty() && (t.back() == '\n' || t.back() == ' ')) t.pop_back();
+    if (t != "identity")
+        throw std::runtime_error("card " + std::to_string(dev) + " is in an IOMMU group of type '" + t + "' (" + path +
+                                 "): the ring's writes between cards need identity domains; boot with iommu=pt");
+}
+// the card's BAR1 from sysfs, held to its memory (require_bar1_covers)
+void check_bar1(int dev, const std::string& bdf, const std::string& dir, const cudaDeviceProp& prop) {
+    const std::string path = dir + "/resource";
+    std::FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) throw std::runtime_error("card " + std::to_string(dev) + ": cannot open " + path + " to read its BAR1 from");
+    std::string text;
+    char buf[4096];
+    for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) text.append(buf, n);
+    const bool bad = std::ferror(f);
+    std::fclose(f);
+    if (bad) throw std::runtime_error("card " + std::to_string(dev) + ": cannot read " + path);
+    require_bar1_covers(dev, bdf, prop.name, bar1_bytes(text, path), prop.totalGlobalMem, NCARD);
+}
+// the Makefile passes the arch the kernels were compiled for (ARCH): a default here would let a card of another one
+// run them through the driver's PTX compiler unchecked
+#ifndef FNX_ARCH
+#error "FNX_ARCH is unset: build through the Makefile (make ARCH=70 or 86)"
+#endif
+// The cards are checked before anything is placed on them (src/card_check.hpp has the rules): a card that fails one
+// would otherwise take the whole load first and then fail far from the cause, an sm_70 build on 24 GB cards out of
+// memory, a short BAR1 as a ring that never completes. The IOMMU check comes before BAR1's, as it is the one that
+// refuses a card with no sysfs directory: BAR1's would only say it cannot open the file
+void check_cards() {
+    const bool skip_bar1 = env_flag("FNX_SKIP_BAR1_CHECK");
+    if (skip_bar1) std::fprintf(stderr, "fnx: FNX_SKIP_BAR1_CHECK=1: the cards' BAR1 is not checked against their memory\n");
+    for (int dev = 0; dev < NCARD; ++dev) {
+        cudaDeviceProp prop;
+        ck(cudaGetDeviceProperties(&prop, dev), "cudaGetDeviceProperties");
+        require_card_arch(dev, prop.name, prop.major, prop.minor, prop.multiProcessorCount, FNX_ARCH, HC_READ_BLOCKS);
+        const std::string bdf = card_bdf(dev), dir = "/sys/bus/pci/devices/" + bdf;
+        require_identity_iommu(dev, dir);
+        if (!skip_bar1) check_bar1(dev, bdf, dir, prop);
+    }
 }
 
 float f16_to_f32(uint16_t h) {
@@ -847,6 +921,18 @@ Mtp::Mtp(const Model& m, const std::string& dir, const std::string& vocab_file) 
 Mtp::~Mtp() { free_mtp_cards(cards); }
 
 Model::Model(const std::string& path, Load how, Store* store, const std::string* image) : g(path) {
+    // the cards first: reading the embeddings into RAM below takes seconds on a cold cache
+    {
+        int ndev = 0;
+        ck(cudaGetDeviceCount(&ndev), "cudaGetDeviceCount");
+        // a build for another count than the cards it is given is a config or build mistake (a 2-card binary on
+        // prod's three would serve, slower): CUDA_VISIBLE_DEVICES (the config's "gpu") must name exactly NCARD
+        if (ndev != NCARD)
+            throw std::runtime_error("fnx: built for " + std::to_string(NCARD) + " cards (FNX_NCARD), " + std::to_string(ndev) +
+                                     " visible: set CUDA_VISIBLE_DEVICES (a config's \"gpu\") to " + std::to_string(NCARD) +
+                                     " of them, or build for " + std::to_string(ndev) + " (make FNX_NCARD=" + std::to_string(ndev) + ")");
+        check_cards();
+    }
     const std::string p = "qwen4exp.";
     if (g.i(p + "block_count") != NL || g.i(p + "embedding_length") != N || g.i(p + "expert_count") != NEXP ||
         g.i(p + "ssm.group_count") != NKH || g.i(p + "ssm.time_step_rank") != NVH || g.i(p + "attention.head_count") != NQH ||
@@ -926,15 +1012,6 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
         for (int v = 0; v < NVH; ++v)
             if (seen[(size_t) v] != 1)
                 throw std::runtime_error("fnx: value head " + std::to_string(v) + " is on " + std::to_string(seen[(size_t) v]) + " cards");
-    }
-    {
-        int ndev = 0;
-        ck(cudaGetDeviceCount(&ndev), "cudaGetDeviceCount");
-        // a build for another count than the cards it is given is a config or build mistake (a 2-card binary on
-        // prod's three would serve, slower): CUDA_VISIBLE_DEVICES (the config's "gpu") must name exactly NCARD
-        if (ndev != NCARD)
-            throw std::runtime_error("fnx: built for " + std::to_string(NCARD) + " cards (FNX_NCARD), " + std::to_string(ndev) +
-                                     " visible: set CUDA_VISIBLE_DEVICES (a config's \"gpu\") to " + std::to_string(NCARD) + " of them");
     }
     const int vstep = (vocab + NCARD - 1) / NCARD;
     for (int c = 0; c < NCARD; ++c) {

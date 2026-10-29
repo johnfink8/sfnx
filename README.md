@@ -76,14 +76,35 @@ consecutive sums on every supported count (`bin/pf_ring_plan_test`). Decode's su
 `FNX_RING_F32=1` sends fp32, more exact and ~30% slower on one request ([docs/config.md](docs/config.md#card-count)). How to validate a count:
 [docs/verification.md](docs/verification.md#other-card-counts).
 
+## Other GPUs (RTX 3090s at a tester's; the rest never run)
+
+`make ARCH=86` builds for RTX 3090s (compute capability 8.6); the default, 70, is this box's V100s. `ARCH=80`, `89`,
+`90`, `100` and `120` (A100, Ada, H100, Blackwell) build too, but nobody has run them; Turing (75) is refused, short of
+the shared memory a prompt kernel takes ([docs/config.md](docs/config.md#other-gpus)). A tester runs three and four RTX
+3090s on PCIe Gen4 with no NVLink and reports ~178 tok/s for one request on three, 152–200 on four, their own measurements on their own
+prompts ([docs/verification.md](docs/verification.md#rtx-3090s)). `lab.sh exact` has not run there, so an sm_86
+build's logits are not yet held to the bar.
+
+Splitting every layer needs every card to write into every other, and GeForce drivers refuse that. The tester's box
+runs a community patch of NVIDIA's open kernel modules that allows it, with Resizable BAR at full size on every card
+(the patch needs it; one card needed its maker's ReBAR VBIOS), CUDA 12.9 (12.8 hung at start) and some experts in RAM
+on 24 GB cards. Workstation and datacenter cards generally allow it with NVIDIA's own driver (`nvidia-smi topo -p2p r`
+says for a given box). There is no fallback for a box without it: a layer split, as Strata does, runs anywhere.
+
+The engine checks each card as it loads, before anything is placed on it, and refuses one that is not the build's arch,
+has fewer SMs than the hc read keeps resident (80, `HC_READ_BLOCKS`), sits in a translated IOMMU domain or has a BAR1
+smaller than its memory. Before the first window it writes across every link between the cards and stops, naming the
+pair, if anything does not arrive; a link under 1 GB/s gets a warning. What a box needs and what each refusal says: [docs/config.md](docs/config.md#other-gpus).
+
 ## Running it
 
-Needs CUDA 12.9, g++-14, llama.cpp at a37cc46 checked out (or linked) as `llama.cpp/` (`make LLAMA=path` for
-elsewhere), the front end's venv (`.venv`, from `pyproject.toml`; see [front/README.md](front/README.md)), the draft
+Needs CUDA 12.9 (`make CUDA=path` for a toolkit other than `/usr/local/cuda`), g++-14, llama.cpp at a37cc46 checked
+out (or linked) as `llama.cpp/` (`make LLAMA=path` for elsewhere), the front end's venv (`.venv`, from `pyproject.toml`; see [front/README.md](front/README.md)), the draft
 layer's files in `data/mtp-rt/`, and a `models` link to the folder holding the GGUFs — `UD-Q4_K_XL/`, `Q8_0/` and
 `mmproj-F16.gguf`.
-Every path in the configs and scripts is relative to the checkout. The cards' IOMMU groups must be identity domains:
-the ring writes between cards, and the engine refuses to start otherwise.
+Every path in the configs and scripts is relative to the checkout. The cards' IOMMU groups must be identity domains
+and every pair of cards must be CUDA peers: the ring writes between cards, and the engine checks the cards and their
+links at start and refuses to run otherwise ([docs/config.md](docs/config.md#boot-requirement)).
 
 ```bash
 ln -s /path/to/Qwen3.8-Flash-Next models
@@ -95,7 +116,8 @@ sudo systemctl start sfnx    # ~80 s to load; the API is on port 8080
 
 `serve/run.sh` runs the same config as a transient unit on port 8095; `serve/run.sh serve/sfnx-q8.json` the Q8_0
 build. For two cards: `make FNX_NCARD=2 -j32 bin/sfnx`, then `serve/run.sh serve/sfnx-2card.json`; for four,
-`FNX_NCARD=4` and `serve/sfnx-4card.json` (a build refuses to start on any other number of cards). A config of your own lives outside the checkout:
+`FNX_NCARD=4` and `serve/sfnx-4card.json` (a build refuses to start on any other number of cards). For RTX 3090s,
+`make ARCH=86` (llama.cpp's build too: a make stops if `llama.cpp/build` was made for another arch). A config of your own lives outside the checkout:
 `make install CONFIG=/etc/sfnx/sfnx.json` (or `~/sfnx.json`, any path) makes it the service's. Engine settings,
 and the files they read: [docs/config.md](docs/config.md).
 
@@ -103,7 +125,7 @@ and the files they read: [docs/config.md](docs/config.md).
 
 | | |
 | --- | --- |
-| `src/` | the engine: kernels (`.cuh`), `engine.cu`, `prefill.cu`, `model.cpp`, `session.cpp`, `batch.cpp` |
+| `src/` | the engine: kernels (`.cuh`), `engine.cu`, `prefill.cu`, `model.cpp`, `session.cpp`, `batch.cpp`; the start-up checks (`card_check.hpp`, `peer_probe.cu`) |
 | `tools/` | the engine process, the lab harness, the checks, probes and benchmarks |
 | `front/` | the Python serving layer and web UI (from Strata's `serve/`, MIT) |
 | `serve/` | configs, the systemd unit's template, run scripts, served tests |
@@ -112,8 +134,11 @@ and the files they read: [docs/config.md](docs/config.md).
 
 ## Limits
 
-- One model, one box: three `sm_70` cards (or two; four, six or eight build but are untested), no FP8 and no
-  CUDA 13 — the kernels are written for this generation.
+- One model, measured on one box: three `sm_70` cards (or two; four, six or eight build but are untested). RTX 3090s
+  (`ARCH=86`) run at a tester's, not yet checked against llama.cpp; 80, 89, 90, 100 and 120 build but have never run,
+  and Turing is refused. No FP8, and no CUDA 13 (it drops `sm_70`).
+- Every pair of cards must be CUDA peers over PCIe: GeForce cards need a community driver patch and full Resizable BAR
+  for that, and there is no fallback for a box without it.
 - Not tied to one quantization, but a GGUF has to keep its embeddings, shared expert and draft-layer projections at
   Q8_0, and its routed experts in a type the kernels have ([docs/design.md](docs/design.md)); anything else throws at
   load. Both quants above are held to the same exactness bar ([docs/verification.md](docs/verification.md)).
