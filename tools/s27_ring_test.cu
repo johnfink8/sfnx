@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "../src/kernels.hpp"
-#include "../src/s27.hpp"
+#include "../src/s27_ring3.cuh"
 #include "../src/s27_ring3.cuh"
 
 using namespace fnx;

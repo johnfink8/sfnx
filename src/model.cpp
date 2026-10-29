@@ -629,7 +629,6 @@ void load_layers_27b(Stager& st, CardW& c, Up& up, const std::vector<int>& conv_
     }
     c.out_norm = up.f32(st.t(NL, "output_norm.weight"));
     c.out = up.dense(up.rows(st.t(NL, "output.weight"), range(c.v0, c.v1)));
-    c.mtp_head = up.dense(up.rows(st.t(NL, "output.weight"), c.dvrows));   // this card's share of the draft vocabulary
     q8(c.out, "output.weight");
     st.done(NL);
     {
@@ -992,6 +991,49 @@ void load_mtp_card(const Model& m, const MtpFiles& f, const CardW& c, const std:
 
 }  // namespace
 
+#if FNX_27B
+// the 27B's draft head: this card's rows of output.weight for its share of the draft vocabulary (the layer itself came
+// with the model). dir names where the layer comes from, so a Flash-Next runtime directory in a 27B config fails here
+Mtp::Mtp(const Model& m, const std::string& dir, const std::string& vocab_file) {
+    if (dir != "nextn") throw std::runtime_error("mtp: the 27B's draft layer is the GGUF's own: its directory is \"nextn\", not \"" + dir + "\"");
+    if (vocab_file.empty()) throw std::runtime_error("mtp: the 27B needs a draft vocabulary file");
+    {
+        std::FILE* f = std::fopen(vocab_file.c_str(), "rb");
+        if (!f) throw std::runtime_error("mtp: cannot open " + vocab_file);
+        int32_t id;
+        while (std::fread(&id, 4, 1, f) == 1) vocab.push_back(id);
+        std::fclose(f);
+        if (vocab.empty()) throw std::runtime_error("mtp: " + vocab_file + " is empty");
+        for (int id2 : vocab)
+            if (id2 < 0 || id2 >= m.vocab) throw std::runtime_error("mtp: " + vocab_file + " holds a token outside the vocabulary");
+    }
+    cards.resize(NCARD);
+    const int step = ((int) vocab.size() + NCARD - 1) / NCARD;
+    std::vector<std::thread> th;
+    std::vector<std::string> errs(NCARD);
+    for (int c = 0; c < NCARD; ++c) {
+        cards[c].dv0 = std::min((int) vocab.size(), c * step);
+        cards[c].dv1 = std::min((int) vocab.size(), (c + 1) * step);
+        th.emplace_back([&, c] {
+            try {
+                MtpCard& mc = cards[c];
+                ck(cudaSetDevice(m.cards[c].dev), "cudaSetDevice");
+                CardW sink;   // Up counts bytes into a CardW
+                sink.dev = mc.dev = m.cards[c].dev;
+                Up up{sink, nullptr, &mc.allocs};
+                mc.head = up.dense(up.rows(*m.g.find("output.weight"), std::vector<int>(vocab.begin() + mc.dv0, vocab.begin() + mc.dv1)));
+                if (!mc.head.s.q) throw std::runtime_error("mtp: output.weight is not Q8_0");
+            } catch (const std::exception& e) { errs[c] = e.what(); }
+        });
+    }
+    for (auto& t : th) t.join();
+    for (int c = 0; c < NCARD; ++c)
+        if (!errs[c].empty()) {
+            free_mtp_cards(cards);
+            throw std::runtime_error("mtp card " + std::to_string(c) + ": " + errs[c]);
+        }
+}
+#else
 Mtp::Mtp(const Model& m, const std::string& dir, const std::string& vocab_file) {
     {
         const std::string vf = vocab_file.empty() ? dir + "/draft_vocab.bin" : vocab_file;
@@ -1024,6 +1066,7 @@ Mtp::Mtp(const Model& m, const std::string& dir, const std::string& vocab_file) 
             throw std::runtime_error("mtp card " + std::to_string(c) + ": " + errs[c]);
         }
 }
+#endif
 
 Mtp::~Mtp() { free_mtp_cards(cards); }
 
@@ -1160,29 +1203,6 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
 #if FNX_27B
     for (int c = 0; c < NCARD; ++c) cards[c].fd0 = ffd_lo(NCARD, c), cards[c].fd1 = ffd_lo(NCARD, c + 1);
     if (cards[NCARD - 1].fd1 != FFD) throw std::runtime_error("27b: the cards' dense FF slices do not cover its width");
-    {   // the draft vocabulary (int32 token ids): FNX_DRAFT_VOCAB, default the one prod's Flash-Next drafts with
-        const char* dp = std::getenv("FNX_DRAFT_VOCAB");
-        const std::string path = dp ? dp : "data/draft_vocab_en.bin";
-        std::FILE* f = std::fopen(path.c_str(), "rb");
-        if (!f) throw std::runtime_error("27b: cannot open the draft vocabulary " + path);
-        int32_t id;
-        while (std::fread(&id, 4, 1, f) == 1) {
-            if (id < 0 || id >= vocab) {
-                std::fclose(f);
-                throw std::runtime_error("27b: " + path + " holds a token outside the vocabulary");
-            }
-            dvocab.push_back(id);
-        }
-        std::fclose(f);
-        if (dvocab.empty()) throw std::runtime_error("27b: " + path + " is empty");
-        const int dstep = ((int) dvocab.size() + NCARD - 1) / NCARD;
-        for (int c = 0; c < NCARD; ++c) {
-            CardW& cw = cards[c];
-            cw.dv0 = std::min((int) dvocab.size(), c * dstep);
-            cw.dv1 = std::min((int) dvocab.size(), (c + 1) * dstep);
-            cw.dvrows.assign(dvocab.begin() + cw.dv0, dvocab.begin() + cw.dv1);
-        }
-    }
     if (how != Load::PLAIN) throw std::runtime_error("27b: plain loads only (the lab's holder does not hold the 27B)");
 #endif
     if (how == Load::ATTACH) {   // a lab worker: the holder's weights are mapped already; take its tables, place the experts

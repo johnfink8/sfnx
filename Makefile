@@ -124,6 +124,10 @@ bin/card_check_test: tools/card_check_test.cpp src/card_check.hpp src/peer_probe
 KPARTS := 0 1 2 3 4 5 6 7 8
 KERN_OBJ := $(foreach p,$(KPARTS),build/kernels_p$(p).o)
 ENG_OBJ := build/gguf.o build/model.o build/store.o $(KERN_OBJ) build/moe_mma.o build/engine.o build/peer_probe.o build/prefill.o build/session.o build/batch.o
+# the 27B's Engine (engine.hpp's interface) is its own: s27_engine.cu and its prompt path
+ifeq ($(FNX_27B),1)
+ENG_OBJ := build/gguf.o build/model.o build/store.o $(KERN_OBJ) build/moe_mma.o build/s27_engine.o build/peer_probe.o build/s27_prefill.o build/session.o build/batch.o
+endif
 PIC := -Xcompiler -fPIC
 build/kernels_p%.o: src/kernels.cu $(STAMPS)
 	@mkdir -p build
@@ -145,14 +149,14 @@ build/tool_%.o: tools/%.cu $(STAMPS)
 bin/load_probe: build/tool_load_probe.o build/gguf.o build/model.o build/store.o
 	@mkdir -p bin
 	$(NVCC) $(NVFLAGS) -o $@ $^ -lcuda
-# the 27B's programs (make FNX_MODEL=27b): its engine (src/s27.*) is not Flash-Next's, whose programs refuse the build
+# the 27B's own programs (make FNX_MODEL=27b), and the lab, which holds Flash-Next only (the 27B loads plain)
 S27_BIN := bin/s27_run bin/s27_probe bin/s27_ring_test
-FNX_BIN := bin/sfnx bin/fnx_run bin/sample_test bin/cache_test bin/lanes_test bin/batch_test lab bin/fnx_lab bin/fnx_hold build/libfnx_lab.so
+FNX_BIN := lab bin/fnx_lab bin/fnx_hold build/libfnx_lab.so
 $(if $(and $(filter 0,$(FNX_27B)),$(filter $(S27_BIN),$(MAKECMDGOALS))),$(error $(filter $(S27_BIN),$(MAKECMDGOALS)): make FNX_MODEL=27b))
 $(if $(and $(filter 1,$(FNX_27B)),$(filter $(FNX_BIN),$(MAKECMDGOALS))),$(error $(filter $(FNX_BIN),$(MAKECMDGOALS)): Flash-Next's, not FNX_MODEL=27b's))
-bin/s27_run: build/tool_s27_run.o build/gguf.o build/model.o build/store.o build/peer_probe.o build/s27.o $(KERN_OBJ) build/moe_mma.o
+bin/s27_run: build/tool_s27_run.o $(ENG_OBJ)
 	@mkdir -p bin
-	$(NVCC) $(NVFLAGS) -o $@ $^ -lcuda
+	$(NVCC) $(NVFLAGS) -o $@ $^ -lcublas -lcuda -lpthread
 bin/kbench bin/s27_probe bin/s27_ring_test bin/moe_mma_bench bin/topk_test: bin/%: build/tool_%.o $(KERN_OBJ) build/moe_mma.o
 	@mkdir -p bin
 	$(NVCC) $(NVFLAGS) -o $@ $^

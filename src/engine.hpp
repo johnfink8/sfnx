@@ -316,6 +316,13 @@ private:
     void attention(int T, CardBuf& b, const CardW& w, const LayerW& L, uint16_t* kc, uint16_t* vc, const int* ctl,
                    uint16_t* qsa_ring, uint16_t* qsa_pooled, int call);
     void ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW& L, float* R, const int* ctl);
+#if FNX_27B
+    // the 27B's window (s27_engine.cu): the layers and head over T rows, one sequence's or a batched window's (lanes),
+    // with the recurrent core each kind runs
+    using GdnFn = std::function<void(CardBuf&, const CardW&, const LayerW&, int)>;
+    void enqueue_layers(int T, bool lanes, const GdnFn& gdn, bool dumps);
+    void prefill_free();   // the prompt path's cuBLAS handles (s27_prefill.cu)
+#endif
 };
 
 }  // namespace fnx

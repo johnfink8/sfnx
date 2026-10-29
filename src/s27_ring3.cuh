@@ -3,12 +3,22 @@
 // sum's time grows with its bytes (~0.6 ms a window row for 128 sums at two values a word); a third fewer words.
 // A 16-bit tag wraps every 65536 exchanges (256 windows): a word left in a slot from exactly that many exchanges back
 // would pass for a new one. Slots are rewritten every exchange up to the window's rows, so only rows a long-unused
-// wider window wrote are exposed: S27::next_tag zeroes the buffers each 128 tags, so no word left is 256 tags old.
+// wider window wrote are exposed: Engine::tags_room (s27_engine.cu) zeroes the buffers each 128 tags, so no word left is 256 tags old.
 #pragma once
 
 #include <cuda_fp16.h>
 
+#include "kernels.hpp"
+#include "model.hpp"
+
 namespace fnx {
+
+// a card's buffers: words in from the card before, finished words gathered; the next card's
+struct R3 {
+    int card = 0;
+    unsigned long long *in = nullptr, *ag = nullptr, *next_in = nullptr, *next_ag = nullptr;
+    unsigned* err = nullptr;
+};
 
 constexpr int R3_NT = (N + 2) / 3;                 // triples a row (the last padded)
 constexpr int R3_CH = R3_NT / NCARD + 1;           // a chunk's triples, at most
@@ -38,7 +48,7 @@ __device__ __forceinline__ float3 r3_take(const unsigned long long* p, unsigned 
                        __half2float(__ushort_as_half((unsigned short) (w >> 32))));
 }
 
-__global__ void __launch_bounds__(256) k_ring3(R3 r, float* x, int T, const unsigned* tagp, int call) {
+static __global__ void __launch_bounds__(256) k_ring3(R3 r, float* x, int T, const unsigned* tagp, int call) {
     const unsigned tag = *tagp * 256u + (unsigned) call + 1u;
     const int n = gridDim.x * blockDim.x, tid = blockIdx.x * blockDim.x + threadIdx.x, g = r.card, set = tag & 1;
     const size_t in_set = (size_t) R3_STEPS * MAXT * R3_CH, ag_set = (size_t) MAXT * R3_NT;

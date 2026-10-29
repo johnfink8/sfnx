@@ -171,14 +171,12 @@ struct CardW {
     int fd0 = 0, fd1 = 0;              // the dense FFN's
     const float* out_norm = nullptr;
     // the draft (nextn) layer: an attention layer split as the trunk's, its input projection [e | h] -> N (every card
-    // the whole of it), norms, and this card's rows [dv0, dv1) of the draft vocabulary's head
+    // the whole of it), its norms. Its head (rows of output.weight for the draft vocabulary) is the Mtp's
     LayerW mtp;
-    DW mtp_eh, mtp_head;
+    DW mtp_eh;
     const float* mtp_enorm = nullptr;
     const float* mtp_hnorm = nullptr;
     const float* mtp_head_norm = nullptr;
-    int dv0 = 0, dv1 = 0;
-    std::vector<int> dvrows;           // their token ids: the head's rows
 #endif
     // output vocabulary split
     int v0 = 0, v1 = 0;
@@ -202,7 +200,8 @@ struct CardW {
 };
 
 // the draft (MTP) layer on one card: an attention layer (hc [0] before the attention, [1] before the MoE), its input
-// projections, the final mixer, and this card's rows [dv0, dv1) of the draft head
+// projections, the final mixer, and this card's rows [dv0, dv1) of the draft head. The 27B's: the head alone (its
+// layer is the GGUF's nextn block, loaded with the model: CardW::mtp)
 struct MtpCard {
     LayerW L;
     DW fc_emb, fc_hid;                 // every card: [N][N] each
@@ -221,7 +220,8 @@ struct Model;
 struct Mtp {
     std::vector<MtpCard> cards;        // one per Model card, on the same devices
     std::vector<int> vocab;            // the draft vocabulary: head row -> token id
-    // vocab_file: the draft vocabulary (int32 token ids); empty: rt_dir/draft_vocab.bin
+    // vocab_file: the draft vocabulary (int32 token ids); empty: rt_dir/draft_vocab.bin. The 27B: rt_dir "nextn" (its
+    // layer is the GGUF's), vocab_file required
     Mtp(const Model& m, const std::string& rt_dir, const std::string& vocab_file = "");
     ~Mtp();
     Mtp(const Mtp&) = delete;
@@ -247,9 +247,6 @@ struct Model {
     double yarn_factor = 0;   // the GGUF's own YaRN (rope.scaling.type yarn): its factor, 0 for none
     int yarn_orig = 0;        // and its original_context_length, 0 when it names none (choose_rope, src/rope.hpp)
     int vocab = 0;
-#if FNX_27B
-    std::vector<int> dvocab;   // the draft head's rows: token ids
-#endif
     // [NL][NEXP]: the routed experts in VRAM at the start (empty: all, no ExpertCache). FNX_EXPERT_RAM_GIB=G (default 3;
     // off: no cache) leaves the coldest G GiB of them (whole experts, all cards' slices) out, ranked by
     // FNX_EXPERT_PROFILE (FNX_ROUTE_COUNT's tallies; default data/expert-routes.bin)

@@ -1,8 +1,9 @@
-// s27_run: the 27B on the cards, one prompt, greedy decode with drafts.
+// s27_run: the 27B's Engine (make FNX_MODEL=27b) on one prompt, greedy decode with drafts.
 //   s27_run MODEL.gguf PROMPT.bin GEN [K=4] [LOOKUP=15] [OUT.ids]
-// The prompt is read in windows of MAXT rows (the draft layer over each). Decode verifies the last token plus drafts a
-// round: n-gram lookup's when it offers at least 3 that agree with the draft layer's first, else a chain of K from the
-// draft layer (K 0: no drafts). OUT.ids: the generated ids, one per line.
+// The prompt but its last token through prefill (the draft layer over it); decode verifies the last token plus drafts
+// a round: n-gram lookup's when it offers at least 3 that agree with the draft layer's first, else a chain of K from
+// the draft layer (K 0: no drafts). OUT.ids: the generated ids, one per line. The draft vocabulary: S27_DRAFT_VOCAB
+// (default data/draft_vocab_en.bin, prod's). S27_BENCH=1: window times by row count instead of decoding
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -11,8 +12,8 @@
 #include <string>
 #include <vector>
 
+#include "../src/engine.hpp"
 #include "../src/model.hpp"
-#include "../src/s27.hpp"
 #include "ref_tokens.hpp"
 
 using namespace fnx;
@@ -29,32 +30,23 @@ int main(int argc, char** argv) {
     if (K < 0 || K > MAXT - 1) throw std::runtime_error("K: 0.." + std::to_string(MAXT - 1));
     if (LK < 0 || LK > MAXT - 1) throw std::runtime_error("LOOKUP: 0.." + std::to_string(MAXT - 1));
     if (prompt.size() < 2) throw std::runtime_error("the prompt needs two tokens or more");
+    const int ctx_len = std::max(32768, (int) prompt.size() + gen + 64);
+    const char* dv = std::getenv("S27_DRAFT_VOCAB");
     const auto t0 = std::chrono::steady_clock::now();
     Model m(argv[1]);
-    S27 e(m, 32768);
+    Mtp mtp(m, "nextn", dv ? dv : "data/draft_vocab_en.bin");
+    Engine e(m, ctx_len, 1);
+    if (K) e.mtp_attach(mtp);
     const auto t1 = std::chrono::steady_clock::now();
     std::fprintf(stderr, "s27: loaded in %.1f s; prompt %zu tokens\n", std::chrono::duration<double>(t1 - t0).count(), prompt.size());
-
-    // the prompt but its last token, MAXT rows a window, the draft layer over each (row r with the token after it)
-    int d1 = -1;
-    float d1_p = 0.f;
-    // S27_DRAFT_P=p: a draft is kept only when the draft layer gives it at least p (0: every one of the K). On prose2 it
-    // never paid: p 0.35 with K 4 111 tok/s, p 0.5 110.6, against 117.6 for every one of K 3
-    const float draft_p = std::getenv("S27_DRAFT_P") ? (float) std::atof(std::getenv("S27_DRAFT_P")) : 0.f;
-    for (size_t i = 0; i + 1 < prompt.size(); i += MAXT) {
-        const size_t n = std::min<size_t>(MAXT, prompt.size() - 1 - i);
-        e.verify(std::vector<int>(prompt.begin() + i, prompt.begin() + i + n));
-        e.commit((int) n);
-        if (K) d1 = e.draft(std::vector<int>(prompt.begin() + i + 1, prompt.begin() + i + 1 + n), (int) i, true), d1_p = e.last_draft_p;
-    }
+    e.prefill(std::vector<int>(prompt.begin(), prompt.end() - 1), prompt.back());
     const auto t2 = std::chrono::steady_clock::now();
     std::fprintf(stderr, "s27: prompt read in %.2f s (%.0f tok/s)\n", std::chrono::duration<double>(t2 - t1).count(),
                  (prompt.size() - 1) / std::chrono::duration<double>(t2 - t1).count());
 
-    // S27_BENCH=1: windows of 1..16 rows instead of decoding, their GPU time (the median of 15 each); the draft pass's too
     if (const char* bs = std::getenv("S27_BENCH"); bs && !std::strcmp(bs, "1")) {
         for (int T : {1, 2, 3, 4, 5, 6, 8, 12, 16}) {
-            std::vector<float> ms, card[NCARD];
+            std::vector<double> ms, card[NCARD];
             for (int r = 0; r < 15; ++r) {
                 e.verify(std::vector<int>(T, prompt.back()));
                 ms.push_back(e.last_gpu_ms);
@@ -69,14 +61,6 @@ int main(int argc, char** argv) {
             }
             std::printf(")\n");
         }
-        std::vector<double> dms;
-        for (int r = 0; r < 15; ++r) {
-            const auto a = std::chrono::steady_clock::now();
-            e.draft({prompt.back()}, e.pos(), false);
-            dms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count());
-        }
-        std::sort(dms.begin(), dms.end());
-        std::printf("draft pass (1 row, host round trip included)  %6.2f ms\n", dms[dms.size() / 2]);
         return 0;
     }
     std::vector<int> ctx(prompt), out;
@@ -94,25 +78,23 @@ int main(int argc, char** argv) {
     int rounds = 0, lookup_rounds = 0;
     long offered = 0, accepted = 0;
     double gpu_ms = 0, draft_ms = 0;
+    int d1 = -1, d1_row = 0;   // the draft layer's guess for the next token, and the row of its pass it came from
     const auto t3 = std::chrono::steady_clock::now();
     while ((int) out.size() < gen) {
         const int p = e.pos();
         std::vector<int> d = lookup();
         const auto td = std::chrono::steady_clock::now();
-        if (K && (d.size() < 3 || d[0] != d1)) {
-            // the draft layer's chain: up to K, each kept only while the draft before it was at least S27_DRAFT_P likely
-            d.clear();
-            float pp = d1_p;
-            if (pp >= draft_p) d.push_back(d1);
-            while (!d.empty() && (int) d.size() < K && pp >= draft_p) {
-                const int nx = e.draft({d.back()}, p + (int) d.size() - 1, false);
-                pp = e.last_draft_p;
-                if (pp >= draft_p) d.push_back(nx);
+        if (K && d1 >= 0 && (d.size() < 3 || d[0] != d1)) {
+            d.assign(1, d1);
+            int row = d1_row;
+            while ((int) d.size() < K) {
+                d.push_back(e.draft(1, false, row, {d.back()}, p + (int) d.size() - 1));
+                row = 0;
             }
-        } else if (!K && LK == 0) {
-            d.clear();
-        } else {
+        } else if (d.size() >= 3 && (LK > 0)) {
             ++lookup_rounds;
+        } else {
+            d.clear();
         }
         draft_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td).count();
         std::vector<int> win{ctx.back()};
@@ -125,14 +107,13 @@ int main(int argc, char** argv) {
         ++rounds;
         offered += (long) d.size();
         accepted += a;
-        // o[0..a]: the next a + 1 tokens; the last becomes the next window's first row (not yet in the cache)
         for (int i = 0; i <= a; ++i) {
             out.push_back(o[i]);
             ctx.push_back(o[i]);
         }
         if (o[a] == 248046 || o[a] == 248044) break;   // eos
         const auto tc = std::chrono::steady_clock::now();
-        if (K) d1 = e.draft(std::vector<int>(o.begin(), o.begin() + a + 1), p, true), d1_p = e.last_draft_p;
+        if (K) d1 = e.draft(a + 1, true, 0, std::vector<int>(o.begin(), o.begin() + a + 1), p), d1_row = a;
         draft_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc).count();
     }
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t3).count();
