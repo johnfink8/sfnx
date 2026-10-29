@@ -3,6 +3,10 @@
 // sequential pieces by a Stager first.
 #pragma once
 
+#ifndef FNX_27B
+#error "FNX_27B is unset: build through the Makefile (make FNX_MODEL=fnx or 27b)"
+#endif
+
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>

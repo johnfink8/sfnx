@@ -60,7 +60,12 @@ __global__ void __launch_bounds__(GDN_THREADS) k_gdn_core(const float* __restric
     if (tid < T) {
         const float* abt = ab + (size_t) tid * 2 * nv;
         const float x = abt[lv] + dt[lv];
+#if FNX_27B   // the decay through double, as gdn_prompt's (gch_exp): __expf's error grows with |x| and compounds in the
+              // state row after row (the 27B's edit1 read through windows: KL 1.1e-6 against llama.cpp, the bar 1.5e-7)
+        gates[tid][0] = (float) exp((double) ((x > 20.0f ? x : (float) log1p(exp((double) x))) * a[lv]));
+#else
         gates[tid][0] = __expf((x > 20.0f ? x : log1pf(__expf(x))) * a[lv]);
+#endif
         gates[tid][1] = 1.0f / (1.0f + __expf(-abt[nv + lv]));
     }
     // ---- conv + silu: q and k channels (all HS of each), this block's v channels

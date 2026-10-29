@@ -82,6 +82,8 @@ struct CardBuf {
     float* snap_block = nullptr;      // every recurrent layer's snap (the prompt path borrows it between windows)
     size_t snap_block_bytes = 0;
     R3 r3;
+    Ring ring;                        // FNX_RING_F32=1: the sums as fp32 words (kernels.cu's ring) instead of r3's
+    bool ring32 = false;
     int* ctl = nullptr;               // [0] window position, [1] ring tag (as unsigned)
     int* mrope = nullptr;             // the current lane's rotary table
     char* stage[2] = {nullptr, nullptr};   // a parked state's copies pass through these page-locked halves

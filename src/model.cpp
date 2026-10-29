@@ -589,6 +589,13 @@ void load_layers_27b(Stager& st, CardW& c, Up& up, const std::vector<int>& conv_
     auto q8 = [](const DW& d, const std::string& what) {
         if (!d.s.q) throw std::runtime_error("27b: " + what + " is not Q8_0 (the 27B's matvecs read Q8_0 only)");
     };
+    // the shape the window writes and reads it at (rows are the output stride; a wrong one would land at another)
+    auto shape = [](const DW& d, int out, int in, const std::string& what) {
+        if (d.n_out != out || d.n_in != in)
+            throw std::runtime_error("27b: " + what + " is " + std::to_string(d.n_out) + " x " + std::to_string(d.n_in) + ", not " +
+                                     std::to_string(out) + " x " + std::to_string(in));
+    };
+    const int ffs = c.fd1 - c.fd0, qkv = c.nq * 2 * HD + 2 * c.nkv * HD;
     auto attn = [&](LayerW& w, auto&& T) {
         w.wq = up.dense(up.rows3(T("attn_q.weight"), qrows, T("attn_k.weight"), kvrows, T("attn_v.weight"), kvrows));
         w.wo = up.dense(up.cols(T("attn_output.weight"), woblocks));
@@ -619,17 +626,24 @@ void load_layers_27b(Stager& st, CardW& c, Up& up, const std::vector<int>& conv_
             w.dt_bias = up.put<float>(dt.data(), dt.size() * 4);
             w.ssm_norm = up.f32(T("ssm_norm.weight"));
             q8(w.qkvz, "layer " + std::to_string(l) + "'s qkv | gate"), q8(w.ssm_out, "layer " + std::to_string(l) + "'s ssm_out");
+            shape(w.qkvz, c.conv_ch() + c.nv() * HS, N, "layer " + std::to_string(l) + "'s qkv | gate");
+            shape(w.ssm_out, N, c.nv() * HS, "layer " + std::to_string(l) + "'s ssm_out");
         } else {
             attn(w, T);
             q8(w.wq, "layer " + std::to_string(l) + "'s q | k | v"), q8(w.wo, "layer " + std::to_string(l) + "'s attn_output");
+            shape(w.wq, qkv, N, "layer " + std::to_string(l) + "'s q | k | v");
+            shape(w.wo, N, c.nq * HD, "layer " + std::to_string(l) + "'s attn_output");
         }
         ffn(w, T);
         q8(w.ffn_gu, "layer " + std::to_string(l) + "'s gate | up"), q8(w.ffn_down, "layer " + std::to_string(l) + "'s down");
+        shape(w.ffn_gu, 2 * ffs, N, "layer " + std::to_string(l) + "'s gate | up");
+        shape(w.ffn_down, N, ffs, "layer " + std::to_string(l) + "'s down");
         st.done(l);
     }
     c.out_norm = up.f32(st.t(NL, "output_norm.weight"));
     c.out = up.dense(up.rows(st.t(NL, "output.weight"), range(c.v0, c.v1)));
     q8(c.out, "output.weight");
+    shape(c.out, c.v1 - c.v0, N, "output.weight's rows");
     st.done(NL);
     {
         auto T = [&](const char* s) -> const Tensor& { return st.t(NL + 1, "blk." + std::to_string(NL) + "." + s); };
@@ -640,6 +654,11 @@ void load_layers_27b(Stager& st, CardW& c, Up& up, const std::vector<int>& conv_
         c.mtp_hnorm = up.f32(T("nextn.hnorm.weight"));
         c.mtp_head_norm = up.f32(T("nextn.shared_head_norm.weight"));
         for (const DW* d : {&c.mtp.wq, &c.mtp.wo, &c.mtp.ffn_gu, &c.mtp.ffn_down, &c.mtp_eh}) q8(*d, "a draft layer matrix");
+        shape(c.mtp.wq, qkv, N, "the draft layer's q | k | v");
+        shape(c.mtp.wo, N, c.nq * HD, "the draft layer's attn_output");
+        shape(c.mtp.ffn_gu, 2 * ffs, N, "the draft layer's gate | up");
+        shape(c.mtp.ffn_down, N, ffs, "the draft layer's down");
+        shape(c.mtp_eh, N, 2 * N, "the draft layer's eh_proj");
         st.done(NL + 1);
     }
 }
@@ -1000,6 +1019,11 @@ Mtp::Mtp(const Model& m, const std::string& dir, const std::string& vocab_file) 
     {
         std::FILE* f = std::fopen(vocab_file.c_str(), "rb");
         if (!f) throw std::runtime_error("mtp: cannot open " + vocab_file);
+        struct stat stb{};
+        if (fstat(fileno(f), &stb) != 0 || stb.st_size % 4 != 0) {
+            std::fclose(f);
+            throw std::runtime_error("mtp: " + vocab_file + " is not whole int32 token ids (" + std::to_string((long long) stb.st_size) + " bytes)");
+        }
         int32_t id;
         while (std::fread(&id, 4, 1, f) == 1) vocab.push_back(id);
         std::fclose(f);
@@ -1089,7 +1113,9 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
     if (g.i(p + "block_count") != NL + g.i(p + "nextn_predict_layers") || g.i(p + "nextn_predict_layers") != 1 ||
         g.i(p + "embedding_length") != N || g.i(p + "feed_forward_length") != FFD || g.i(p + "ssm.group_count") != NKH ||
         g.i(p + "ssm.time_step_rank") != NVH || g.i(p + "attention.head_count") != NQH ||
-        g.i(p + "attention.head_count_kv") != NKVH || g.i(p + "full_attention_interval") != 4)
+        g.i(p + "attention.head_count_kv") != NKVH || g.i(p + "full_attention_interval") != 4 ||
+        g.i(p + "attention.key_length") != HD || g.i(p + "attention.value_length") != HD || g.i(p + "ssm.state_size") != HS ||
+        g.i(p + "ssm.inner_size") != NVH * HS || g.i(p + "ssm.conv_kernel") != 4 || g.i(p + "rope.dimension_count") != NROT)
         throw std::runtime_error("27b: this GGUF's geometry is not Qwen3.8-27B's");
 #else
     const std::string p = "qwen4exp.";
@@ -1123,6 +1149,8 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
 #if FNX_27B
     if (tok_embd->type != T_Q8_0) throw std::runtime_error("27b: token_embd.weight is not Q8_0 (the host's embedding reads Q8_0)");
     vocab = (int) tok_embd->ne[1];
+    if (g.t("output.weight").ne[1] != vocab || g.t("output.weight").ne[0] != N)
+        throw std::runtime_error("27b: output.weight is not [" + std::to_string(N) + "][" + std::to_string(vocab) + "] (token_embd's vocabulary)");
     {   // the host gathers its rows every window: a row read from the disk costs milliseconds, so keep it in RAM
         const auto t0 = std::chrono::steady_clock::now();
         lock_in_ram(*tok_embd);

@@ -99,15 +99,15 @@ $(if $(NVCC_VERSION),,$(if $(wildcard $(NVCC)),$(warning nvcc at $(NVCC) gave no
 $(call stamp,build/cuda,$(NVCC_ID))
 STAMPS := build/ncard build/arch build/cuda build/model
 
-bin/gguf_test: tools/gguf_test.cpp src/gguf.cpp src/gguf.hpp src/rope_gguf.hpp
-	mkdir -p bin && g++-14 -O2 -std=c++17 -o $@ tools/gguf_test.cpp src/gguf.cpp
-bin/stage_test: tools/stage_test.cpp src/gguf.cpp src/gguf.hpp
-	mkdir -p bin && g++-14 -O2 -std=c++17 -o $@ tools/stage_test.cpp src/gguf.cpp -lpthread
+bin/gguf_test: tools/gguf_test.cpp src/gguf.cpp src/gguf.hpp src/rope_gguf.hpp build/model
+	mkdir -p bin && g++-14 -O2 -std=c++17 -DFNX_27B=$(FNX_27B) -o $@ tools/gguf_test.cpp src/gguf.cpp
+bin/stage_test: tools/stage_test.cpp src/gguf.cpp src/gguf.hpp build/model
+	mkdir -p bin && g++-14 -O2 -std=c++17 -DFNX_27B=$(FNX_27B) -o $@ tools/stage_test.cpp src/gguf.cpp -lpthread
 bin/sfnx_input_test: tools/sfnx_input_test.cpp tools/sfnx_input.hpp
 	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -pthread -o $@ tools/sfnx_input_test.cpp
 # the batched drafts' row plan, on the CPU alone
-bin/batch_plan_test: tools/batch_plan_test.cpp src/batch_plan.hpp
-	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -o $@ tools/batch_plan_test.cpp
+bin/batch_plan_test: tools/batch_plan_test.cpp src/batch_plan.hpp build/model
+	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -DFNX_27B=$(FNX_27B) -o $@ tools/batch_plan_test.cpp
 # the prompt path's ring plan against the two- and three-card sequences, and every supported count's sum, on the CPU
 bin/pf_ring_plan_test: tools/pf_ring_plan_test.cpp src/pf_ring_plan.hpp src/card_split.hpp src/model.hpp src/gguf.hpp build/ncard build/model
 	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -DFNX_NCARD=$(FNX_NCARD) -DFNX_27B=$(FNX_27B) -o $@ tools/pf_ring_plan_test.cpp
@@ -157,6 +157,9 @@ $(if $(and $(filter 1,$(FNX_27B)),$(filter $(FNX_BIN),$(MAKECMDGOALS))),$(error 
 bin/s27_run: build/tool_s27_run.o $(ENG_OBJ)
 	@mkdir -p bin
 	$(NVCC) $(NVFLAGS) -o $@ $^ -lcublas -lcuda -lpthread
+bin/s27_bw_probe: build/tool_s27_bw_probe.o
+	@mkdir -p bin
+	$(NVCC) $(NVFLAGS) -o $@ $^
 bin/kbench bin/s27_probe bin/s27_ring_test bin/moe_mma_bench bin/topk_test: bin/%: build/tool_%.o $(KERN_OBJ) build/moe_mma.o
 	@mkdir -p bin
 	$(NVCC) $(NVFLAGS) -o $@ $^

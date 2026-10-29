@@ -153,6 +153,10 @@ __global__ void k_norm_cat(const float* e, const float* h, const float* we, cons
 // values a word (kernels.cu's) took 19.4 ms against 18.5 at 4 rows, 25.9 against 23.8 at 8
 void sum_cards(CardBuf& b, float* x, int T, const int* ctl, int call) {
     ring_call_check(call, "sum_cards");
+    if (b.ring32) {
+        ring_sum(b.ring, x, T, (const unsigned*) (ctl + 1), call, b.st);
+        return;
+    }
     k_ring3<<<R3_BLOCKS, 256, 0, b.st>>>(b.r3, x, T, (const unsigned*) (ctl + 1), call);
     ck(cudaGetLastError(), "ring3");
 }
@@ -170,6 +174,7 @@ void mv(CardBuf& b, const DW& w, const void* y, float* out, int T) { q8s_gemv(w.
 struct Rows {
     const int* ctl;
     LaneRows lr;
+    const int* const* tabs;   // a batched window's rows' rotary tables (null: rope's own, the current lane's)
 };
 
 // an attention layer's mixer half on one card: the last half's sum folded into R (pend) and the norm, the card's q heads
@@ -178,10 +183,9 @@ struct Rows {
 void attn_half(CardBuf& b, const LayerW& L, float* R, bool pend, int slot, const Rows& rows, int q0, int kv0, int call, int T, float eps,
                const Rope& rope) {
     add_norm(b, R, pend ? b.bo : nullptr, L.attn_norm, T, eps, true);
-    if (L.wq.n_out != S27_QKV) throw std::runtime_error("27b: an attention layer's q|k|v is not S27_QKV rows");
     mv(b, L.wq, b.xq, b.qkv, T);
     k_s27_prep<<<dim3(S27_NQ + 2 * S27_NKV, T), HD, 0, b.st>>>(b.qkv, S27_QKV, L.q_norm, L.k_norm, b.pool, slot, rows.ctl, b.pt, rows.lr,
-                                                                eps, rope);
+                                                                rows.tabs, eps, rope);
     k_s27_attn<<<dim3(S27_ASPLIT, T, S27_NQ), 128, 0, b.st>>>(b.qkv, S27_QKV, b.pool, slot, rows.ctl, b.pt, rows.lr, kv0, q0, b.apart);
     k_s27_merge<<<dim3(T, S27_NQ), HD, 0, b.st>>>(b.qkv, S27_QKV, b.apart, b.att);
     ck(cudaGetLastError(), "attention");
@@ -227,6 +231,14 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
     }
     if (std::getenv("FNX_KV8") && env_int("FNX_KV8", 0) != 0)
         throw std::runtime_error("FNX_KV8: the 27B keeps its K/V in f16 (llama.cpp's default); int8 K/V is Flash-Next's");
+    // Flash-Next's engine settings (experts, the arena, hyper-connections, QSA, its prompt path's knobs): the 27B has none of
+    // what they set, so one given is a mistake, not a run of the default
+    for (const char* k : {"FNX_EXPERT_RAM_GIB", "FNX_EXPERT_PROFILE", "FNX_ARENA", "FNX_ARENA_RESERVE_MIB", "FNX_ARENA_BASE_PAGES",
+                          "FNX_ARENA_CHURN", "FNX_HC1", "FNX_HC_BAR_WRAP", "FNX_NO_TWIN", "FNX_RING_TAG_START", "FNX_PF_OVERLAP",
+                          "FNX_PF_PASS", "FNX_PF_STAGE_ROWS", "FNX_PF_STAGE_MIB", "FNX_PF_RING_SM", "FNX_PF_ATT_PIECES", "FNX_PF_QSA_ROWS",
+                          "FNX_PF_ATTN_DEC", "FNX_PF_F16ACC", "FNX_PF_MOE_Q8", "FNX_PF_DRAFT8", "FNX_ROUTE_COUNT", "FNX_ROUTE_TRACE",
+                          "FNX_PREFETCH_PROBE", "FNX_PF_SEQ_START"})
+        if (std::getenv(k)) throw std::runtime_error(std::string(k) + " is Flash-Next's: the 27B has nothing it sets");
     const long long pf_rows = env_int("FNX_PF_ROWS", pf_c_);
     if (pf_rows < MAXT || pf_rows > 8192 || pf_rows % MAXT)
         throw std::runtime_error("FNX_PF_ROWS: a multiple of " + std::to_string(MAXT) + " from " + std::to_string(MAXT) + " to 8192, got " +
@@ -250,7 +262,7 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         own_event(b->ev0);
         ck(cudaEventCreate(&b->ev1), "event");
         own_event(b->ev1);
-        if (w.nq != S27_NQ || w.nkv != S27_NKV || w.q0 != c * S27_NQ || w.kv0 != w.q0 / (NQH / NKVH))
+        if (w.nq != S27_NQ || w.nkv != S27_NKV || w.q0 != c * S27_NQ || w.kv0 != w.q0 / (NQH / NKVH) || w.L[3].wq.n_out != S27_QKV)
             throw std::runtime_error("27b: card " + std::to_string(c) + "'s attention heads are not the split s27_attn.cuh runs");
         const int ffs = w.fd1 - w.fd0;
         b->R = dalloc<float>((size_t) MAXT * N);
@@ -297,6 +309,13 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         b->r3.in = dalloc<unsigned long long>(r3_in_words());
         b->r3.ag = dalloc<unsigned long long>(r3_ag_words());
         b->r3.err = b->err;
+        if ((b->ring32 = ring_f32())) {
+            b->ring.card = c;
+            b->ring.in = dalloc<unsigned long long>(ring_in_words(MAXT));
+            b->ring.ag = dalloc<unsigned long long>(ring_ag_words(MAXT));
+            b->ring.f32 = true;
+            b->ring.err = b->err;
+        }
         cb_.push_back(b);
     }
     {   // every link carries a probe's stores before the ring's (src/peer_probe.hpp)
@@ -307,6 +326,8 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
     for (int c = 0; c < NCARD; ++c) {
         cb_[c]->r3.next_in = cb_[(c + 1) % NCARD]->r3.in;
         cb_[c]->r3.next_ag = cb_[(c + 1) % NCARD]->r3.ag;
+        cb_[c]->ring.next_in = cb_[(c + 1) % NCARD]->ring.in;
+        cb_[c]->ring.next_ag = cb_[(c + 1) % NCARD]->ring.ag;
     }
     // the prompt path's buffers now, so the pool below is sized from what is left after them
     prefill_alloc();
@@ -367,6 +388,10 @@ void Engine::clear_rings() {
         ck(cudaSetDevice(b->dev), "set");
         ck(cudaMemset(b->r3.in, 0, r3_in_words() * 8), "ring clear");
         ck(cudaMemset(b->r3.ag, 0, r3_ag_words() * 8), "ring clear");
+        if (b->ring32) {
+            ck(cudaMemset(b->ring.in, 0, ring_in_words(MAXT) * 8), "ring clear");
+            ck(cudaMemset(b->ring.ag, 0, ring_ag_words(MAXT) * 8), "ring clear");
+        }
     }
     for (CardBuf* b : cb_) { ck(cudaSetDevice(b->dev), "set"); ck(cudaDeviceSynchronize(), "ring clear sync"); }
 }
@@ -639,6 +664,8 @@ std::vector<unsigned> Engine::route_trace(size_t) const { return {}; }
 
 std::vector<int> Engine::graph_key(const std::vector<int>& lanes) const {
     std::vector<int> k(lanes);
+    // a lane's rotary table is either none or its own buffer (made once), so whether it has one names the pointer a
+    // graph holds: in a batched window's rows, or a single lane's window as an argument
     for (int l : lanes) k.push_back(cb_[0]->lanes[(size_t) l].mrope != nullptr);
     return k;
 }
@@ -1181,9 +1208,11 @@ void Engine::enqueue_layers(int T, bool lanes, const GdnFn& gdn, bool dumps) {
     auto dd = [&](const std::string& name, int layer, const float* p, int n) {
         if (dumps) dump_dev(name, layer, p, T, n);
     };
-    // a card's rows: its window's at *b.ctl + t on its current lane's pages, or a batched window's from b.lane_rows
+    // a card's rows: its window's at *b.ctl + t on its current lane's pages and rotary table, or a batched window's from
+    // b.lane_rows, each with its own lane's
     auto rows_of = [&](CardBuf& b) {
-        return lanes ? Rows{b.ctl, LaneRows{b.lane_rows[(size_t) T], b.lane_rows[(size_t) T] + MAXT}} : Rows{b.ctl, LaneRows{}};
+        const int* const* lr = b.lane_rows[(size_t) T];
+        return lanes ? Rows{b.ctl, LaneRows{lr, lr + MAXT}, lr + 2 * MAXT} : Rows{b.ctl, LaneRows{}, nullptr};
     };
     for (int l = 0; l < NL; ++l) {
         each([&](int, CardBuf& b, const CardW& w) {
@@ -1196,7 +1225,7 @@ void Engine::enqueue_layers(int T, bool lanes, const GdnFn& gdn, bool dumps) {
                 mv(b, L.ssm_out, b.xq, b.bo, T);
                 sum_cards(b, b.bo, T, b.ctl, call);
             } else {
-                attn_half(b, L, b.R, l > 0, s27_slot(l), rows_of(b), w.q0, w.kv0, call, T, eps, rope_of(b.mrope));
+                attn_half(b, L, b.R, l > 0, s27_slot(l), rows_of(b), w.q0, w.kv0, call, T, eps, rope_of(lanes ? nullptr : b.mrope));
             }
         });
         ++call;
@@ -1235,10 +1264,10 @@ double rope_scale() {
 }
 
 bool ring_f32() {
-    // the 27B's sums are three fp16 values a word (s27_ring3.cuh): no fp32 ring
+    // the 27B's sums: three fp16 values a word (s27_ring3.cuh) by default; 1: fp32 words through kernels.cu's ring
     const long long v = env_int("FNX_RING_F32", 0);
-    if (v != 0) throw std::runtime_error("FNX_RING_F32: the 27B's ring is fp16 only, got " + std::to_string(v));
-    return false;
+    if (v != 0 && v != 1) throw std::runtime_error("FNX_RING_F32: 0 or 1, got " + std::to_string(v));
+    return v == 1;
 }
 
 BatchDrafts batch_drafts() {
@@ -1328,11 +1357,12 @@ std::vector<int> Engine::step(const std::vector<int>& lanes, const std::vector<i
     const std::vector<int> bkey = graph_key(lanes);
     if (cb_[0]->batch_graphs[T].key != bkey || !cb_[0]->batch_graphs[T].exec) {
         each([&](int, CardBuf& b, const CardW&) {
-            if (!b.lane_rows[(size_t) T]) b.lane_rows[(size_t) T] = dalloc<const int*>((size_t) 2 * MAXT);
-            std::vector<const int*> rows((size_t) 2 * MAXT, nullptr);
+            if (!b.lane_rows[(size_t) T]) b.lane_rows[(size_t) T] = dalloc<const int*>((size_t) 3 * MAXT);
+            std::vector<const int*> rows((size_t) 3 * MAXT, nullptr);
             for (int r = 0; r < T; ++r) {
                 rows[(size_t) r] = b.lanes[(size_t) lanes[r]].ctl;
                 rows[(size_t) (MAXT + r)] = b.lanes[(size_t) lanes[r]].pt;
+                rows[(size_t) (2 * MAXT + r)] = b.lanes[(size_t) lanes[r]].mrope;
             }
             ck(cudaMemcpy(b.lane_rows[(size_t) T], rows.data(), rows.size() * sizeof(const int*), cudaMemcpyHostToDevice), "lane rows");
             if (!b.lane_gdn[(size_t) T]) b.lane_gdn[(size_t) T] = dalloc<float*>((size_t) 2 * NL * MAXT);
@@ -1523,11 +1553,13 @@ std::vector<int> Engine::verify_rows(const std::vector<int>& lanes, const std::v
     if (cb_[0]->batch_graphs[T].key != key || !cb_[0]->batch_graphs[T].exec) {
         const auto tc = std::chrono::steady_clock::now();
         each([&](int, CardBuf& b, const CardW&) {
-            if (!b.lane_rows[(size_t) T]) b.lane_rows[(size_t) T] = dalloc<const int*>((size_t) 2 * MAXT);
-            std::vector<const int*> rows((size_t) 2 * MAXT, nullptr);
+            if (!b.lane_rows[(size_t) T]) b.lane_rows[(size_t) T] = dalloc<const int*>((size_t) 3 * MAXT);
+            std::vector<const int*> rows((size_t) 3 * MAXT, nullptr);
             for (int r = 0; r < T; ++r) {
+                const LaneDev& LD = b.lanes[(size_t) lanes[(size_t) sg.row_lane[(size_t) r]]];
                 rows[(size_t) r] = b.row_pos + r;
-                rows[(size_t) (MAXT + r)] = b.lanes[(size_t) lanes[(size_t) sg.row_lane[(size_t) r]]].pt;
+                rows[(size_t) (MAXT + r)] = LD.pt;
+                rows[(size_t) (2 * MAXT + r)] = LD.mrope;
             }
             ck(cudaMemcpy(b.lane_rows[(size_t) T], rows.data(), rows.size() * sizeof(const int*), cudaMemcpyHostToDevice), "lane rows");
             if (!b.lane_gdn[(size_t) T]) b.lane_gdn[(size_t) T] = dalloc<float*>((size_t) 2 * NL * MAXT);
@@ -1717,7 +1749,7 @@ void Engine::mtp_enqueue(int T) {
         ck(cudaGetLastError(), "norm_cat");
         quantize_q8_1(b.mcat, b.xq, 2 * N, T, b.st);
         mv(b, w.mtp_eh, b.xq, b.mR, T);
-        attn_half(b, w.mtp, b.mR, false, S27_SLOTS - 1, Rows{b.mctl, LaneRows{}}, w.q0, w.kv0, 0, T, eps, rope_of(b.mrope));
+        attn_half(b, w.mtp, b.mR, false, S27_SLOTS - 1, Rows{b.mctl, LaneRows{}, nullptr}, w.q0, w.kv0, 0, T, eps, rope_of(b.mrope));
     }
     for (int c = 0; c < NCARD; ++c) {
         CardBuf& b = *cb_[c];

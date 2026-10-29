@@ -14,6 +14,7 @@ lands off by default until the GPU checks pass ([docs/verification.md](verificat
 | `serve/sfnx-pool.json` | a check config: 32k context, `--spec 4`, `--lookup 7`, no env of its own — the arena is on, only the context is small |
 | `serve/sfnx-2card.json` | two cards (`"gpu": [0, 1]`), for an engine built with `make FNX_NCARD=2`: prod's settings without vision, a 32 GiB conversation cache, port 8095. The engine puts as many experts in RAM as the cards need at start; fp16 sums between the cards, slightly over the exactness bar (code KL 7.5e-4 against 6.1e-4, edit 7.1e-6 against 5.2e-6; the same top-1 as fp32) on two (`FNX_RING_F32=1`: fp32, within it and ~30% slower; [docs/benchmarks.md](benchmarks.md#two-cards-and-one-card)) |
 | `serve/sfnx-4card.json` | four cards (`"gpu": [0, 1, 2, 3]`), for an engine built with `make FNX_NCARD=4`: prod's settings with vision on card 3, a 32 GiB conversation cache, port 8095. Untested on hardware ([Card count](#card-count)) |
+| `serve/sfnx-27b.json` | Qwen3.8-27B (dense) Q8_0, for an engine built with `make FNX_MODEL=27b` ([Model](#model)): 262,144 context, 6 lanes, f16 K/V, its own draft layer (`--mtp nextn`), `--spec 4`, vision on card 2 with 2.5 GiB a card kept from the K/V pool for it (`FNX_KV_RESERVE_MIB`), port 8096. `models` must point at the folder holding `Q8_0/Qwen3.8-27B-Q8_0.gguf` and its `mmproj-F16.gguf` |
 | `serve/sfnx.service.in` | the systemd unit's template: `make install` fills in the checkout (`@ROOT@`), the config (`@CONFIG@`: `serve/sfnx.json`, or `make install CONFIG=path`) and whoever runs it (`@USER@`, `@GROUP@`) and writes `/etc/systemd/system/sfnx.service`. It overrides the config's port with `--port 8080` |
 | `serve/run.sh [CONFIG]` | the same as a transient unit on the config's own port (8095 for `sfnx.json`), with `LimitMEMLOCK` raised |
 
@@ -69,6 +70,33 @@ of each expert's FF width, and need at most eight CUDA peers a card. Every layer
 K/V is dealt by position (blocks of 4 positions, card j % n) and the vocabulary in ranges of ceil(vocab / n) tokens, the last card's
 shorter, on every count.
 Validating a count: [docs/verification.md](verification.md#other-card-counts).
+
+## Model
+
+`FNX_MODEL` is a build setting like `FNX_NCARD`: `make FNX_MODEL=fnx` (the default, prod) builds for Flash-Next,
+`make FNX_MODEL=27b` for Qwen3.8-27B, the dense model of the same family (64 layers, 48 recurrent and 16 attention,
+width 5120, a 17,408-wide FFN, Q8_0 only). `build/model` records which `build/` was made for; another rebuilds
+everything. Where they differ the code says so in `#if FNX_27B` blocks, and a Flash-Next build preprocesses to the same
+text as one without them. The 27B has its own engine behind `src/engine.hpp`'s interface (`src/s27_engine.cu`, its
+prompt path `src/s27_prefill.cu`), so `bin/sfnx`, the front end, `bin/batch_test`, `bin/sample_test` and `bin/fnx_run`
+serve and check it unchanged; the lab holds Flash-Next only (the 27B loads plain, ~30 s).
+
+How the 27B splits, on three cards only (the Makefile refuses another count for it):
+
+| What | How |
+| --- | --- |
+| Recurrent layers | by heads, as Flash-Next (same 16 key / 48 value heads) |
+| Attention | by heads: 8 query heads a card and the 2 KV heads they read, K/V for every position on the card that reads them; no exchange until the output projection's sum |
+| FFN | by FF width, in 32-value blocks (182 / 181 / 181) |
+| Output head | a third of the vocabulary per card |
+| Draft layer | the GGUF's own nextn block (`--mtp nextn`), split as a trunk layer; its head the draft vocabulary's rows |
+| Sums | three fp16 values a word around the ring (`src/s27_ring3.cuh`) |
+
+Its settings: `FNX_KV_RESERVE_MIB` (default 1024: VRAM kept from the K/V pool for graphs, cuBLAS and the lanes' tables;
+the pool takes the rest, ~490k positions at 1024), `FNX_KV_PAGES` (a pool of that many 256-position pages instead),
+`FNX_PF_ROWS` (prompt chunk rows, as Flash-Next), `FNX_PF_SCORE_MIB` (the prompt attention's scores' room a card,
+default 256), `FNX_PF_SCORES=f16` (those scores as f16: [docs/benchmarks.md](benchmarks.md#qwen38-27b)). `FNX_KV8=1`
+and `FNX_RING_F32=1` are refused: its K/V is f16 (llama.cpp's default) and its ring fp16.
 
 ## Engine settings
 

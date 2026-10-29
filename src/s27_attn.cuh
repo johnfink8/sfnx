@@ -4,7 +4,8 @@
 // K/V live in a paged pool: a page holds S27_PP positions of every attention layer and the draft layer (a slot each:
 // its K rows [S27_PP][2][HD], then its V rows); a sequence's page table maps its logical pages to physical ones.
 // A window's rows each have a position and a page table: one sequence's rows at *pos0 + t on pt0, or a batched
-// window's, each from its lane (LaneRows: the row's position word and table)
+// window's, each from its lane (LaneRows: the row's position word and table; tabs: its lane's rotary table, null for a
+// lane without an image)
 #pragma once
 
 #include <cuda_fp16.h>
@@ -47,10 +48,12 @@ __device__ __forceinline__ float s27_sum256(float v, float* sh) {
 // per (head, row): q heads normed and rotated in place; K heads normed, rotated and stored at the row's position; V
 // heads stored. HD threads a block, one per value. qkv rows at row_stride
 static __global__ void __launch_bounds__(HD) k_s27_prep(float* qkv, int row_stride, const float* qn, const float* kn, __half* pool, int slot,
-                                                 const int* pos0p, const int* pt0, LaneRows lr, float eps, Rope rope) {
+                                                 const int* pos0p, const int* pt0, LaneRows lr, const int* const* tabs, float eps,
+                                                 Rope rope) {
     __shared__ float sh[HD / 32];
     __shared__ float x[HD];
     const int h = blockIdx.x, t = blockIdx.y, i = threadIdx.x, pos = s27_row_pos(lr, pos0p, t);
+    if (tabs) rope.tab = tabs[t];
     const int* pt = s27_row_pt(lr, pt0, t);
     float* row = qkv + (size_t) t * row_stride;
     float* p;

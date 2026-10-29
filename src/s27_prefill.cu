@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -151,6 +152,35 @@ __global__ void k_pf_softmax(const float* __restrict__ S, int P, int p0, __half*
     __half* o = prob + (size_t) t * P;
     for (int p = threadIdx.x; p < P; p += blockDim.x) o[p] = __float2half(p < len ? __expf(s[p] * scale - m) * iz : 0.f);
 }
+// the same over f16 scores already scaled by 1 / sqrt(HD), in place: each thread's running max and sum over its
+// share of the row in one read (online), the block's combined, then the probabilities written over the scores
+__device__ __forceinline__ void pf_ml_merge(float& m, float& l, float m2, float l2) {
+    const float mm = fmaxf(m, m2);
+    l = (m == -INFINITY ? 0.f : l * __expf(m - mm)) + (m2 == -INFINITY ? 0.f : l2 * __expf(m2 - mm));
+    m = mm;
+}
+__global__ void k_pf_softmax16(__half* __restrict__ S, int P, int p0) {
+    __shared__ float sm[32], sl[32];
+    const int t = blockIdx.x, len = p0 + t + 1;
+    __half* s = S + (size_t) t * P;
+    float m = -INFINITY, l = 0.f;
+    for (int p = threadIdx.x; p < len; p += blockDim.x) {
+        const float x = __half2float(s[p]);
+        if (x > m) {
+            l = l * __expf(m - x) + 1.f;
+            m = x;
+        } else {
+            l += __expf(x - m);
+        }
+    }
+    for (int o = 16; o; o >>= 1) pf_ml_merge(m, l, __shfl_xor_sync(0xffffffffu, m, o), __shfl_xor_sync(0xffffffffu, l, o));
+    if ((threadIdx.x & 31) == 0) sm[threadIdx.x >> 5] = m, sl[threadIdx.x >> 5] = l;
+    __syncthreads();
+    m = -INFINITY, l = 0.f;
+    for (int w = 0; w < (int) (blockDim.x >> 5); ++w) pf_ml_merge(m, l, sm[w], sl[w]);
+    const float il = 1.f / l;
+    for (int p = threadIdx.x; p < P; p += blockDim.x) s[p] = __float2half(p < len ? __expf(__half2float(s[p]) - m) * il : 0.f);
+}
 // att[r0 + t][h] = O[t] * sigmoid(gate) as f16, rows of S27_NQ * HD (wo's input)
 __global__ void k_pf_gate(const float* __restrict__ O, const float* __restrict__ qkv, int h, int r0, int n, __half* __restrict__ att) {
     for (size_t e = blockIdx.x * (size_t) blockDim.x + threadIdx.x; e < (size_t) n * HD; e += (size_t) gridDim.x * blockDim.x) {
@@ -277,6 +307,9 @@ void Engine::prefill_alloc() {
     // FNX_PF_SCORE_MIB: the attention scores' room a card (default 256: query blocks of 512 rows at 128k positions)
     const long long score_mib = env_int("FNX_PF_SCORE_MIB", 256);
     if (score_mib < 16) throw std::runtime_error("FNX_PF_SCORE_MIB: want 16 MiB or more, got " + std::to_string(score_mib));
+    if (((size_t) score_mib << 18) < (size_t) MAXT * (max_ctx_ + S27_PP))
+        throw std::runtime_error("FNX_PF_SCORE_MIB: " + std::to_string(score_mib) + " MiB holds fewer than " + std::to_string(MAXT) +
+                                 " queries' scores over the context of " + std::to_string(max_ctx_) + " positions");
     for (int c = 0; c < NCARD; ++c) {
         CardBuf& b = *cb_[(size_t) c];
         const CardW& w = m_.cards[c];
@@ -363,6 +396,22 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
     if (mtp_ && after < 0) throw std::runtime_error("prefill: the draft layer needs the token after the last row");
     const size_t nt = tokens.size();
     if (pos_ + (int) nt > max_ctx_) throw Refused("prefill: context full");
+    // FNX_PF_WINDOWS=1 (a check): the prompt through decode windows of MAXT rows, the draft layer over each, instead
+    if (env_flag("FNX_PF_WINDOWS")) {
+        for (size_t i = 0; i < nt; i += MAXT) {
+            const size_t e = std::min(nt, i + MAXT);
+            const int T = (int) (e - i), p0 = pos_;
+            verify(std::vector<int>(tokens.begin() + (long) i, tokens.begin() + (long) e));
+            commit(T);
+            if (mtp_) {
+                std::vector<int> next(tokens.begin() + (long) i + 1, tokens.begin() + (long) e);
+                next.push_back(e < nt ? tokens[e] : after);
+                draft(T, true, 0, next, p0);
+            }
+            if (on_prefill_chunk && (e % (size_t) pf_c_ == 0 || e == nt)) on_prefill_chunk((int) e);
+        }
+        return;
+    }
     if (pf_[0]->seq >= PF_SEQ_RESET) {   // every card idle (each chunk ends synchronized): the flags zeroed, numbers from 0
         for (Pf* p : pf_) {
             ckc(cudaSetDevice(p->dev), "set");
@@ -382,6 +431,13 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
     // FNX_PF_SKIP=ring,attn: leave the sums or the attention out (wrong rows: a timing breakdown only)
     static const char* skip_s = std::getenv("FNX_PF_SKIP");
     static const bool skip_ring = skip_s && std::strstr(skip_s, "ring"), skip_attn = skip_s && std::strstr(skip_s, "attn");
+    // FNX_PF_SCORES: the attention's scores as f16 (the default: scaled first, half the bytes through memory) or f32. On
+    // ref/long64 f16 read 4-7% faster (32k 2,187 against 2,096 tok/s) and as close to llama.cpp: KL 2.65e-4 against 2.89e-4
+    static const bool scores16 = [] {
+        const char* v = std::getenv("FNX_PF_SCORES");
+        if (v && std::strcmp(v, "f16") && std::strcmp(v, "f32")) throw std::runtime_error(std::string("FNX_PF_SCORES: f16 or f32, not '") + v + "'");
+        return !v || !std::strcmp(v, "f16");
+    }();
     const float eps = m_.eps;
     auto each = [&](auto&& f) {
         for (int c = 0; c < NCARD; ++c) {
@@ -389,6 +445,10 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
             f(c, *cb_[(size_t) c], m_.cards[c], *pf_[(size_t) c]);
         }
     };
+    // a position's token: the history's before the read, the prompt's after (h0 taken once: each pass adds its rows to
+    // the history)
+    const int h0 = (int) history_.size();
+    const auto tok_at = [&](int q) -> int { return q < h0 ? history_[(size_t) q] : tokens[(size_t) (q - h0)]; };
     for (size_t i = 0; i < nt; i += (size_t) PF_K * pf_c_) {
         const auto t_pass = std::chrono::steady_clock::now();
         const int rows = (int) std::min(nt - i, (size_t) PF_K * pf_c_), nk = (rows + pf_c_ - 1) / pf_c_;
@@ -400,8 +460,6 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
         }
         ensure_pages(pos_ + rows);
         // the pass's rows, then (for the draft layer) the token after its last row, embedded on the host
-        const int h0 = (int) history_.size();
-        const auto tok_at = [&](int q) -> int { return q < h0 ? history_[(size_t) q] : tokens[(size_t) (q - h0)]; };
         for (int t = 0; t < rows; ++t) embed_token(tok_at(pos_ + t), pos_ + t, pf_emb_[0] + (size_t) t * N);
         if (mtp_) embed_token(i + rows < nt ? tokens[i + rows] : after, pos_ + rows, pf_emb_[0] + (size_t) rows * N);
         for (int j = 0; j < nk; ++j) {   // a tag per group of MAXT rows, so the recurrent history's parity steps per group
@@ -441,6 +499,7 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
         auto attention = [&](CardBuf& b, const CardW& w, Pf& p, int slot) {
             const int P = pos0 + C;
             const int qb = (int) std::min<size_t>((size_t) C, std::max<size_t>(MAXT, p.score_floats / (size_t) P / MAXT * MAXT));
+            const float one = 1.0f, zero = 0.0f, scale = 1.0f / std::sqrt((float) HD);
             for (int j = 0; j < S27_NKV; ++j) {
                 k_pf_gather<<<grid_for((size_t) P * HD / 8), 256, 0, b.st>>>(b.pool, b.pt, slot, j, P, p.kc, p.vc);
                 for (int h = 0; h < S27_NQ; ++h) {
@@ -448,11 +507,17 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
                     for (int r0 = 0; r0 < C; r0 += qb) {
                         const int n = std::min(qb, C - r0), Pb = pos0 + r0 + n;
                         k_pf_q16<<<grid_for((size_t) n * HD), 256, 0, b.st>>>(p.big, h, r0, n, p.q16);
-                        const float one = 1.0f, zero = 0.0f;
-                        ckb(cublasGemmEx(p.blas, CUBLAS_OP_T, CUBLAS_OP_N, Pb, n, HD, &one, p.kc, CUDA_R_16F, HD, p.q16, CUDA_R_16F, HD, &zero,
-                                         p.score, CUDA_R_32F, Pb, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                            "scores");
-                        k_pf_softmax<<<n, 256, 0, b.st>>>(p.score, Pb, pos0 + r0, p.prob);
+                        if (scores16) {
+                            ckb(cublasGemmEx(p.blas, CUBLAS_OP_T, CUBLAS_OP_N, Pb, n, HD, &scale, p.kc, CUDA_R_16F, HD, p.q16, CUDA_R_16F, HD,
+                                             &zero, p.prob, CUDA_R_16F, Pb, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                                "scores");
+                            k_pf_softmax16<<<n, 256, 0, b.st>>>(p.prob, Pb, pos0 + r0);
+                        } else {
+                            ckb(cublasGemmEx(p.blas, CUBLAS_OP_T, CUBLAS_OP_N, Pb, n, HD, &one, p.kc, CUDA_R_16F, HD, p.q16, CUDA_R_16F, HD, &zero,
+                                             p.score, CUDA_R_32F, Pb, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                                "scores");
+                            k_pf_softmax<<<n, 256, 0, b.st>>>(p.score, Pb, pos0 + r0, p.prob);
+                        }
                         ckb(cublasGemmEx(p.blas, CUBLAS_OP_N, CUBLAS_OP_N, HD, n, Pb, &one, p.vc, CUDA_R_16F, HD, p.prob, CUDA_R_16F, Pb, &zero,
                                          p.o, CUDA_R_32F, HD, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
                             "values");
@@ -480,7 +545,7 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
                     } else {
                         pf_dense(p, L.wq, p.xh, C, p.big);
                         k_s27_prep<<<dim3(S27_NQ + 2 * S27_NKV, C), HD, 0, b.st>>>(p.big, S27_QKV, L.q_norm, L.k_norm, b.pool, s27_slot(l), p.ctl,
-                                                                                    b.pt, LaneRows{}, eps, rope_of(b.mrope));
+                                                                                    b.pt, LaneRows{}, nullptr, eps, rope_of(b.mrope));
                         if (!skip_attn) attention(b, w, p, s27_slot(l));
                         pf_dense(p, L.wo, p.xh, C, p.bo);
                     }
@@ -518,7 +583,7 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
                 k_pf_add_norm<<<C, 1024, 0, b.st>>>(p.R, nullptr, w.mtp.attn_norm, nullptr, p.xh, eps);
                 pf_dense(p, w.mtp.wq, p.xh, C, p.big);
                 k_s27_prep<<<dim3(S27_NQ + 2 * S27_NKV, C), HD, 0, b.st>>>(p.big, S27_QKV, w.mtp.q_norm, w.mtp.k_norm, b.pool, S27_SLOTS - 1, p.ctl,
-                                                                            b.pt, LaneRows{}, eps, rope_of(b.mrope));
+                                                                            b.pt, LaneRows{}, nullptr, eps, rope_of(b.mrope));
                 ckc(cudaGetLastError(), "draft layer (prompt)");
             });
         }

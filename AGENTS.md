@@ -16,6 +16,10 @@ the verification and the settings.
   `peer_probe.cu` / `.hpp` (every link written and watched before the engine uses it, and the report and failure text
   it prints). `kernels.cu`
   compiles as nine objects (`-DFNX_KPART=0..8`), each holding its share of the launchers.
+- **The 27B** (`make FNX_MODEL=27b`, Qwen3.8-27B dense, docs/config.md "Model"): `s27_engine.cu` is engine.hpp's
+  Engine for it, `s27_prefill.cu` its prompt path, `s27_attn.cuh` (head-split paged attention), `s27_ring3.cuh` (its
+  sums), `s27_impl.hpp`; its differences elsewhere sit in `#if FNX_27B` blocks, and a Flash-Next build must preprocess
+  to the same text as main's (no `FNX_27B` left in it).
 - **`tools/`**: `sfnx.cpp` is the engine process (a line protocol on stdin, `sfnx_input.hpp`); `fnx_run.cpp` is the
   lab harness; `fnx_hold` / `fnx_lab` + `lab.sh` are the lab; the `*_test` programs and `*_check.sh` scripts are the
   checks (they share `labenv.sh`); the `*_probe` / `*_bench` programs measured the hardware the design rests on.
@@ -84,6 +88,13 @@ Measure speed with `lab.sh decode` (edit1 and code1 greedy, prose2 and code1s wi
 `lab.sh batch`; trace with `lab.sh trace`. A `kbench` win is not a win until the real window shows it. Sample GPU
 utilization and power in every speed run. Mid perf push, measure speed only; run the exactness checks once the push is
 done.
+
+The 27B (`make FNX_MODEL=27b`, its own worktree: switching models rebuilds everything) has no lab: its checks load it
+plain (~30 s) through `tools/s27.sh` (the memlock limit the loader needs, and this shell's `FNX_*` settings):
+`tools/s27.sh bin/fnx_run models/Q8_0/Qwen3.8-27B-Q8_0.gguf exact` (and `decode`), `tools/s27.sh bin/batch_test MODEL
+nextn data/draft_vocab_en.bin 64 ref/long2.bin ref/code1.bin ref/long2.bin`, `SAMPLE_TEST_LANES=3 tools/s27.sh
+bin/sample_test MODEL nextn data/draft_vocab_en.bin ref/open1.bin 600 24`; serving through `serve/sfnx-27b.json`.
+Its llama.cpp references (docs/verification.md, "The 27B") are made locally like the rest of `ref/lgr/`.
 
 ## The checks (on the GPU, before merging engine changes; the full inventory: `docs/verification.md`)
 

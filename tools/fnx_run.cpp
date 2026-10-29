@@ -37,6 +37,13 @@
 
 #include "../src/engine.hpp"
 #include "batch_check.hpp"
+
+// the draft layer's runtime: Flash-Next's files, or the 27B's own layer in its GGUF (Mtp's "nextn")
+#if FNX_27B
+#define MTP_RT "nextn"
+#else
+#define MTP_RT FNX_DIR "/data/mtp-rt"
+#endif
 #include "ref_tokens.hpp"
 #include "../src/env.hpp"
 
@@ -294,12 +301,24 @@ struct Bar {
     double top1_pct, kl_mean, kl_slack;
 };
 constexpr double TOP1_SLACK = 1.5;
+#if FNX_27B
+// the 27B's (make FNX_MODEL=27b), on Qwen3.8-27B Q8_0 (docs/verification.md, "The 27B"): code1 and edit1 llama.cpp's CPU
+// backend against its CUDA one, teacher-forced on the CUDA tokens (ref/lgr/llama_cpu_<model>_<prompt>.lgr); the picture
+// the same under its own encoder (IMG_LOGREF_GPU=0); long64 llama.cpp's q8_0 K/V against its f16 K/V, as Flash-Next's
+constexpr Bar BARS[] = {
+    {"code1", 100.00, 8.95e-5, 1.25},
+    {"edit1", 100.00, 1.48e-7, 1.25},
+    {"picture", 99.50, 4.69e-4, 1.25},
+    {"long64", 99.50, 2.08e-4, 1.0},
+};
+#else
 constexpr Bar BARS[] = {
     {"code1", 98.33, 4.85e-4, 1.25},
     {"edit1", 100.00, 4.12e-6, 1.25},
     {"picture", 98.50, 6.38e-3, 1.25},
     {"long64", 97.50, 4.98e-3, 1.0},
 };
+#endif
 // empty when c is within prompt's bar, else what is outside it
 static std::string breach(const std::string& prompt, const LgrCmp& c) {
     for (const Bar& b : BARS) {
@@ -446,7 +465,7 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
                 return 2;
             }
         }
-        const fnx::Mtp mtp(m, FNX_DIR "/data/mtp-rt", FNX_DIR "/data/draft_vocab_en.bin");
+        const fnx::Mtp mtp(m, MTP_RT, FNX_DIR "/data/draft_vocab_en.bin");
         fnx::Engine e(m, env_ctx(262144), 6);
         e.mtp_attach(mtp);
         const std::vector<int> eos{248044, 248046};
@@ -529,7 +548,7 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
             return a;
         };
         auto msg = [&](int role, const std::vector<int>& body) { return cat({TURN, role}, body); };
-        const fnx::Mtp mtp(m, FNX_DIR "/data/mtp-rt", FNX_DIR "/data/draft_vocab_en.bin");
+        const fnx::Mtp mtp(m, MTP_RT, FNX_DIR "/data/draft_vocab_en.bin");
         fnx::Engine e(m, env_ctx(65536), 1);
         e.mtp_attach(mtp);
         const std::vector<int> eos{248044, 248046};
@@ -621,7 +640,7 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
         if (nl < 1 || nl > 6 || n < 1) { std::fprintf(stderr, "bdecode [LANES 1..6] [N >= 1] [PROMPTS]\n"); return 2; }
         const std::string names = argc > 5 ? argv[5] : "prose2,code1";
         if (fnx::batch_drafts() == fnx::BatchDrafts::off) { std::fprintf(stderr, "bdecode: set FNX_BATCH_DRAFTS (lookup or 1)\n"); return 2; }
-        const fnx::Mtp mtp(m, FNX_DIR "/data/mtp-rt", FNX_DIR "/data/draft_vocab_en.bin");
+        const fnx::Mtp mtp(m, MTP_RT, FNX_DIR "/data/draft_vocab_en.bin");
         fnx::Engine e(m, env_ctx(262144), 6);
         e.mtp_attach(mtp);
         const std::vector<int> eos{248044, 248046};
@@ -707,7 +726,7 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
         // tools/batch_check.sh's lanes: two long prompts (past 2,048 positions, so the QSA selection runs) and a short one
         const int gen = argc > 3 ? std::atoi(argv[3]) : 64;
         if (gen < 1) { std::fprintf(stderr, "batch [GEN]: GEN >= 1\n"); return 2; }
-        const fnx::Mtp mtp(m, FNX_DIR "/data/mtp-rt", "data/draft_vocab_en.bin");
+        const fnx::Mtp mtp(m, MTP_RT, "data/draft_vocab_en.bin");
         fnx::Engine e(m, env_ctx(100000));
         return batch_check(m, e, mtp, gen,
                            {ref_tokens("ref/long2.bin"), ref_tokens("ref/code1.bin"), ref_tokens("ref/long2.bin")});
@@ -725,7 +744,12 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
     // only). code1 and edit1 also run in windows of 1, 2, 3, 11 and 16 rows, which must give the 5-row windows' logits
     // byte for byte: decode verifies windows of 1..MAXT rows, so a kernel whose sums depend on the row count (or one
     // that takes another path for small windows, as FNX_HC1) would move served output while every 5-row check passed.
+#if FNX_27B   // the 27B's references are its own, named by the model (Flash-Next's Q4 and Q8 files are not its)
+    const bool q4 = false, q8 = false;
+    const std::string pic_stem = "ref/img/sphinx_" + stem;
+#else
     const bool q4 = stem.find("UD-Q4_K_XL") != std::string::npos, q8 = stem.find("Q8_0") != std::string::npos;
+#endif
     const std::string name = argc > 3 ? argv[3] : "try", dir = lab_dir();
     const bool base_run = name == "base";
     // a base is written only from a run within the bar: its files go to MODEL-base-new*.lgr first and replace the
@@ -775,16 +799,22 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
     };
     for (const char* p : {"long64", "code1", "edit1", "picture"}) {
         const bool pic = std::string(p) == "picture", long64 = std::string(p) == "long64";
+#if !FNX_27B   // the 27B has its own picture reference
         if (pic && !q4) {
             std::printf("exact %s picture: not run (llama.cpp's picture reference is Q4's only)\n", name.c_str());
             continue;
         }
+#endif
         if (long64 && q8 && !std::getenv("FNX_EXACT_REF")) {
             std::printf("exact %s long64: not run (no llama.cpp reference on Q8_0 at 62k; FNX_EXACT_REF=FILE.lgr gives one)\n",
                         name.c_str());
             continue;
         }
+#if FNX_27B
+        const std::string prompt = pic ? pic_stem + ".bin" : std::string("ref/") + p + ".bin",
+#else
         const std::string prompt = pic ? "ref/img/sphinx.bin" : std::string("ref/") + p + ".bin",
+#endif
                           tag = long64 ? "" : std::string("-") + p;
         // a scaled build is held to llama.cpp run with the same scaling (ref/fnx_logref and ref/img_logref read the same
         // settings), else the comparison measures the rope change itself; the file names the scale, the trained length
@@ -804,7 +834,11 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
         }
         std::string llama_s = long64 && std::getenv("FNX_EXACT_REF") ? std::getenv("FNX_EXACT_REF")
                               : scale                                ? "ref/lgr/" + yarn_tag + "_" + p + ".lgr"
+#if FNX_27B
+                              : pic                                  ? pic_stem + ".lgr"
+#else
                               : pic                                  ? "ref/img/sphinx.lgr"
+#endif
                               : q4                                   ? "ref/lgr/llama_cuda_" + std::string(p) + ".lgr"
                               : q8                                   ? "ref/lgr/llama_cpu_q8w_" + std::string(p) + ".lgr"
                                                                      : "ref/lgr/llama_cuda_" + stem + "_" + p + ".lgr";
@@ -814,7 +848,11 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
                 std::fprintf(stderr, "exact: no llama.cpp reference %s for %s; make it with\n  %sref/img_logref %s MMPROJ.gguf "
                              "ref/img/sphinx.png 'What does this picture show? Answer in two sentences.' 200 %s\n",
                              llama_s.c_str(), stem.c_str(), scaled_env.c_str(), argv[1],
+#if FNX_27B
+                             scale ? llama_s.substr(0, llama_s.size() - 4).c_str() : pic_stem.c_str());
+#else
                              scale ? llama_s.substr(0, llama_s.size() - 4).c_str() : "ref/img/sphinx");
+#endif
             else
                 std::fprintf(stderr, "exact: no llama.cpp reference %s for %s; make it with\n  %sref/fnx_logref %s %s %d %s\n",
                              llama_s.c_str(), stem.c_str(), scaled_env.c_str(), argv[1], prompt.c_str(), long64 ? 200 : 300,
@@ -827,7 +865,11 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
         // the logits of the prompt and the reference's steps in windows of T rows, on a fresh engine
         auto logits = [&](int T, const std::string& out) {
             fnx::Engine e(m, env_ctx(n_prompt + 1024), 1);
+#if FNX_27B
+            if (pic) setenv("FNX_IMAGES", (pic_stem + ".sve").c_str(), 1);
+#else
             if (pic) setenv("FNX_IMAGES", "ref/img/sphinx.sve", 1);
+#endif
             const int r = run_logits(m, e, prompt.c_str(), llama_s.c_str(), T, out.c_str(), true);
             if (pic) unsetenv("FNX_IMAGES");
             return r;
@@ -845,7 +887,9 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
         const LgrCmp vs_llama = lgr_compare(ref, mine);
         std::printf("  vs llama.cpp %s: %s\n", q8 ? "CPU" : "CUDA", vs_llama.str().c_str());
         if (!std::isfinite(vs_llama.kl_mean)) fail("KL is not a number: one side's logits are broken");
+#if !FNX_27B
         else if (!q4 && !q8) fail("no documented bar for " + stem + ": the numbers above are not judged");
+#endif
         else if (scale) {
             // YaRN moves the model's own outputs (docs/verification.md, "Rope scaling"), and llama.cpp's backends part
             // differently under it, so the bar is not held here: only a port that is plainly broken fails, at 10x the

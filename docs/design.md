@@ -118,6 +118,29 @@ Unsloth's UD-Q4_K_XL and the Q8_0 build both satisfy this; those two are what ru
 ([docs/verification.md](verification.md)). A quant that does not is a new kernel, not a config change — and it fails
 at load, naming the tensor.
 
+## The 27B
+
+Qwen3.8-27B is the family's dense model (`make FNX_MODEL=27b`, [docs/config.md](config.md#model)): 27B weights read
+whole every window, against Flash-Next's ~3B active. One request is bandwidth-bound on 9.2 GB a card at 880 GB/s, so
+decode is ~3x slower a row than Flash-Next's and the drafts carry it the same way.
+
+- **Attention by heads, not by position.** 24 query heads over 4 KV heads: each card takes 8 query heads and the 2 KV
+  heads they read (query head h reads KV head h / 6, so a KV head straddling two cards' heads is kept on both). K/V
+  stays on the card that reads it; no partials cross the cards before the output projection's sum. Flash-Next splits
+  K/V by position because its 2 KV heads do not divide by three cards.
+- **The FFN by FF width**, 17,408 in 32-value blocks, as Flash-Next's experts.
+- **Sums**: two a layer, 128 a window, three fp16 values a word around the ring (`src/s27_ring3.cuh`): a third fewer
+  words than two a word, 4-row windows 19.4 → 18.5 ms. Storing straight to both peers instead of the ring was slower at
+  every window size (28.9 against 19.4 ms at 4 rows): GPU 0 sits on the other socket from 1 and 2.
+- **Matvecs**: the 27B's matrices all go through q8s (Q8_0 only, the loader refuses another type). Its window is 257
+  dependent matrices, and their boundaries cost ~2.3 ms of a 4-row window against the same bytes in a few big
+  matrices; a persistent launch with a grid barrier between matrices measured the same, prefetching the next rows into
+  L2 slower.
+- **The prompt path** (`src/s27_prefill.cu`): chunks of 4,096 rows, every Q8_0 matrix dequantized to f16 and multiplied
+  with cuBLAS on the tensor cores, the recurrent layers through Flash-Next's `gdn_prompt`, attention per head as two
+  cuBLAS products around a causal softmax (the scores in blocks of queries that fit 256 MiB), the sums on the copy
+  engines with each half's sum crossing the links while the pass's other chunk computes.
+
 ## Hardware
 
 The cards are used datacenter V100s: `sm_70`, no CUDA 13, no FP8, capped at 200 W each (110–150 W each sampled in the
