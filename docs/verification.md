@@ -118,6 +118,10 @@ from its CPU backend (code 1.13e-4): about the distance between any two of llama
 
 Windows of 1, 2, 3, 11 and 16 rows give the 5-row windows' logits byte for byte.
 
+On two cards (`FNX_NCARD=2`, GPUs 1 and 2, its own lab directory) the same: code 100% / 1.34e-4, edit 100% / 1.46e-7,
+the picture 99.0% / 5.95e-4, all within the bar; long64 100% / 3.06e-4, over it as on three; the windows byte for
+byte. Its batched windows and its sums (`bin/s27_ring_test`) pass there too. Four cards build and have never run.
+
 The bar takes the CPU backend's top-1 (the highest of the three) and the widest KL, with Flash-Next's slack on top
 (1.25x; 1.0 for long64).
 
