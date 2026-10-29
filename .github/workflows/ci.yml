@@ -1,0 +1,79 @@
+# What a hosted runner can check without a GPU: the engine, the lab and the test programs compile and link (sm_70 on
+# every card count, sm_86 on three and four, every other arch the Makefile takes on three), the CPU checks pass, and the
+# front end's tests pass with none skipped. Not built: the picture encoder and the reference tools, which need
+# llama.cpp's CUDA libraries. The GPU checks (AGENTS.md, docs/verification.md) are run on cards by the author and again
+# on the V100s before merging.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  engine:
+    name: engine sm_${{ matrix.arch }}, ${{ matrix.ncard }} cards
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:12.9.1-devel-ubuntu24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [70]
+        ncard: [2, 3, 4, 6, 8]
+        include:
+          - arch: 86
+            ncard: 3
+          - arch: 86
+            ncard: 4
+          - arch: 80
+            ncard: 3
+          - arch: 89
+            ncard: 3
+          - arch: 90
+            ncard: 3
+          - arch: 100
+            ncard: 3
+          - arch: 120
+            ncard: 3
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install gcc 14
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: apt-get update -q && apt-get install -y -q --no-install-recommends g++-14 make git ca-certificates
+      - name: llama.cpp at a37cc46 (ggml's headers)
+        run: |
+          git init -q llama.cpp
+          git -C llama.cpp fetch -q --depth 1 https://github.com/ggml-org/llama.cpp a37cc46104eb50900d5ab4a9ba02a0abdac039db
+          git -C llama.cpp checkout -q FETCH_HEAD
+      - name: Build
+        run: make -j"$(nproc)" ARCH=${{ matrix.arch }} FNX_NCARD=${{ matrix.ncard }} lab bin/sfnx test-bin
+      - run: bin/sfnx_input_test
+      - run: bin/batch_plan_test
+      - run: bin/pf_ring_plan_test
+      - run: bin/rope_test
+      - run: bin/card_check_test
+      - run: tools/build_guards_check.sh
+
+  front:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Install
+        run: python -m venv .venv && .venv/bin/pip install -q '.[test]'
+      - name: node (front/test_web_sampling.py runs the web page's functions in it)
+        run: node --version
+      - run: .venv/bin/python -m pytest -q front/
+        env:
+          FNX_NO_SKIPS: "1"

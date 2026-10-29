@@ -1,0 +1,48 @@
+name: Other cards
+description: sFNX on cards, card counts or links other than three PCIe V100s, whether it worked or not.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        docs/config.md ("Other GPUs") and docs/verification.md ("Other card counts", "Other GPUs") say what has run where
+        and how to validate a new setup. Results from any box help, including a failure.
+  - type: textarea
+    id: cards
+    attributes:
+      label: Cards and link
+      description: |
+        The cards, how many, their compute capability, the link between them (PCIe gen and lanes, NVLink, a PCIe
+        switch), the driver (and any P2P patch), the CPU and RAM. Then the output of:
+        ```sh
+        nvidia-smi; nvidia-smi topo -m; nvidia-smi -q | grep -A3 BAR1
+        ```
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: build
+    attributes:
+      label: Build
+      description: |
+        The commit and settings, and anything you changed to build it:
+        ```sh
+        git rev-parse --short HEAD; cat build/arch build/ncard build/cuda
+        ```
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: What happened
+      description: >
+        Whether it loaded and served, the start-up log (its card and link checks), and if it failed, where. If it ran:
+        tools/lab.sh exact's results against llama.cpp, and tools/lab.sh decode's numbers.
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Config
+      description: The serve/*.json you ran, and any FNX_* settings.
+      render: json
