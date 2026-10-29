@@ -117,8 +117,8 @@ Its llama.cpp references (docs/verification.md, "The 27B") are made locally like
 | `.venv/bin/python -m pytest -q front/` | the front end (CPU only) | pytest |
 
 CI (`.github/workflows/ci.yml`, every PR and push to main, no GPU) builds `lab bin/sfnx test-bin` for sm_70 on every
-card count, sm_86 on three and four and every other arch on three, and runs the CPU-only checks above and the front
-end's tests (a skipped test fails it). The GPU rows stay the author's and the lead's to run.
+card count, sm_86 on three and four and every other arch on three, the 27B's programs (`make FNX_MODEL=27b`) on sm_70
+and three cards, and runs the CPU-only checks above and the front end's tests (a skipped test fails it). The GPU rows stay the author's and the lead's to run.
 
 Bases live in `/tmp/fnx-lab-$UID`, which a reboot empties: regenerate them with the previous build before judging a
 new one.
