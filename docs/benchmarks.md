@@ -206,8 +206,8 @@ One row reads 9.2 GB a card: ~570 GB/s of the cards' 880.
 | 62,794 | 31.95 s | 1,965 |
 | 114,000 | 71.16 s | 1,602 |
 
-**Where a prompt chunk's time goes.** A 4,096-row chunk at the start of `ref/long64`, by part (`FNX_PF_SKIP`, with each
-sum run after its half rather than beside the other chunk):
+**Where a prompt chunk's time goes.** A 4,096-row chunk at the start of `ref/long64`, by part (`FNX_PF_SKIP` with
+`FNX_PF_SKIP_CONFIRM=1`, with each sum run after its half rather than beside the other chunk):
 
 | Part | Time a chunk |
 | --- | --- |

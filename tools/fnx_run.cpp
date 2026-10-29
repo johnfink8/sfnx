@@ -302,13 +302,16 @@ struct Bar {
 };
 constexpr double TOP1_SLACK = 1.5;
 #if FNX_27B
-// the 27B's (make FNX_MODEL=27b), on Qwen3.8-27B Q8_0 (docs/verification.md, "The 27B"): code1 and edit1 llama.cpp's CPU
-// backend against its CUDA one, teacher-forced on the CUDA tokens (ref/lgr/llama_cpu_<model>_<prompt>.lgr); the picture
-// the same under its own encoder (IMG_LOGREF_GPU=0); long64 llama.cpp's q8_0 K/V against its f16 K/V, as Flash-Next's
+// the 27B's (make FNX_MODEL=27b), on Qwen3.8-27B Q8_0 (docs/verification.md, "The 27B"): the widest of llama.cpp's own
+// spreads, each teacher-forced on its CUDA run's tokens (the file the check compares against,
+// ref/lgr/llama_cuda_<model>_<prompt>.lgr). Its CPU backend against CUDA (llama_cpu_*: code1 8.95e-5, edit1 1.48e-7,
+// the picture 99.50% / 4.69e-4), and its CUDA with the int8 products of quantized activations off, cuBLAS for every
+// product (ref/llama_cublas_only.patch, llama_cublas_*: code1 1.25e-4, edit1 1.23e-7, the picture 99.00% / 8.91e-4,
+// long64 1.04e-4); long64 its q8_0 K/V against its f16 K/V (2.08e-4), as Flash-Next's
 constexpr Bar BARS[] = {
-    {"code1", 100.00, 8.95e-5, 1.25},
+    {"code1", 100.00, 1.25e-4, 1.25},
     {"edit1", 100.00, 1.48e-7, 1.25},
-    {"picture", 99.50, 4.69e-4, 1.25},
+    {"picture", 99.00, 8.91e-4, 1.25},
     {"long64", 99.50, 2.08e-4, 1.0},
 };
 #else

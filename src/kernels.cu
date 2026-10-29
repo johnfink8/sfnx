@@ -756,7 +756,6 @@ __global__ void k_ple_conv(float* R, const float* gated, const float* normd, con
 constexpr int RCH = N / NCARD + 1;     // words per slot row (more than a chunk's pairs)
 constexpr int RSTEPS = NCARD - 1;      // receive slots: the reduce hops
 constexpr int NP = N / 2;          // pairs per row
-constexpr float RING_MAX = 65504.0f;   // fp16's largest finite value
 // fp32 words: one value | tag per word, pair i at words 2i, 2i + 1
 __device__ __forceinline__ void rput32(unsigned long long* p, float2 v, unsigned tag, unsigned* err) {
     if (!(isfinite(v.x) && isfinite(v.y))) atomicOr(err, 2u);

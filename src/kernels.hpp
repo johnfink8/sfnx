@@ -130,12 +130,15 @@ __host__ __device__ inline int kv_local_block(int j) { return j / NCARD; }
 // int8 K/V (the default; FNX_KV8=0: f16): the K and V rows int8 in groups of 32 with an f16 scale each (llama.cpp's
 // q8_0); a layer's slot holds its K rows (int8), their scales, the V rows, their scales, then the pooled keys (f16
 // either way: QSA's block selection reads them). The pool then has as many more pages as fit in the f16 pool's bytes.
-#if FNX_27B   // the 27B's pages hold S27_PP positions (s27_attn.cuh); the blocks and slots are Flash-Next's alone
+#if FNX_27B
+// the 27B's pages hold S27_PP positions in S27_SLOTS slots, laid out as s27_attn.cuh says. The blocks and slots here are
+// Flash-Next's, for the attention kernels of kernels.cu a 27B build compiles and never launches
 constexpr int KVP_BLOCKS = 48, KVP_POS = S27_PP, KVP_SLOTS = 13;
 #else
 constexpr int KVP_BLOCKS = 48, KVP_POS = 192, KVP_SLOTS = 13;   // slots: 12 attention layers + the draft layer
 #endif
 static_assert(KVP_BLOCKS % NCARD == 0, "a page holds whole rounds of the cards");
+constexpr float RING_MAX = 65504.0f;   // fp16's largest finite value: past it a sum between cards is out of range
 constexpr int KV8_GROUP = 32;
 bool kv_q8();
 __host__ __device__ inline int kvp_rows(int) { return KVP_BLOCKS / NCARD * 4; }

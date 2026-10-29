@@ -16,10 +16,18 @@ the verification and the settings.
   `peer_probe.cu` / `.hpp` (every link written and watched before the engine uses it, and the report and failure text
   it prints). `kernels.cu`
   compiles as nine objects (`-DFNX_KPART=0..8`), each holding its share of the launchers.
-- **The 27B** (`make FNX_MODEL=27b`, Qwen3.8-27B dense, docs/config.md "Model"): `s27_engine.cu` is engine.hpp's
-  Engine for it, `s27_prefill.cu` its prompt path, `s27_attn.cuh` (head-split paged attention), `s27_ring3.cuh` (its
-  sums), `s27_impl.hpp`; its differences elsewhere sit in `#if FNX_27B` blocks, and a Flash-Next build must preprocess
-  to the same text as main's (no `FNX_27B` left in it).
+- **Two models, one Engine** (`engine.hpp`): `engine_common.cu` holds what does not depend on the model (lanes and
+  pages, windows over one lane or many, commits, saved states, the draft layer's window, the sampler's candidates, the
+  window graphs), written against `engine_parts.hpp`; each model brings its per-card buffers and the few helpers that
+  header names (`engine_impl.hpp` for Flash-Next, `s27_impl.hpp` for the 27B), its layers and embeddings (`engine.cu`,
+  `s27_engine.cu`) and its prompt path (`prefill.cu`, `s27_prefill.cu`; their shared checks and ring conversions in
+  `pf_common.cuh`). `owned.hpp` is the release list every engine registers on. A third model is a third header and
+  engine file.
+- **The 27B** (`make FNX_MODEL=27b`, Qwen3.8-27B dense, docs/config.md "Model"): `s27_attn.cuh` (head-split paged
+  attention), `s27_ring3.cuh` (its sums); its differences in shared files (the loader, the kernels, the planner) sit
+  in `#if FNX_27B` blocks. Its tools: `s27_run` (a prompt and greedy decode with drafts), `s27_ring_test` (its sums,
+  timed and checked), `s27_probe` / `s27_bw_probe` (the weight-reading floor), `s27_cmp.py` (a layer dump against
+  llama.cpp's), `s27_detok.py`, and `s27.sh` (runs any of them, and the checks, with the memlock limit).
 - **`tools/`**: `sfnx.cpp` is the engine process (a line protocol on stdin, `sfnx_input.hpp`); `fnx_run.cpp` is the
   lab harness; `fnx_hold` / `fnx_lab` + `lab.sh` are the lab; the `*_test` programs and `*_check.sh` scripts are the
   checks (they share `labenv.sh`); the `*_probe` / `*_bench` programs measured the hardware the design rests on.

@@ -1,0 +1,62 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index e438073..57a67b5 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1893,6 +1893,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
+ }
+ 
+ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
++    if (getenv("FNX_CUBLAS_ONLY")) { return false; }
+     ggml_tensor *       src0 = tensor->src[0];
+     ggml_tensor *       src1 = tensor->src[1];
+     const ggml_tensor * dst  = tensor;
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index 46efdfe..b4065ea 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ #include "common.cuh"
+ #include "mmq.cuh"
+ #include "quantize.cuh"
+@@ -133,6 +134,7 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
+ 
+ void ggml_cuda_mul_mat_q(
+         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
++    GGML_ASSERT(!getenv("FNX_CUBLAS_ONLY") && "quantized-activation kernel ran under FNX_CUBLAS_ONLY");
+     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
+     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
+     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+@@ -353,6 +355,7 @@ void ggml_cuda_mul_mat_q(
+ }
+ 
+ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
++    if (getenv("FNX_CUBLAS_ONLY")) { return false; }
+ #ifdef GGML_CUDA_FORCE_CUBLAS
+     return false;
+ #endif // GGML_CUDA_FORCE_CUBLAS
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 930f1ad..f7c376f 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ #include "mmvq.cuh"
+ #include "quantize.cuh"
+ #include "unary.cuh"
+@@ -316,6 +317,7 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+ }
+ 
+ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
++    if (getenv("FNX_CUBLAS_ONLY")) { return false; }
+     if (!ggml_is_quantized(type)) {
+         return false;
+     }
+@@ -1455,6 +1457,7 @@ static void mul_mat_vec_q_switch_type(
+ void ggml_cuda_mul_mat_vec_q(
+         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+         const ggml_cuda_mm_fusion_args_host * fusion) {
++    GGML_ASSERT(!getenv("FNX_CUBLAS_ONLY") && "quantized-activation kernel ran under FNX_CUBLAS_ONLY");
+     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
+     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
+     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.

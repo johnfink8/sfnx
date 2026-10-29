@@ -11,7 +11,9 @@
 #include <thread>
 #include <vector>
 
+#include "../src/env.hpp"
 #include "../src/kernels.hpp"
+#include "../src/s27_attn.cuh"
 
 using namespace fnx;
 
@@ -22,37 +24,48 @@ static void ck(cudaError_t e, const char* what) {
     }
 }
 
-constexpr int H = 5120, NLY = 64;
+// card 0's recurrent slice: the larger share of the key heads, a third of the value heads (card_split.hpp's)
+constexpr int KH0 = (NKH + NCARD - 1) / NCARD, VH0 = NVH / NCARD;
+static_assert(KH0 == 6 && VH0 == 16, "card 0's recurrent heads on three cards");
+constexpr int VOCAB = 248320;   // Qwen3.8-27B's output head rows
 struct Mat {
     int rows, cols;
 };
 
 int main(int argc, char** argv) {
     std::vector<int> Ts;
-    for (int i = 1; i < argc; ++i) Ts.push_back(std::atoi(argv[i]));
-    if (Ts.empty()) Ts = {1, 2, 3, 4, 6, 8, 12, 16};
-    // card 0's slice: 6 of 16 key heads, 16 of 48 value heads, 182 of 544 FF blocks, 8 of 24 query heads, all 4 KV heads
-    std::vector<Mat> mats;
-    for (int l = 0; l < NLY; ++l) {
-        if ((l + 1) % 4) {
-            mats.push_back({2 * 6 * 128 + 2 * 16 * 128, H});   // qkv + z
-            mats.push_back({H, 16 * 128});                       // ssm_out
-        } else {
-            mats.push_back({8 * 256 * 2 + 2 * 4 * 256, H});      // q + gate, k, v
-            mats.push_back({H, 8 * 256});                        // wo
+    for (int i = 1; i < argc; ++i) {
+        long long T = 0;
+        if (!parse_whole(argv[i], T) || T < 1 || T > MAXT) {
+            std::fprintf(stderr, "s27_probe: T is 1..%d, not '%s'\n", MAXT, argv[i]);
+            return 2;
         }
-        mats.push_back({2 * 182 * 32, H});                       // gate | up
-        mats.push_back({H, 182 * 32});                           // down
+        Ts.push_back((int) T);
     }
-    mats.push_back({248320 / 3 + 1, H});                         // output head
+    if (Ts.empty()) Ts = {1, 2, 3, 4, 6, 8, 12, 16};
+    // card 0's slice: KH0 of the key heads, VH0 of the value heads, its FF blocks, S27_NQ query heads and the S27_NKV KV
+    // heads they read
+    std::vector<Mat> mats;
+    for (int l = 0; l < NL; ++l) {
+        if ((l + 1) % 4) {
+            mats.push_back({2 * KH0 * HS + 2 * VH0 * HS, N});   // qkv + z
+            mats.push_back({N, VH0 * HS});                       // ssm_out
+        } else {
+            mats.push_back({S27_QKV, N});                        // q + gate, k, v
+            mats.push_back({N, S27_NQ * HD});                    // wo
+        }
+        mats.push_back({2 * FFD_CARD_MAX, N});                   // gate | up
+        mats.push_back({N, FFD_CARD_MAX});                       // down
+    }
+    mats.push_back({VOCAB / NCARD + 1, N});                      // output head
     // S27_PROBE_ONE=1: the same bytes as a few 2 GB matrices (the kernel's rate without the boundaries between the
     // window's 257; one matrix would pass q8s's 32-bit offsets)
     if (std::getenv("S27_PROBE_ONE")) {
         double b0 = 0;
         for (auto& m : mats) b0 += (double) m.rows * m.cols;
-        const int rows = (int) (b0 / H), step = 400000;
+        const int rows = (int) (b0 / N), step = 400000;
         mats.clear();
-        for (int r = 0; r < rows; r += step) mats.push_back({std::min(step, rows - r), H});
+        for (int r = 0; r < rows; r += step) mats.push_back({std::min(step, rows - r), N});
     }
     double bytes = 0;
     for (auto& m : mats) bytes += (double) m.rows * m.cols * (1 + 2.0 / 32);

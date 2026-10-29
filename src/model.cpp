@@ -336,12 +336,19 @@ struct Up {
             c.L[(size_t) l].down_e.ep = ec.ep_dn + (size_t) l * NEXP;
         }
     }
+    // row r of t (counting every matrix's rows, in order), which must be one of its rows: a row list made from the model's
+    // geometry would otherwise read the next tensor's bytes from the mapping when a GGUF's tensor is shorter than it
+    static const uint8_t* row_of(const Tensor& t, int r, size_t row_bytes) {
+        if (r < 0 || r >= t.nrows())
+            throw std::runtime_error(t.name + ": row " + std::to_string(r) + " asked for, it has " + std::to_string(t.nrows()));
+        return t.data + (size_t) r * row_bytes;
+    }
     // rows `rows` of a 2-D F32 tensor (ne1 indexes rows)
     float* f32_rows(const Tensor& t, const std::vector<int>& rows) {
         if (t.type != T_F32) throw std::runtime_error(t.name + " is not F32");
         std::vector<float> h(rows.size() * (size_t) t.ne[0]);
         for (size_t i = 0; i < rows.size(); ++i)
-            std::memcpy(&h[i * t.ne[0]], t.data + (size_t) rows[i] * t.ne[0] * 4, (size_t) t.ne[0] * 4);
+            std::memcpy(&h[i * t.ne[0]], row_of(t, rows[i], (size_t) t.ne[0] * 4), (size_t) t.ne[0] * 4);
         return put<float>(h.data(), h.size() * 4);
     }
     // Q8_0 -> bf16, the whole tensor; F32 -> bf16 likewise
@@ -431,7 +438,7 @@ struct Up {
         w.n_out = (int) rows.size();
         w.row_bytes = t.row_bytes();
         std::vector<uint8_t> h(rows.size() * w.row_bytes);
-        for (size_t i = 0; i < rows.size(); ++i) std::memcpy(&h[i * w.row_bytes], t.data + (size_t) rows[i] * w.row_bytes, w.row_bytes);
+        for (size_t i = 0; i < rows.size(); ++i) std::memcpy(&h[i * w.row_bytes], row_of(t, rows[i], w.row_bytes), w.row_bytes);
         w.p = put<uint8_t>(h.data(), h.size());
         return w;
     }
@@ -445,8 +452,8 @@ struct Up {
         w.row_bytes = t1.row_bytes();
         std::vector<uint8_t> h((size_t) w.n_out * w.row_bytes);
         size_t o = 0;
-        for (int r : r1) { std::memcpy(&h[o], t1.data + (size_t) r * w.row_bytes, w.row_bytes); o += w.row_bytes; }
-        for (int r : r2) { std::memcpy(&h[o], t2.data + (size_t) r * w.row_bytes, w.row_bytes); o += w.row_bytes; }
+        for (int r : r1) { std::memcpy(&h[o], row_of(t1, r, w.row_bytes), w.row_bytes); o += w.row_bytes; }
+        for (int r : r2) { std::memcpy(&h[o], row_of(t2, r, w.row_bytes), w.row_bytes); o += w.row_bytes; }
         w.p = put<uint8_t>(h.data(), h.size());
         return w;
     }
@@ -464,7 +471,7 @@ struct Up {
         std::vector<uint8_t> h((size_t) w.n_out * w.row_bytes);
         size_t o = 0;
         for (const auto& [t, rs] : {std::pair{&t1, &r1}, std::pair{&t2, &r2}, std::pair{&t3, &r3}})
-            for (int r : *rs) { std::memcpy(&h[o], t->data + (size_t) r * w.row_bytes, w.row_bytes); o += w.row_bytes; }
+            for (int r : *rs) { std::memcpy(&h[o], row_of(*t, r, w.row_bytes), w.row_bytes); o += w.row_bytes; }
         w.p = put<uint8_t>(h.data(), h.size());
         return w;
     }
@@ -476,9 +483,10 @@ struct Up {
             const size_t n = (size_t) t->ne[0];
             for (int r : rows) {
                 if (t->type == T_F32) {
-                    h.insert(h.end(), (const float*) t->data + (size_t) r * n, (const float*) t->data + (size_t) (r + 1) * n);
+                    const float* row = (const float*) row_of(*t, r, n * 4);
+                    h.insert(h.end(), row, row + n);
                 } else if (t->type == T_Q8_0 && n % 32 == 0) {
-                    const uint8_t* row = t->data + (size_t) r * t->row_bytes();
+                    const uint8_t* row = row_of(*t, r, t->row_bytes());
                     for (size_t b = 0; b < n / 32; ++b) {
                         uint16_t dh;
                         std::memcpy(&dh, row + b * 34, 2);
@@ -501,6 +509,9 @@ struct Up {
         w.n_out = (int) t.ne[1];
         w.row_bytes = blocks.size() * ti.bytes;
         const size_t src_row = t.row_bytes();
+        for (int b : blocks)
+            if (b < 0 || (size_t) (b + 1) * ti.bytes > src_row)
+                throw std::runtime_error(t.name + ": block " + std::to_string(b) + " asked for, a row has " + std::to_string(src_row / ti.bytes));
         std::vector<uint8_t> h((size_t) w.n_out * w.row_bytes);
         for (int r = 0; r < w.n_out; ++r)
             for (size_t b = 0; b < blocks.size(); ++b)
@@ -509,7 +520,13 @@ struct Up {
         return w;
     }
     // per expert: rows [r0, r1) (gate / up), expert-major
+    static void row_range(const Tensor& t, int r0, int r1) {
+        if (r0 < 0 || r1 <= r0 || r1 > t.ne[1])
+            throw std::runtime_error(t.name + ": rows [" + std::to_string(r0) + ", " + std::to_string(r1) + ") asked for, it has " +
+                                     std::to_string(t.ne[1]) + " a matrix");
+    }
     DW expert_rows(const Tensor& t, int r0, int r1, size_t& stride) {
+        row_range(t, r0, r1);
         DW w;
         w.type = t.type;
         w.n_in = (int) t.ne[0];
@@ -525,6 +542,8 @@ struct Up {
     // per expert: rows [r0, r1) of t1 then of t2 (gate; up), expert-major
     DW expert_rows2(const Tensor& t1, const Tensor& t2, int r0, int r1, size_t& stride, const char** host_of = nullptr) {
         if (t1.type != t2.type || t1.ne[0] != t2.ne[0] || t1.ne[2] != t2.ne[2]) throw std::runtime_error(t1.name + " and " + t2.name + " do not stack");
+        row_range(t1, r0, r1);
+        row_range(t2, r0, r1);
         DW w;
         w.type = t1.type;
         w.n_in = (int) t1.ne[0];
@@ -559,6 +578,9 @@ struct Up {
         w.row_bytes = (size_t) (b1 - b0) * ti.bytes;
         stride = (size_t) w.n_out * w.row_bytes;
         const size_t src_row = t.row_bytes(), src_mat = (size_t) t.ne[1] * src_row;
+        if (b0 < 0 || b1 <= b0 || (size_t) b1 * ti.bytes > src_row)
+            throw std::runtime_error(t.name + ": blocks [" + std::to_string(b0) + ", " + std::to_string(b1) + ") asked for, a row has " +
+                                     std::to_string(src_row / ti.bytes));
         std::vector<uint8_t> tmp;
         const size_t bytes = (size_t) t.ne[2] * stride;
         uint8_t* h = expert_buf(bytes, host_of, tmp);
@@ -1236,6 +1258,12 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
         const auto it = std::find(toks.begin(), toks.end(), "<|image_pad|>");
         if (it == toks.end()) throw std::runtime_error("27b: the tokenizer has no <|image_pad|> token");
         ple_image = it - toks.begin();
+        // the ids the engine process stops and starts turns on (tools/sfnx.cpp's EOS and 248045, front/engine_limits.py's
+        // EOS_IDS), which are Flash-Next's tokenizer's: a GGUF tokenized otherwise would run past its turns' ends
+        for (const auto& [id, want] : {std::pair{248044, "<|endoftext|>"}, std::pair{248045, "<|im_start|>"}, std::pair{248046, "<|im_end|>"}})
+            if ((size_t) id >= toks.size() || toks[(size_t) id] != want)
+                throw std::runtime_error("27b: token " + std::to_string(id) + " is '" + ((size_t) id < toks.size() ? toks[(size_t) id] : "") +
+                                         "', the engine stops on it as " + want);
     }
     if (how != Load::PLAIN) throw std::runtime_error("27b: plain loads only (the lab's holder does not hold the 27B)");
 #endif

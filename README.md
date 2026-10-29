@@ -111,9 +111,10 @@ attention, which splits by heads: the 27B's 4 KV heads let each card keep the K/
 | Six conversations decoding at once, with drafts | 224 tok/s combined (`bin/batch_test`, `ref/long2` and `ref/code1`) |
 | Prompt reading: 8k / 32k / 62k / 114k tokens | 2,435 / 2,264 / 1,965 / 1,602 tok/s |
 
-Its logits are held to llama.cpp's own CPU-against-CUDA distance on the 27B, a bar 5–30x tighter than Flash-Next's.
-Every prompt's top-1 agreement meets it and the code edit's KL does; code, the picture and the 62k prompt sit at 1.3–1.6x
-its KL. llama.cpp decodes the 27B Q8_0 at ~24 tok/s on this box, one request; 1Cat-vLLM's own V100 numbers are 69–98
+Its logits are held to the widest gap between llama.cpp's own ways of running the 27B (its CPU backend, its CUDA
+with and without int8 products of quantized activations), a bar 4–30x tighter than Flash-Next's. Code, the edit and
+the picture are within it, with top-1 agreement of 100% / 100% / 99.5%; the 62k prompt agrees on every top-1 and sits
+at 1.27x its KL. llama.cpp decodes the 27B Q8_0 at ~24 tok/s on this box, one request; 1Cat-vLLM's own V100 numbers are 69–98
 alone, 222–225 at six, ~1.3k tok/s reading 96k. Details:
 [docs/benchmarks.md](docs/benchmarks.md#qwen38-27b), [docs/verification.md](docs/verification.md#the-27b).
 
@@ -146,7 +147,7 @@ and the files they read: [docs/config.md](docs/config.md).
 
 | | |
 | --- | --- |
-| `src/` | the engine: kernels (`.cuh`), `engine.cu`, `prefill.cu`, `model.cpp`, `session.cpp`, `batch.cpp`; the start-up checks (`card_check.hpp`, `peer_probe.cu`) |
+| `src/` | the engine: kernels (`.cuh`), `engine_common.cu` (what both models share), each model's layers and prompt path (`engine.cu` and `prefill.cu` for Flash-Next, `s27_engine.cu` and `s27_prefill.cu` for the 27B), `model.cpp`, `session.cpp`, `batch.cpp`; the start-up checks (`card_check.hpp`, `peer_probe.cu`) |
 | `tools/` | the engine process, the lab harness, the checks, probes and benchmarks |
 | `front/` | the Python serving layer and web UI (from Strata's `serve/`, MIT) |
 | `serve/` | configs, the systemd unit's template, run scripts, served tests |

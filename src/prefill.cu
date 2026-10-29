@@ -7,6 +7,7 @@
 // What the chunk leaves is the state a run of windows over the same rows leaves: K/V, recurrent states and
 // histories, the PLE history, the QSA keys, and with the draft layer attached its K/V and QSA keys too (the draft layer
 // over the chunk's final residuals in windows of MAXT rows).
+#include "pf_common.cuh"
 #include "engine.hpp"
 #include "engine_impl.hpp"
 #include "env.hpp"
@@ -36,12 +37,6 @@ namespace {
 
 constexpr size_t PF_WH = (size_t) 16 << 20;                      // halves: a dense matrix's f16 staging (larger ones go in slices)
 
-void ckc(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) throw std::runtime_error(std::string("prefill: ") + what + ": " + cudaGetErrorString(e));
-}
-void ckb(cublasStatus_t s, const char* what) {
-    if (s != CUBLAS_STATUS_SUCCESS) throw std::runtime_error(std::string("prefill: cublas ") + what + ": " + std::to_string((int) s));
-}
 // buffers carved from a block (aligned to 256 bytes); with base null it only sums the sizes
 struct Arena {
     char* base;
@@ -516,35 +511,7 @@ __global__ void k_pfr_addend(float* __restrict__ x, const float* __restrict__ pa
         x[e] = fmaf(pf_sigm(logits[(size_t) t * (NEXP + 1) + NEXP]), part[((size_t) C * TOPK + t) * N + i], s);
     }
 }
-// out = f16(x) over n values (n even)
-__global__ void k_pfr_pack(const float2* __restrict__ x, int n2, __half2* __restrict__ out, unsigned* err) {
-    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < n2; e += gridDim.x * blockDim.x) {
-        const float2 v = x[e];
-        if (!(fabsf(v.x) <= 65504.0f && fabsf(v.y) <= 65504.0f)) atomicOr(err, 2u);   // past fp16's range (or NaN)
-        out[e] = __floats2half2_rn(v.x, v.y);
-    }
-}
-// out = f16(in + x) over n values (n even)
-__global__ void k_pfr_add(const __half2* __restrict__ in, const float2* __restrict__ x, int n2, __half2* __restrict__ out,
-                          unsigned* err) {
-    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < n2; e += gridDim.x * blockDim.x) {
-        const float2 a = __half22float2(in[e]), b = x[e];
-        const float2 v = make_float2(a.x + b.x, a.y + b.y);
-        if (!(fabsf(v.x) <= 65504.0f && fabsf(v.y) <= 65504.0f)) atomicOr(err, 2u);
-        out[e] = __floats2half2_rn(v.x, v.y);
-    }
-}
-__global__ void k_pfr_out(const __half2* __restrict__ ag, float2* __restrict__ x, int n2) {
-    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < n2; e += gridDim.x * blockDim.x) x[e] = __half22float2(ag[e]);
-}
 
-void cud(CUresult e, const char* what) {
-    if (e != CUDA_SUCCESS) {
-        const char* s = nullptr;
-        cuGetErrorString(e, &s);
-        throw std::runtime_error(std::string("prefill: ") + what + ": " + (s ? s : "?"));
-    }
-}
 
 // one direction's sum of x (C rows of N) over the cards, on stream s; this card is at position g of the direction's
 // ring (its next card: g + 1 there), by the steps of r.plan (pf_ring_plan.hpp, which describes the algorithm). Each
@@ -684,8 +651,8 @@ void Engine::prefill_alloc() {
         {
             const int d = current_card();
             cublasHandle_t h = p->blas;
-            owned().push_back([d, h] { cudaSetDevice(d); cublasDestroy(h); });
-            owned().push_back([p] { delete p; });
+            own([d, h] { cudaSetDevice(d); cublasDestroy(h); });
+            own([p] { delete p; });
         }
         ckb(cublasSetStream(p->blas, b.st), "stream");
         ckb(cublasSetMathMode(p->blas, CUBLAS_TENSOR_OP_MATH), "math mode");
@@ -770,7 +737,7 @@ void Engine::prefill_alloc() {
             p->xq = palloc<uint8_t>((size_t) pf_c_ * q8_1_bytes(N));
             q8_twin(p->xq, (size_t) pf_c_ * q8_1_bytes(N), palloc<int8_t>((size_t) pf_c_ * N), palloc<float>((size_t) pf_c_ * N / 32));
             const void* q = p->xq;
-            owned().push_back([q] { q8_untwin(q); });
+            own([q] { q8_untwin(q); });
         }
         p->logits = palloc<float>((size_t) pf_c_ * (NEXP + 1));
         p->topw = palloc<float>((size_t) pf_c_ * TOPK);

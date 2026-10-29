@@ -9,6 +9,7 @@
 
 #include "kernels.hpp"
 #include "model.hpp"
+#include "owned.hpp"
 #include "s27_attn.cuh"
 #include "s27_ring3.cuh"
 
@@ -23,27 +24,6 @@ struct LaneDev {
     int* mrope_buf = nullptr;         // the lane's rotary table ([max_ctx][3]), made at its first image
     int* mrope = nullptr;             // mrope_buf while its sequence holds an image, else null (rotary position = cell)
 };
-
-// what the engine made on the cards and in page-locked memory, each with how to release it (newest first, ~Engine)
-std::vector<std::function<void()>>& owned();
-inline int current_card() {
-    int d = -1;
-    cudaGetDevice(&d);
-    return d;
-}
-inline void own_dev(void* p) {
-    const int d = current_card();
-    owned().push_back([d, p] { cudaSetDevice(d); cudaFree(p); });
-}
-inline void own_pinned(void* p) { owned().push_back([p] { cudaFreeHost(p); }); }
-inline void own_stream(cudaStream_t s) {
-    const int d = current_card();
-    owned().push_back([d, s] { cudaSetDevice(d); cudaStreamDestroy(s); });
-}
-inline void own_event(cudaEvent_t e) {
-    const int d = current_card();
-    owned().push_back([d, e] { cudaSetDevice(d); cudaEventDestroy(e); });
-}
 
 // the widest q8_1 row a window quantizes: the draft layer's [e | h], the FFN's slice, the attention's heads
 constexpr int S27_XQ_COLS = 2 * N > FFD_CARD_MAX ? (2 * N > S27_NQ * HD ? 2 * N : S27_NQ * HD) : FFD_CARD_MAX;
@@ -106,13 +86,41 @@ struct CardBuf {
     CopyJob* commit_jobs = nullptr;
     cudaEvent_t commit_ev = nullptr, rows_commit_ev = nullptr;
     // the draft layer: its token rows, source rows, [e | h] normed, residual, outputs after the head norm, head logits
-    float *me = nullptr, *mh = nullptr, *mcat = nullptr, *mR = nullptr, *mout = nullptr, *mlogits = nullptr, *mbv = nullptr;
-    int *mbi = nullptr, *mctl = nullptr;
-    int* mpen = nullptr;              // the last row's penalties (penalize_row's pen, this card's draft-vocabulary indexes)
-    float* mpen_par = nullptr;
-    float* mtk_v = nullptr;
-    int *mtk_i = nullptr, *mzero = nullptr;
-    unsigned* mtk_err = nullptr;
+    float *mtp_emb = nullptr, *mtp_src = nullptr, *mtp_cat = nullptr, *mtp_R = nullptr, *mtp_out = nullptr,
+          *mtp_logits = nullptr, *mtp_bv = nullptr;
+    int *mtp_bi = nullptr, *mtp_ctl = nullptr;
+    int* mtp_pen = nullptr;           // the last row's penalties (penalize_row's pen, this card's draft-vocabulary indexes)
+    float* mtp_pen_par = nullptr;
+    float* mtp_tk_v = nullptr;
+    int *mtp_tk_i = nullptr, *mtp_zero = nullptr;
+    unsigned* mtp_tk_err = nullptr;
 };
+
+// what engine_common.cu reads of this model (engine_parts.hpp says what each is)
+constexpr int ROW_W = N;
+constexpr int LANE_ROW_COLS = 3;   // and the row's lane's rotary table
+inline void lane_row_extra(const int** rows, int r, const LaneDev& L) { rows[2 * MAXT + r] = L.mrope; }
+inline void card_lane(CardBuf& b, const LaneDev& L) {
+    b.pt = L.pt;
+    b.S = L.S;
+    b.chist = L.chist;
+    b.mrope = L.mrope;
+}
+inline cudaError_t reset_hists(CardBuf&) { return cudaSuccess; }   // the recurrent layers' are all it has
+constexpr int HIST_JOBS = 0;
+inline int hist_jobs(CopyJob*, const CardBuf&, const LaneDev*, size_t) { return 0; }
+inline const float* draft_src(const CardBuf& b, bool from_main) { return from_main ? b.hfin : b.mtp_out; }
+constexpr bool MTP_HEAD_EVERY_ROW = false;   // mtp_enqueue: the last row through the head
+inline unsigned* err_word(CardBuf& b) { return b.err; }
+inline const char* window_error(unsigned err, bool draft) {
+    if (err & 1u) return "a ring sum timed out";
+    if (err & 2u) return "a ring sum met a NaN or inf (or a value past fp16's range)";
+    if (err & 16u) return draft ? "the draft layer's logits hold a NaN or inf" : "the head's logits hold a NaN or inf";
+    return nullptr;
+}
+// mtp: unused (the draft layer's K/V is a slot of every page, so the pages carry it); hist_half: the conv history half
+// the next window reads
+std::vector<std::pair<char*, size_t>> state_pieces(CardBuf& b, const CardW& w, bool mtp, int pos, bool kv, unsigned hist_half,
+                                                   const std::vector<int>& pages);
 
 }  // namespace fnx

@@ -8,6 +8,7 @@
 // What a chunk leaves is the state a run of windows over the same rows leaves: K/V, recurrent states and histories,
 // and with the draft layer attached its K/V (the draft layer over the chunk's final rows, each paired with the token
 // after it, up to its K/V).
+#include "pf_common.cuh"
 #include "engine.hpp"
 #include "env.hpp"
 #include "pf_ring_plan.hpp"
@@ -28,19 +29,6 @@
 namespace fnx {
 
 namespace {
-void ckc(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) throw std::runtime_error(std::string("prefill: ") + what + ": " + cudaGetErrorString(e));
-}
-void ckb(cublasStatus_t s, const char* what) {
-    if (s != CUBLAS_STATUS_SUCCESS) throw std::runtime_error(std::string("prefill: cuBLAS ") + what + ": status " + std::to_string((int) s));
-}
-void cud(CUresult e, const char* what) {
-    if (e != CUDA_SUCCESS) {
-        const char* s = nullptr;
-        cuGetErrorString(e, &s);
-        throw std::runtime_error(std::string("prefill: ") + what + ": " + (s ? s : "?"));
-    }
-}
 template <typename T> T* palloc(size_t n) {
     void* p = nullptr;
     const cudaError_t e = cudaMalloc(&p, n * sizeof(T));
@@ -189,25 +177,6 @@ __global__ void k_pf_gate(const float* __restrict__ O, const float* __restrict__
         att[t * S27_NQ * HD + h * HD + d] = __float2half(O[e] / (1.f + __expf(-g)));
     }
 }
-// ---- the chunk sum on the copy engines (prefill.cu's)
-__global__ void k_pfr_pack(const float2* __restrict__ x, int n2, __half2* __restrict__ out, unsigned* err) {
-    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < n2; e += gridDim.x * blockDim.x) {
-        const float2 v = x[e];
-        if (!(fabsf(v.x) <= 65504.0f && fabsf(v.y) <= 65504.0f)) atomicOr(err, 2u);
-        out[e] = __floats2half2_rn(v.x, v.y);
-    }
-}
-__global__ void k_pfr_add(const __half2* __restrict__ in, const float2* __restrict__ x, int n2, __half2* __restrict__ out, unsigned* err) {
-    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < n2; e += gridDim.x * blockDim.x) {
-        const float2 a = __half22float2(in[e]), b = x[e];
-        const float2 v = make_float2(a.x + b.x, a.y + b.y);
-        if (!(fabsf(v.x) <= 65504.0f && fabsf(v.y) <= 65504.0f)) atomicOr(err, 2u);
-        out[e] = __floats2half2_rn(v.x, v.y);
-    }
-}
-__global__ void k_pfr_out(const __half2* __restrict__ ag, float2* __restrict__ x, int n2) {
-    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < n2; e += gridDim.x * blockDim.x) x[e] = __half22float2(ag[e]);
-}
 constexpr int PF_RING_STEPS = pf_ring_steps(NCARD);
 constexpr unsigned PF_SEQ_RESET = 1u << 31;
 constexpr int PF_K = 2;   // chunks a pass: one's sums cross the links while the other computes
@@ -318,7 +287,13 @@ void Engine::prefill_alloc() {
         pf_.push_back(p);
         p->dev = b.dev;
         p->st = b.st;
+        own([p] { delete p; });
         ckb(cublasCreate(&p->blas), "create");
+        {
+            const int d = current_card();
+            cublasHandle_t h = p->blas;
+            own([d, h] { cudaSetDevice(d); cublasDestroy(h); });
+        }
         ckb(cublasSetStream(p->blas, b.st), "stream");
         ckb(cublasSetMathMode(p->blas, CUBLAS_TENSOR_OP_MATH), "math mode");
         size_t most = 0;
@@ -382,15 +357,6 @@ void Engine::prefill_alloc() {
     }
 }
 
-void Engine::prefill_free() {
-    for (Pf* p : pf_) {
-        cudaSetDevice(p->dev);
-        if (p->blas) cublasDestroy(p->blas);
-        delete p;
-    }
-    pf_.clear();
-}
-
 void Engine::prefill(const std::vector<int>& tokens, int after) {
     if (!pending_.empty() || !rows_pending_.lanes.empty()) throw std::runtime_error("prefill: a window is not committed");
     if (mtp_ && after < 0) throw std::runtime_error("prefill: the draft layer needs the token after the last row");
@@ -428,9 +394,28 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
         }
     }
     static const bool timing = env_flag("FNX_PF_TIMING");
-    // FNX_PF_SKIP=ring,attn: leave the sums or the attention out (wrong rows: a timing breakdown only)
-    static const char* skip_s = std::getenv("FNX_PF_SKIP");
-    static const bool skip_ring = skip_s && std::strstr(skip_s, "ring"), skip_attn = skip_s && std::strstr(skip_s, "attn");
+    // FNX_PF_SKIP=ring, attn or ring,attn with FNX_PF_SKIP_CONFIRM=1: leave the sums or the attention out. The rows come
+    // out wrong and stay in the K/V and the recurrent states: a timing breakdown only, said on stderr when it is on
+    static bool skip_ring = false, skip_attn = false;
+    static const bool skip_read = [] {
+        const char* v = std::getenv("FNX_PF_SKIP");
+        if (!v) return true;
+        const std::string s = v;
+        for (size_t a = 0; a <= s.size();) {
+            const size_t e = std::min(s.find(',', a), s.size());
+            const std::string part = s.substr(a, e - a);
+            if (part == "ring") skip_ring = true;
+            else if (part == "attn") skip_attn = true;
+            else throw std::runtime_error("FNX_PF_SKIP: ring, attn or ring,attn, not '" + s + "'");
+            a = e + 1;
+        }
+        if (!env_flag("FNX_PF_SKIP_CONFIRM"))
+            throw std::runtime_error("FNX_PF_SKIP=" + s + " makes every prompt read wrong: set FNX_PF_SKIP_CONFIRM=1 beside it to time with it");
+        std::fprintf(stderr, "fnx: FNX_PF_SKIP=%s: the prompt path leaves out%s%s, its rows are wrong (timing only)\n", v,
+                     skip_ring ? " the ring sums" : "", skip_attn ? " the attention" : "");
+        return true;
+    }();
+    (void) skip_read;
     // FNX_PF_SCORES: the attention's scores as f16 (the default: scaled first, half the bytes through memory) or f32. On
     // ref/long64 f16 read 4-7% faster (32k 2,187 against 2,096 tok/s) and as close to llama.cpp: KL 2.65e-4 against 2.89e-4
     static const bool scores16 = [] {

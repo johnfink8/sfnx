@@ -263,7 +263,11 @@ private:
         unsigned* err = nullptr;
         float* par = nullptr;   // per row: repeat, freq, present
     } tk_;
-    void embed(const std::vector<int>& tokens, std::vector<float>& R0, std::vector<float>& ple) const;
+    // a window's rows r .. r + k - 1 in its page-locked inputs (h_.R0, and what else the model reads), for positions
+    // p0 .. p0 + k - 1 (tok_at: the token at a position); batched: the caller's name when the rows are a batched
+    // window's (null for one lane's), which a model refuses rows in by that name. rows_upload: a window's T rows to b
+    void embed_into(int r, int k, int p0, const std::function<int(int)>& tok_at, const char* batched);
+    void rows_upload(CardBuf& b, int T);
     // rows at positions p0 .. p0 + T - 1 (tok_at: the token at a position, for the row's and the PLE n-grams'): the
     // token embedding (one stream, rows of N) and the PLE rows (rows of N)
     void embed_rows(int p0, int T, const std::function<int(int)>& tok_at, float* emb, float* ple) const;
@@ -321,7 +325,6 @@ private:
     // with the recurrent core each kind runs
     using GdnFn = std::function<void(CardBuf&, const CardW&, const LayerW&, int)>;
     void enqueue_layers(int T, bool lanes, const GdnFn& gdn, bool dumps);
-    void prefill_free();   // the prompt path's cuBLAS handles (s27_prefill.cu)
 #endif
 };
 

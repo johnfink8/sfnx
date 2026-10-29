@@ -1,7 +1,17 @@
-"""s27's first-window dump (S27_DUMP) against fnx_ref's records of the same names: per record, the cosine and the
-relative RMS difference of the rows both hold (llama.cpp's rows are the whole prompt; s27's the first window's).
+"""The 27B's per-layer dump (`bin/fnx_run MODEL check REF.bin OUT.bin [W]`) against ref/fnx_ref's of the same prompt
+(its REGEX taking model.input_embed, linear_attn_out, attn_output, attn_residual, l_out and result_norm), layer by
+layer, as the cosine and the relative RMS difference of the rows both hold:
 
-    s27_cmp.py REF.bin S27.bin"""
+    R0            model.input_embed
+    attn_out-L    linear_attn_out-L (a recurrent layer) or attn_output-L (an attention layer): the mixer's sum
+    ffn_out-L     l_out-L - attn_residual-L: the FFN's sum
+    result_norm   result_norm
+
+The dump's rows come from every window in order, the reference's are the prompt's first rows. Any record of the dump
+without its reference, or a layer missing from the dump, is an error (exit 1): a renamed record would otherwise drop
+out of the comparison without a word.
+
+    s27_cmp.py REF.bin OUT.bin"""
 import sys
 from pathlib import Path
 
@@ -10,15 +20,59 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "ref"))
 from refio import records  # noqa: E402
 
+if len(sys.argv) != 3:
+    raise SystemExit(__doc__)
 ref = {}
 for name, a in records(sys.argv[1]):
-    ref.setdefault(name, a)
+    ref.setdefault(name, a.reshape(-1, a.shape[-1]).astype(np.float64))
+got = {}
 for name, a in records(sys.argv[2]):
-    if name not in ref:
-        print(f"{name:24s} no reference")
+    got.setdefault(name, []).append(a.reshape(-1, a.shape[-1]))
+if not got:
+    raise SystemExit(f"{sys.argv[2]}: no records")
+
+
+def reference(name):
+    """the reference rows for a dump record, or a string saying what is missing"""
+    if name == "R0":
+        return ref.get("model.input_embed", "model.input_embed")
+    if name == "result_norm":
+        return ref.get("result_norm", "result_norm")
+    kind, l = name.rsplit("-", 1)
+    if kind == "attn_out":
+        r = ref.get(f"linear_attn_out-{l}", ref.get(f"attn_output-{l}"))
+        return r if r is not None else f"linear_attn_out-{l} or attn_output-{l}"
+    if kind == "ffn_out":
+        lo, ar = ref.get(f"l_out-{l}"), ref.get(f"attn_residual-{l}")
+        return lo - ar if lo is not None and ar is not None else f"l_out-{l} and attn_residual-{l}"
+    return f"a reference for {name}"
+
+
+def order(n):
+    tail = n.rsplit("-", 1)[-1]
+    return (n != "R0", int(tail) if tail.isdigit() else 1 << 30, n)
+
+
+fails = []
+layers = sorted({int(n.rsplit("-", 1)[1]) for n in got if n.startswith(("attn_out-", "ffn_out-"))})
+for l in range(layers[-1] + 1 if layers else 0):
+    for p in ("attn_out", "ffn_out"):
+        if f"{p}-{l}" not in got:
+            fails.append(f"{p}-{l}: not in the dump")
+for name in sorted(got, key=order):
+    r = reference(name)
+    if isinstance(r, str):
+        fails.append(f"{name}: the reference has no {r}")
         continue
-    r = ref[name].reshape(-1, a.shape[-1])[: a.shape[0]]
-    x = a[: r.shape[0]]
+    x = np.concatenate(got[name], axis=0).astype(np.float64)
+    if r.shape[1] != x.shape[1]:
+        fails.append(f"{name}: width {x.shape[1]} against the reference's {r.shape[1]}")
+        continue
+    n = min(len(x), len(r))
+    x, r = x[:n], r[:n]
     cos = float((x * r).sum() / (np.linalg.norm(x) * np.linalg.norm(r) + 1e-30))
     rel = float(np.sqrt(((x - r) ** 2).mean() / ((r**2).mean() + 1e-30)))
-    print(f"{name:24s} rows {x.shape[0]:3d}  cos {cos:.6f}  rel {rel:.2e}")
+    print(f"{name:24s} rows {n:5d}  cos {cos:.6f}  rel {rel:.2e}")
+for f in fails:
+    print(f"FAIL: {f}", file=sys.stderr)
+sys.exit(1 if fails else 0)

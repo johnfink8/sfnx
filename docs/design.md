@@ -136,6 +136,12 @@ decode is ~3x slower a row than Flash-Next's and the drafts carry it the same wa
   dependent matrices, and their boundaries cost ~2.3 ms of a 4-row window against the same bytes in a few big
   matrices; a persistent launch with a grid barrier between matrices measured the same, prefetching the next rows into
   L2 slower.
+- **One Engine for both.** Lanes, pages, windows over one lane or several, commits, saved states, the draft layer's
+  window, the sampler's candidates and the window graphs are `src/engine_common.cu`'s, the same code in either build.
+  A model brings its per-card buffers and a handful of helpers named in `src/engine_parts.hpp` (its residual's width,
+  the histories a commit copies besides the recurrent states, the draft layer's source rows, its error bits), and its
+  layers, embeddings and prompt path. Flash-Next's are `engine.cu`, `engine_impl.hpp` and `prefill.cu`; the 27B's
+  `s27_engine.cu`, `s27_impl.hpp` and `s27_prefill.cu`.
 - **The prompt path** (`src/s27_prefill.cu`): chunks of 4,096 rows, every Q8_0 matrix dequantized to f16 and multiplied
   with cuBLAS on the tensor cores, the recurrent layers through Flash-Next's `gdn_prompt`, attention per head as two
   cuBLAS products around a causal softmax (the scores in blocks of queries that fit 256 MiB), the sums on the copy

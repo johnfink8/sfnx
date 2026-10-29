@@ -30,7 +30,7 @@ inline size_t r3_ag_words() { return (size_t) 2 * MAXT * R3_NT; }
 __device__ __forceinline__ int r3_lo(int k) { return k * R3_NT / NCARD; }
 __device__ __forceinline__ float r3_x(const float* x, int t, int i) { return i < N ? x[(size_t) t * N + i] : 0.f; }
 __device__ __forceinline__ void r3_put(unsigned long long* p, float a, float b, float c, unsigned tag, unsigned* err) {
-    if (!(fabsf(a) <= 65504.f && fabsf(b) <= 65504.f && fabsf(c) <= 65504.f)) atomicOr(err, 2u);
+    if (!(fabsf(a) <= RING_MAX && fabsf(b) <= RING_MAX && fabsf(c) <= RING_MAX)) atomicOr(err, 2u);
     const unsigned long long w = (unsigned long long) __half_as_ushort(__float2half_rn(a)) |
                                  (unsigned long long) __half_as_ushort(__float2half_rn(b)) << 16 |
                                  (unsigned long long) __half_as_ushort(__float2half_rn(c)) << 32 | (unsigned long long) (tag & 0xffffu) << 48;

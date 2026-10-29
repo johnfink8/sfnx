@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "../src/engine.hpp"
+#include "../src/env.hpp"
 #include "../src/model.hpp"
 #include "ref_tokens.hpp"
 
@@ -24,11 +25,16 @@ int main(int argc, char** argv) {
         return 2;
     }
     const std::vector<int> prompt = ref_tokens(argv[2]);
-    const int gen = std::atoi(argv[3]);
-    const int K = argc > 4 ? std::atoi(argv[4]) : 4;
-    const int LK = argc > 5 ? std::atoi(argv[5]) : 15, LNG = 3;
-    if (K < 0 || K > MAXT - 1) throw std::runtime_error("K: 0.." + std::to_string(MAXT - 1));
-    if (LK < 0 || LK > MAXT - 1) throw std::runtime_error("LOOKUP: 0.." + std::to_string(MAXT - 1));
+    auto arg = [&](int i, const char* name, long long lo, long long hi, long long def) -> int {
+        if (i >= argc) return (int) def;
+        long long v = 0;
+        if (!parse_whole(argv[i], v) || v < lo || v > hi)
+            throw std::runtime_error(std::string(name) + ": " + std::to_string(lo) + ".." + std::to_string(hi) + ", not '" + argv[i] + "'");
+        return (int) v;
+    };
+    const int gen = arg(3, "GEN", 0, 1 << 20, 0);
+    const int K = arg(4, "K", 0, MAXT - 1, 4);
+    const int LK = arg(5, "LOOKUP", 0, MAXT - 1, 15), LNG = 3;
     if (prompt.size() < 2) throw std::runtime_error("the prompt needs two tokens or more");
     const int ctx_len = std::max(32768, (int) prompt.size() + gen + 64);
     const char* dv = std::getenv("S27_DRAFT_VOCAB");

@@ -23,6 +23,8 @@ constexpr int S27_SLOTS = NL / 4 + 1;   // the attention layers, then the draft 
 constexpr size_t S27_ROWH = (size_t) S27_NKV * HD;              // halves a position takes in K (or V)
 constexpr size_t S27_SLOT = (size_t) 2 * S27_PP * S27_ROWH;     // halves of a layer's slot in a page
 constexpr size_t S27_PAGE = (size_t) S27_SLOTS * S27_SLOT;      // halves a page
+// the attention and the prompt path read K/V rows as 16-byte uint4s (8 halves) from the pool's base
+static_assert(S27_ROWH % 8 == 0 && HD % 8 == 0 && S27_SLOT % 8 == 0 && S27_PAGE % 8 == 0, "K/V rows start on 16 bytes");
 static_assert(NQH % NCARD == 0, "query heads split evenly");
 static_assert(NCARD == 3 && NQH / NKVH == 6, "the head split (two KV heads a card) is three cards' of 24 / 4 heads");
 
