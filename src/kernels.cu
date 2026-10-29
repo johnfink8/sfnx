@@ -1036,13 +1036,14 @@ int hc_grid() {
     return hc_grid_[dev];
 }
 
-int hc_prepare() {
+int hc_prepare(int cap) {
     const int dev = hc_dev();
     int sms = 0;
     const cudaError_t e = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
     if (e != cudaSuccess) throw std::runtime_error(std::string("hc_prepare: SM count: ") + cudaGetErrorString(e));
     if (sms <= 0) throw std::runtime_error("hc_prepare: card " + std::to_string(dev) + " reports " + std::to_string(sms) + " SMs");
-    hc_grid_[dev] = std::min(sms, H_BLOCKS);
+    if (cap < 0 || cap > H_BLOCKS) throw std::runtime_error("hc_prepare: cap 1.." + std::to_string(H_BLOCKS) + " (0: none), got " + std::to_string(cap));
+    hc_grid_[dev] = std::min(sms, cap ? cap : H_BLOCKS);
     return hc_grid_[dev];
 }
 
