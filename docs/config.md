@@ -76,19 +76,20 @@ Validating a count: [docs/verification.md](verification.md#other-card-counts).
 `FNX_MODEL` is a build setting like `FNX_NCARD`: `make FNX_MODEL=fnx` (the default, prod) builds for Flash-Next,
 `make FNX_MODEL=27b` for Qwen3.8-27B, the dense model of the same family (64 layers, 48 recurrent and 16 attention,
 width 5120, a 17,408-wide FFN, Q8_0 only). `build/model` records which `build/` was made for; another rebuilds
-everything. Where they differ the code says so in `#if FNX_27B` blocks, and a Flash-Next build preprocesses to the same
-text as one without them. The 27B has its own engine behind `src/engine.hpp`'s interface (`src/s27_engine.cu`, its
-prompt path `src/s27_prefill.cu`), so `bin/sfnx`, the front end, `bin/batch_test`, `bin/sample_test` and `bin/fnx_run`
-serve and check it unchanged; the lab holds Flash-Next only (the 27B loads plain, ~30 s).
+everything. Both models run on one Engine (`src/engine_common.cu` for what they share, `src/engine_parts.hpp` for what
+each brings); the 27B's layers and prompt path are `src/s27_engine.cu` and `src/s27_prefill.cu`, and its differences
+in other shared files sit in `#if FNX_27B` blocks. So `bin/sfnx`, the front end, `bin/batch_test`, `bin/sample_test`
+and `bin/fnx_run` serve and check it unchanged; the lab holds Flash-Next only (the 27B loads plain, ~30 s).
 
-How the 27B splits, on three cards only (the Makefile refuses another count for it):
+How the 27B splits, on two, three or four cards (`FNX_NCARD`; the Makefile refuses another count for it, as a card's
+query heads would read unequal numbers of KV heads). Two and three are measured, four builds and has never run:
 
 | What | How |
 | --- | --- |
 | Recurrent layers | by heads, as Flash-Next (same 16 key / 48 value heads) |
-| Attention | by heads: 8 query heads a card and the 2 KV heads they read, K/V for every position on the card that reads them; no exchange until the output projection's sum |
-| FFN | by FF width, in 32-value blocks (182 / 181 / 181) |
-| Output head | a third of the vocabulary per card |
+| Attention | by heads: 12, 8 or 6 query heads a card and the 2, 2 or 1 KV heads they read, K/V for every position on the card that reads them; no exchange until the output projection's sum |
+| FFN | by FF width, in 32-value blocks (272 a card on two, 182 / 181 / 181 on three, 136 on four) |
+| Output head | its share of the vocabulary per card |
 | Draft layer | the GGUF's own nextn block (`--mtp nextn`), split as a trunk layer; its head the draft vocabulary's rows |
 | Sums | three fp16 values a word around the ring (`src/s27_ring3.cuh`) |
 

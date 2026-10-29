@@ -1,5 +1,6 @@
-// The 27B's attention split by heads: card c holds query heads [8c, 8c + 8) and the two KV heads they read (query head
-// h reads KV head h / 6), K/V for every position (f16). No exchange between the cards until wo's sum. Rows of the
+// The 27B's attention split by heads: card c holds query heads [S27_NQ c, S27_NQ (c + 1)) and the S27_NKV KV heads
+// they read (query head h reads KV head h / 6), K/V for every position (f16): 12 query heads and two KV heads a card on
+// two cards, 8 and two on three (a KV head straddling two cards' heads is kept on both), 6 and one on four. No exchange between the cards until wo's sum. Rows of the
 // projection: [q | gate] for each of the 8 heads, then the 2 K heads, then the 2 V heads (S27_QKV values).
 // K/V live in a paged pool: a page holds S27_PP positions of every attention layer and the draft layer (a slot each:
 // its K rows [S27_PP][2][HD], then its V rows); a sequence's page table maps its logical pages to physical ones.
@@ -15,7 +16,10 @@
 
 namespace fnx {
 
-constexpr int S27_NQ = NQH / NCARD, S27_NKV = 2;
+// the KV heads card c's query heads read
+constexpr int s27_nkv_of(int c) { return (c * (NQH / NCARD) + NQH / NCARD - 1) / (NQH / NKVH) - c * (NQH / NCARD) / (NQH / NKVH) + 1; }
+constexpr bool s27_nkv_even(int c) { return c == NCARD || (s27_nkv_of(c) == s27_nkv_of(0) && s27_nkv_even(c + 1)); }
+constexpr int S27_NQ = NQH / NCARD, S27_NKV = s27_nkv_of(0);
 constexpr int S27_QKV = S27_NQ * 2 * HD + 2 * S27_NKV * HD;
 constexpr int S27_ASPLIT = 32;   // position splits of a row's attention
 
@@ -26,7 +30,9 @@ constexpr size_t S27_PAGE = (size_t) S27_SLOTS * S27_SLOT;      // halves a page
 // the attention and the prompt path read K/V rows as 16-byte uint4s (8 halves) from the pool's base
 static_assert(S27_ROWH % 8 == 0 && HD % 8 == 0 && S27_SLOT % 8 == 0 && S27_PAGE % 8 == 0, "K/V rows start on 16 bytes");
 static_assert(NQH % NCARD == 0, "query heads split evenly");
-static_assert(NCARD == 3 && NQH / NKVH == 6, "the head split (two KV heads a card) is three cards' of 24 / 4 heads");
+// every card's K/V the same size (the pool's page layout is one for all); six cards would put one KV head on some, two
+// on others
+static_assert(NQH % NCARD == 0 && s27_nkv_even(0), "the 27B's query heads split evenly, every card reading as many KV heads");
 
 // the slot an attention layer's K/V take (the draft layer: S27_SLOTS - 1)
 inline int s27_slot(int l) { return l / 4; }

@@ -1,4 +1,4 @@
-// s27_probe: the dense 27B's decode window floor on three cards: every Q8_0 matrix one card reads in a window (64
+// s27_probe: the dense 27B's decode window floor on the build's cards: every Q8_0 matrix one card reads in a window (64
 // layers at card 0's slice, then its third of the output head), through q8s_gemv at T rows, each card at once in a
 // CUDA graph. No sums between the cards, no recurrent or attention core: the weight reading alone.
 //   s27_probe [T...]
@@ -24,9 +24,8 @@ static void ck(cudaError_t e, const char* what) {
     }
 }
 
-// card 0's recurrent slice: the larger share of the key heads, a third of the value heads (card_split.hpp's)
-constexpr int KH0 = (NKH + NCARD - 1) / NCARD, VH0 = NVH / NCARD;
-static_assert(KH0 == 6 && VH0 == 16, "card 0's recurrent heads on three cards");
+// card 0's recurrent slice (card_split.hpp): its key heads, its share of the value heads
+constexpr int KH0 = khead_count(NCARD, 0), VH0 = NVH / NCARD;
 constexpr int VOCAB = 248320;   // Qwen3.8-27B's output head rows
 struct Mat {
     int rows, cols;
@@ -71,7 +70,7 @@ int main(int argc, char** argv) {
     for (auto& m : mats) bytes += (double) m.rows * m.cols * (1 + 2.0 / 32);
     std::printf("per card: %zu matrices, %.2f GB\n", mats.size(), bytes / 1e9);
 
-    constexpr int NC = 3;
+    constexpr int NC = NCARD;
     std::vector<std::vector<Q8S>> w(NC);
     std::vector<void*> xq(NC);
     std::vector<float*> out(NC);
@@ -109,8 +108,8 @@ int main(int argc, char** argv) {
             ck(cudaStreamBeginCapture(st[c], cudaStreamCaptureModeThreadLocal), "capture");
             // S27_PF_MB=m: beside each matrix, the first m MB of the next pulled into L2 on a second stream
             static const double pf_mb = std::getenv("S27_PF_MB") ? std::atof(std::getenv("S27_PF_MB")) : 0.0;
-            static cudaStream_t st2[3];
-            static cudaEvent_t fork[3], join[3];
+            static cudaStream_t st2[NCARD];
+            static cudaEvent_t fork[NCARD], join[NCARD];
             if (pf_mb > 0 && !st2[c]) {
                 ck(cudaStreamCreateWithFlags(&st2[c], cudaStreamNonBlocking), "st2");
                 ck(cudaEventCreateWithFlags(&fork[c], cudaEventDisableTiming), "fork");
@@ -150,6 +149,8 @@ int main(int argc, char** argv) {
                 ms[c] /= REPS;
             });
         for (auto& t : th) t.join();
-        std::printf("T=%2d  window %6.2f / %6.2f / %6.2f ms  (%4.0f GB/s on card 0)\n", T, ms[0], ms[1], ms[2], bytes / ms[0] / 1e6);
+        std::printf("T=%2d  window", T);
+        for (int c = 0; c < NC; ++c) std::printf("%s%6.2f", c ? " / " : " ", ms[c]);
+        std::printf(" ms  (%4.0f GB/s on card 0)\n", bytes / ms[0] / 1e6);
     }
 }

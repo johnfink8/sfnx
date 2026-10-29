@@ -47,7 +47,9 @@ the GGUFs, configs and prompts all come from the operator. Missing authenticatio
 finding; a hidden *failure* is.
 
 The bar is correctness first: logits match llama.cpp to the same tolerance as llama.cpp's own CPU backend, on text and
-pictures, at temperature 0, and in distribution when sampled with drafts. `docs/benchmarks.md` is the contract; a
+pictures, at temperature 0, and in distribution when sampled with drafts. For the 27B, whose two llama.cpp backends
+agree 5–30x more closely than Flash-Next's, the tolerance is the widest of llama.cpp's own ways of running it (its
+CPU backend, its CUDA with and without int8 products of quantized activations: docs/verification.md, "The 27B"). `docs/benchmarks.md` is the contract; a
 change that silently moves them is a regression. Prod's settings are the code's defaults; environment settings exist
 to try better ones, and a new behaviour lands off by default until the GPU checks below pass.
 
@@ -118,7 +120,7 @@ Its llama.cpp references (docs/verification.md, "The 27B") are made locally like
 
 CI (`.github/workflows/ci.yml`, every PR and push to main, no GPU) builds `lab bin/sfnx test-bin` for sm_70 on every
 card count, sm_86 on three and four and every other arch on three, the 27B's programs (`make FNX_MODEL=27b`) on sm_70
-and three cards, and runs the CPU-only checks above and the front end's tests (a skipped test fails it). The GPU rows stay the author's and the lead's to run.
+and two, three and four cards, and runs the CPU-only checks above and the front end's tests (a skipped test fails it). The GPU rows stay the author's and the lead's to run.
 
 Bases live in `/tmp/fnx-lab-$UID`, which a reboot empties: regenerate them with the previous build before judging a
 new one.

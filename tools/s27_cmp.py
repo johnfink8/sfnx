@@ -8,8 +8,9 @@ layer, as the cosine and the relative RMS difference of the rows both hold:
     result_norm   result_norm
 
 The dump's rows come from every window in order, the reference's are the prompt's first rows. Any record of the dump
-without its reference, or a layer missing from the dump, is an error (exit 1): a renamed record would otherwise drop
-out of the comparison without a word.
+without its reference, and any of R0, result_norm or a layer's two sums (every layer the reference has an l_out of)
+missing from the dump, is an error (exit 1): a renamed or truncated record would otherwise drop out of the comparison
+without a word.
 
     s27_cmp.py REF.bin OUT.bin"""
 import sys
@@ -54,11 +55,12 @@ def order(n):
 
 
 fails = []
-layers = sorted({int(n.rsplit("-", 1)[1]) for n in got if n.startswith(("attn_out-", "ffn_out-"))})
-for l in range(layers[-1] + 1 if layers else 0):
-    for p in ("attn_out", "ffn_out"):
-        if f"{p}-{l}" not in got:
-            fails.append(f"{p}-{l}: not in the dump")
+layers = sorted(int(n.rsplit("-", 1)[1]) for n in ref if n.startswith("l_out-"))
+if not layers:
+    raise SystemExit(f"{sys.argv[1]}: no l_out records (fnx_ref's REGEX must take them)")
+for want in ["R0", "result_norm"] + [f"{p}-{l}" for l in layers for p in ("attn_out", "ffn_out")]:
+    if want not in got:
+        fails.append(f"{want}: not in the dump")
 for name in sorted(got, key=order):
     r = reference(name)
     if isinstance(r, str):

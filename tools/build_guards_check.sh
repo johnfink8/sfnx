@@ -34,7 +34,7 @@ refused "not 'sm_86'" ARCH=sm_86
 refused "FNX_NCARD: one value, not '3 4'" "FNX_NCARD=3 4"
 refused "not '5'" FNX_NCARD=5
 refused "FNX_MODEL: fnx or 27b, not 'q4'" FNX_MODEL=q4
-refused "FNX_MODEL=27b: three cards only" FNX_MODEL=27b FNX_NCARD=2
+refused "FNX_MODEL=27b: two, three or four cards" FNX_MODEL=27b FNX_NCARD=6
 # each model's programs asked of the other's build, which would otherwise rewrite build/model on the way to refusing
 refused "make FNX_MODEL=27b" FNX_MODEL=fnx bin/s27_bw_probe
 refused "Flash-Next's, not FNX_MODEL=27b's" FNX_MODEL=27b lab

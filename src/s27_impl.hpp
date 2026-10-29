@@ -116,6 +116,7 @@ inline const char* window_error(unsigned err, bool draft) {
     if (err & 1u) return "a ring sum timed out";
     if (err & 2u) return "a ring sum met a NaN or inf (or a value past fp16's range)";
     if (err & 16u) return draft ? "the draft layer's logits hold a NaN or inf" : "the head's logits hold a NaN or inf";
+    if (err) return "an error bit no message names";
     return nullptr;
 }
 // mtp: unused (the draft layer's K/V is a slot of every page, so the pages carry it); hist_half: the conv history half

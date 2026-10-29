@@ -114,8 +114,10 @@ attention, which splits by heads: the 27B's 4 KV heads let each card keep the K/
 Its logits are held to the widest gap between llama.cpp's own ways of running the 27B (its CPU backend, its CUDA
 with and without int8 products of quantized activations), a bar 4–30x tighter than Flash-Next's. Code, the edit and
 the picture are within it, with top-1 agreement of 100% / 100% / 99.5%; the 62k prompt agrees on every top-1 and sits
-at 1.27x its KL. llama.cpp decodes the 27B Q8_0 at ~24 tok/s on this box, one request; 1Cat-vLLM's own V100 numbers are 69–98
-alone, 222–225 at six, ~1.3k tok/s reading 96k. Details:
+at 1.27x its KL. llama.cpp decodes the 27B Q8_0 at ~24 tok/s on this box, one request. On two of these cards
+(`make FNX_MODEL=27b FNX_NCARD=2`) sFNX decodes the code edit at 255, new code at 133 and prose at 88 tok/s;
+1Cat-vLLM run on the same two cards with the same prompts (NVFP4, 31% fewer bytes, with its DFlash2 drafts) gives 252,
+184 and 78, and reads a 62k prompt at 1,427 tok/s against sFNX's 1,511. Details:
 [docs/benchmarks.md](docs/benchmarks.md#qwen38-27b), [docs/verification.md](docs/verification.md#the-27b).
 
 ## Running it
@@ -156,7 +158,8 @@ and the files they read: [docs/config.md](docs/config.md).
 
 ## Limits
 
-- Two models (Flash-Next; the 27B as a build of its own, at Q8_0 only and on three cards only), measured on one box: three `sm_70` cards (or two; four, six or eight build but are untested). RTX 3090s
+- Two models (Flash-Next; the 27B as a build of its own, at Q8_0 only, on two or three cards; four build and are
+  untested), measured on one box: three `sm_70` cards (or two; four, six or eight build but are untested). RTX 3090s
   (`ARCH=86`) run at a tester's, not yet checked against llama.cpp; 80, 89, 90, 100 and 120 build but have never run,
   and Turing is refused. No FP8, and no CUDA 13 (it drops `sm_70`).
 - Every pair of cards must be CUDA peers over PCIe: GeForce cards need a community driver patch and full Resizable BAR

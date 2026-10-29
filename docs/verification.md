@@ -118,6 +118,9 @@ from its CPU backend (code 1.13e-4): about the distance between any two of llama
 
 Windows of 1, 2, 3, 11 and 16 rows give the 5-row windows' logits byte for byte.
 
+The bar takes the CPU backend's top-1 (the highest of the three) and the widest KL, with Flash-Next's slack on top
+(1.25x; 1.0 for long64).
+
 **Code, edit and the picture are within the bar; long64 is not, and the exact check says so** (`FAIL`, so no base is
 written). Every prompt's top-1 agreement is the bar's or better. long64's KL is 1.27x the bar, where the slack is 1.0,
 and 2.5x the distance between llama.cpp's own two CUDA paths there (1.04e-4): over 62k tokens sFNX drifts further
@@ -160,8 +163,8 @@ Checked on the 27B as on Flash-Next:
   Each batched row is rotated by its own lane's M-RoPE table.
 - **The speculative sampler** matches plain sampling through three batched lanes with drafts (`SAMPLE_TEST_LANES=3
   bin/sample_test`, open1, 600 seeds: every p >= 0.116).
-- **Its sums** (`bin/s27_ring_test`): both rings, fp16 three a word and fp32, give the cards' sum within fp16's
-  rounding of it at 1, 2, 5 and 16 rows, with no error bit.
+- **Its sums** (`bin/s27_ring_test`): the fp32 ring gives the cards' sum exactly and the fp16 one (three a word)
+  within fp16's rounding of it, at 1, 2, 5 and 16 rows, with no error bit in the timed sums or the checked ones.
 - **The API and pictures through the front end:** `serve/api_smoke.py` 10 of 10, `serve/image_test.py` 6 of 6
   (three requests at once among them), and `pytest front/` 595 passed.
 

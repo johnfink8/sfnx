@@ -2118,9 +2118,11 @@ void q8s_gemv_f32(const Q8S& w, int rows, int cols, const void* y, float* out, c
     for (int s = 0; s < Q8S_SEGS; ++s) g.q[s] = w.q, g.d[s] = w.d, g.out[s] = out, g.end[s] = rows, g.stride[s] = rows;
     const block_q8_1* yq = (const block_q8_1*) y;
     cudaStream_t s = (cudaStream_t) st;
-    // compiled for its one use, qkvz (4096 to 8191 rows: two a warp, as q8s_gemv alone would run them)
-    if (rows < 4096 || rows >= 8192) throw std::runtime_error("q8s_gemv_f32: compiled for 4096..8191 rows (qkvz)");
-    q8s_ab_launch<2>(g, rows, cols, yq, W, x, yf, rf, T, s);
+    // compiled for its one use, qkvz: 4096 to 8191 rows two a warp, 8192 and more (the 27B's on two cards) four, as
+    // q8s_gemv alone would run them
+    if (rows < 4096) throw std::runtime_error("q8s_gemv_f32: compiled for 4096 rows or more (qkvz)");
+    if (rows >= 8192) q8s_ab_launch<4>(g, rows, cols, yq, W, x, yf, rf, T, s);
+    else q8s_ab_launch<2>(g, rows, cols, yq, W, x, yf, rf, T, s);
     ck_launch("q8s_gemv_f32");
 }
 #endif

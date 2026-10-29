@@ -1,7 +1,8 @@
-// s27_ring_test: the 27B's sums across the cards at the build's N, alone. Times kernels.cu's ring_sum (the 27B's ring
-// with FNX_RING_F32=1) and s27_ring3.cuh's k_ring3 (three fp16 a word, its default), 128 sums back to back; then checks both:
-// card c holds x[t][i] = (c + 1) * (i % 97 + t) / 64, the sum must be n(n+1)/2 x on n cards. Exits 1 when a sum is off
-// by more than fp16's rounding of it or sets an error bit.
+// s27_ring_test: the 27B's sums across the cards at the build's N, alone. Times kernels.cu's ring_sum with fp32 words
+// (the 27B's ring with FNX_RING_F32=1) and s27_ring3.cuh's k_ring3 (three fp16 a word, its default), 128 sums back to
+// back; then checks both: card c holds x[t][i] = (c + 1) * (i % 97 + t) / 64, the sum must be n(n+1)/2 x on n cards.
+// Exits 1 when a sum is off by more than its words' rounding of it (fp32: exact, as every partial is a multiple of 1/64
+// well inside fp32's mantissa; fp16: each hop and the gather round once) or any sum, timed or checked, sets an error bit.
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -9,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <tuple>
 #include <vector>
 
 #include "../src/kernels.hpp"
@@ -40,6 +42,7 @@ int main() {
         ck(cudaStreamCreateWithFlags(&st[c], cudaStreamNonBlocking), "stream");
         Ring& r = rings[c];
         r.card = c;
+        r.f32 = true;   // ring_in_words / ring_ag_words size the buffers for fp32 words
         ck(cudaMalloc(&r.in, ring_in_words(MAXT) * 8), "in");
         ck(cudaMalloc(&r.ag, ring_ag_words(MAXT) * 8), "ag");
         ck(cudaMalloc(&r.err, 4), "err");
@@ -48,7 +51,6 @@ int main() {
         ck(cudaMalloc(&r3[c].ag, r3_ag_words() * 8), "ag3");
         r3[c].err = r.err;
         ck(cudaMalloc(&x[c], (size_t) MAXT * N * 4), "x");
-        ck(cudaMemset(x[c], 0, (size_t) MAXT * N * 4), "x0");   // the timed sums add zeros
         ck(cudaMalloc(&tag[c], 4), "tag");
     }
     for (int c = 0; c < NCARD; ++c) {
@@ -67,6 +69,7 @@ int main() {
             ck(cudaMemset(r3[c].in, 0, r3_in_words() * 8), "in3 0");
             ck(cudaMemset(r3[c].ag, 0, r3_ag_words() * 8), "ag3 0");
             ck(cudaMemset(rings[c].err, 0, 4), "err0");
+            ck(cudaMemset(x[c], 0, (size_t) MAXT * N * 4), "x0");   // the timed sums add in place: zeros stay zeros
             ck(cudaDeviceSynchronize(), "sync");
         }
     };
@@ -82,8 +85,20 @@ int main() {
             ck(cudaStreamSynchronize(st[c]), "tag up");
         }
     };
+    // every card's error bits, OR'd
+    auto err_bits = [&] {
+        unsigned err = 0;
+        for (int c = 0; c < NCARD; ++c) {
+            ck(cudaSetDevice(c), "set");
+            unsigned e = 0;
+            ck(cudaMemcpy(&e, rings[c].err, 4, cudaMemcpyDeviceToHost), "err down");
+            err |= e;
+        }
+        return err;
+    };
     int fails = 0;
-    for (const auto& [name, sum] : {std::pair{"ring_sum", fp32}, std::pair{"k_ring3", fp16x3}}) {
+    const auto rings_tested = {std::tuple{"ring_sum fp32", fp32, 0.0}, std::tuple{"k_ring3", fp16x3, NCARD * std::ldexp(1.0, -11)}};
+    for (const auto& [name, sum, bar] : rings_tested) {
         clear();
         unsigned tg = 1;
         for (int T : {1, 2, 4, 8, 16}) {   // the time
@@ -107,6 +122,10 @@ int main() {
             float ms = 0;
             ck(cudaEventElapsedTime(&ms, a, b), "elapsed");
             std::printf("%s T=%2d: %.1f us a sum (128 back to back)\n", name, T, ms * 1000 / 128);
+        }
+        if (const unsigned e = err_bits()) {
+            std::printf("%s: the timed sums set error bits %u  FAIL\n", name, e);
+            ++fails;
         }
         clear();
         for (int T : {1, 2, 5, 16}) {   // the sums
@@ -141,8 +160,6 @@ int main() {
                             worst = std::max(worst, (double) std::fabs(h[(size_t) t * N + i] - want) / (std::fabs(want) + 1e-3));
                         }
                 }
-                // each of the n - 1 steps rounds a partial to fp16 (2^-11 relative), and the gather the sum once more
-                const double bar = NCARD * std::ldexp(1.0, -11);
                 const bool ok = worst <= bar && !err;
                 if (!ok) ++fails;
                 std::printf("%s T=%2d call %d: worst rel %.2e (bar %.2e), err bits %u%s\n", name, T, call, worst, bar, err,

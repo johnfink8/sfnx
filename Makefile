@@ -76,11 +76,12 @@ $(if $(word 2,$(FNX_NCARD)),$(error FNX_NCARD: one value, not '$(FNX_NCARD)'))
 $(if $(filter 2 3 4 6 8,$(FNX_NCARD)),,$(error FNX_NCARD: 2, 3, 4, 6 or 8 (the 24 query heads and 48 value heads split evenly, a 32-value FF block on every card, at most 8 for CUDA's peers a card), not '$(FNX_NCARD)'))
 NVFLAGS += -DFNX_NCARD=$(FNX_NCARD) -DFNX_ARCH=$(ARCH)
 # the model (src/model.hpp): fnx (Flash-Next, prod) or 27b (Qwen3.8-27B: src/s27_*, bin/s27_run). build/model holds
-# it as build/ncard holds the count; the 27B has run on three cards only, so other counts are refused for it
+# it as build/ncard holds the count; the 27B is built for two, three or four cards (src/s27_attn.cuh: every card reads
+# as many KV heads), other counts refused
 FNX_MODEL ?= fnx
 override FNX_MODEL := $(strip $(FNX_MODEL))
 $(if $(filter fnx 27b,$(FNX_MODEL)),,$(error FNX_MODEL: fnx or 27b, not '$(FNX_MODEL)'))
-$(if $(and $(filter 27b,$(FNX_MODEL)),$(filter-out 3,$(FNX_NCARD))),$(error FNX_MODEL=27b: three cards only (its K/V heads are placed for three), not FNX_NCARD=$(FNX_NCARD)))
+$(if $(and $(filter 27b,$(FNX_MODEL)),$(filter-out 2 3 4,$(FNX_NCARD))),$(error FNX_MODEL=27b: two, three or four cards (its K/V heads are placed for those), not FNX_NCARD=$(FNX_NCARD)))
 FNX_27B := $(if $(filter 27b,$(FNX_MODEL)),1,0)
 NVFLAGS += -DFNX_27B=$(FNX_27B)
 # the 27B's own programs (make FNX_MODEL=27b), and the lab, which holds Flash-Next only (the 27B loads plain); refused

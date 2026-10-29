@@ -307,11 +307,12 @@ constexpr double TOP1_SLACK = 1.5;
 // ref/lgr/llama_cuda_<model>_<prompt>.lgr). Its CPU backend against CUDA (llama_cpu_*: code1 8.95e-5, edit1 1.48e-7,
 // the picture 99.50% / 4.69e-4), and its CUDA with the int8 products of quantized activations off, cuBLAS for every
 // product (ref/llama_cublas_only.patch, llama_cublas_*: code1 1.25e-4, edit1 1.23e-7, the picture 99.00% / 8.91e-4,
-// long64 1.04e-4); long64 its q8_0 K/V against its f16 K/V (2.08e-4), as Flash-Next's
+// long64 1.04e-4); long64 its q8_0 K/V against its f16 K/V (2.08e-4), as Flash-Next's. Top-1 the CPU backend's (the
+// highest), KL the widest; the slack on top is Flash-Next's, for sFNX's own summation orders
 constexpr Bar BARS[] = {
     {"code1", 100.00, 1.25e-4, 1.25},
     {"edit1", 100.00, 1.48e-7, 1.25},
-    {"picture", 99.00, 8.91e-4, 1.25},
+    {"picture", 99.50, 8.91e-4, 1.25},
     {"long64", 99.50, 2.08e-4, 1.0},
 };
 #else

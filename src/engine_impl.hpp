@@ -155,6 +155,7 @@ inline const char* window_error(unsigned err, bool draft) {
     if (err & 2u) return "a ring sum met a NaN or inf (or, on the fp16 ring, a value past its range)";
     if (err & 4u) return "an hc read's grid barrier timed out";
     if (err & 16u) return draft ? "the draft layer's logits hold a NaN or inf" : "the head's logits hold a NaN or inf";
+    if (err) return "an error bit no message names";
     return nullptr;
 }
 // mtp: the draft layer is attached (its K/V and QSA keys are part of the state); hist_half: the conv history half the
