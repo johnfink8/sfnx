@@ -1,0 +1,17 @@
+name: Idea
+description: A change to the engine, the front end or the way it is run.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What and why
+      description: What you would change, and what it buys (a measurement, if you have one, with what it was measured on).
+    validations:
+      required: true
+  - type: textarea
+    id: cost
+    attributes:
+      label: What it costs
+      description: >
+        What it could move: the logits against llama.cpp, speed on three V100s, memory, prod's defaults.

@@ -18,7 +18,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest==9.1.1"]
+# anthropic: front/test_anthropic_base_url.py drives /v1/messages with the real client
+test = ["pytest==9.1.1", "anthropic==2.3.0"]
 # ref/*.py and tools/mtp_experts.py; pyyaml for llama.cpp's gguf-py, which the GGUF tools take from PYTHONPATH
 tools = ["numpy==2.5.4", "pyyaml==6.0.3"]
 
