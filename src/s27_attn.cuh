@@ -1,9 +1,10 @@
 // The 27B's attention split by heads: card c holds query heads [S27_NQ c, S27_NQ (c + 1)) and the S27_NKV KV heads
 // they read (query head h reads KV head h / 6), K/V for every position (f16): 12 query heads and two KV heads a card on
-// two cards, 8 and two on three (a KV head straddling two cards' heads is kept on both), 6 and one on four. No exchange between the cards until wo's sum. Rows of the
-// projection: [q | gate] for each of the 8 heads, then the 2 K heads, then the 2 V heads (S27_QKV values).
+// two cards, 8 and two on three (a KV head straddling two cards' heads is kept on both), 6 and one on four. No exchange
+// between the cards until wo's sum. Rows of the projection: [q | gate] for each of the S27_NQ heads, then the S27_NKV
+// K heads, then the S27_NKV V heads (S27_QKV values).
 // K/V live in a paged pool: a page holds S27_PP positions of every attention layer and the draft layer (a slot each:
-// its K rows [S27_PP][2][HD], then its V rows); a sequence's page table maps its logical pages to physical ones.
+// its K rows [S27_PP][S27_NKV][HD], then its V rows); a sequence's page table maps its logical pages to physical ones.
 // A window's rows each have a position and a page table: one sequence's rows at *pos0 + t on pt0, or a batched
 // window's, each from its lane (LaneRows: the row's position word and table; tabs: its lane's rotary table, null for a
 // lane without an image)
