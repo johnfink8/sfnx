@@ -98,7 +98,6 @@ static void route_from_logits(const float* logits, int T, int* topi, float* topw
 int main() {
     std::mt19937 rng(1);
     cudaSetDevice(2);
-    hc_prepare();
     for (int T : {1, 2, 3, 4, 5, 8, 16}) {
         {   // dense: card 2's qkvz (5 key heads: 5120 rows) and ssm_out (2560 x 1920), Q8_0; the f32 router and ab
             void* xq;
@@ -167,6 +166,7 @@ int main() {
             cudaMalloc(&injo, MAXT * HC * 4);
             cudaMalloc(&scratch, hc_scratch_floats(MAXT) * 4);
             cudaMemset(scratch, 0, hc_scratch_floats(MAXT) * 4);
+            hc_prepare(scratch);
             unsigned* herr;
             cudaMalloc(&herr, 4);
             cudaMemset(herr, 0, 4);
@@ -178,15 +178,13 @@ int main() {
             });
             std::printf("T=%d hc_read       %7.1f us (%5.1f MB, %4.0f GB/s)\n", T, us, mb, mb / us * 1e3);
             for (const int g : {72, 64, 40}) {   // as a card of g SMs runs it (a 72-SM PG500-216)
-                hc_prepare(g);
-                cudaMemset(scratch, 0, hc_scratch_floats(MAXT) * 4);   // its barrier counter, in generations of 80
+                hc_prepare(scratch, g);
                 const float ug = time_us([&](cudaStream_t s) {
                     hc_read(R, bo, inj, wn, wd, wu, wi, 1e-6f, mixed, injo, scratch, herr, T, s, q8);
                 });
                 std::printf("T=%d hc_read on %d %7.1f us (x%.2f)\n", T, g, ug, ug / us);
             }
-            hc_prepare();
-            cudaMemset(scratch, 0, hc_scratch_floats(MAXT) * 4);
+            hc_prepare(scratch);
             {   // the same with the down weights pulled into L2 first (not timed)
                 cudaStream_t st;
                 cudaStreamCreate(&st);

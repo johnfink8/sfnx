@@ -1036,7 +1036,7 @@ int hc_grid() {
     return hc_grid_[dev];
 }
 
-int hc_prepare(int cap) {
+int hc_prepare(float* scratch, int cap) {
     const int dev = hc_dev();
     int sms = 0;
     const cudaError_t e = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
@@ -1044,6 +1044,10 @@ int hc_prepare(int cap) {
     if (sms <= 0) throw std::runtime_error("hc_prepare: card " + std::to_string(dev) + " reports " + std::to_string(sms) + " SMs");
     if (cap < 0 || cap > H_BLOCKS) throw std::runtime_error("hc_prepare: cap 1.." + std::to_string(H_BLOCKS) + " (0: none), got " + std::to_string(cap));
     hc_grid_[dev] = std::min(sms, cap ? cap : H_BLOCKS);
+    // a counter left by another grid sits mid-generation for this one: its next barrier would let blocks through early
+    const unsigned zero = 0;
+    const cudaError_t z = cudaMemcpy(scratch + hc_scratch_floats(MAXT) - 1, &zero, sizeof zero, cudaMemcpyHostToDevice);
+    if (z != cudaSuccess) throw std::runtime_error(std::string("hc_prepare: the barrier counter: ") + cudaGetErrorString(z));
     return hc_grid_[dev];
 }
 
