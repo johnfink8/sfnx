@@ -130,11 +130,9 @@ bin/card_check_test: tools/card_check_test.cpp src/card_check.hpp src/peer_probe
 # kernels.cu compiles as KPARTS objects in parallel (make -j), each with its share of the launchers (FNX_KPART)
 KPARTS := 0 1 2 3 4 5 6 7 8
 KERN_OBJ := $(foreach p,$(KPARTS),build/kernels_p$(p).o)
-ENG_OBJ := build/gguf.o build/model.o build/store.o $(KERN_OBJ) build/moe_mma.o build/engine.o build/engine_common.o build/peer_probe.o build/prefill.o build/session.o build/batch.o
-# the 27B's Engine (engine.hpp's interface) is its own: s27_engine.cu and its prompt path
-ifeq ($(FNX_27B),1)
-ENG_OBJ := build/gguf.o build/model.o build/store.o $(KERN_OBJ) build/moe_mma.o build/s27_engine.o build/engine_common.o build/peer_probe.o build/s27_prefill.o build/session.o build/batch.o
-endif
+# the 27B's Engine (engine.hpp's interface) is its own: s27_engine.cu and its prompt path; everything else links shared
+ENG_MODEL := $(if $(filter 1,$(FNX_27B)),s27_,)
+ENG_OBJ := build/gguf.o build/model.o build/store.o $(KERN_OBJ) build/moe_mma.o build/$(ENG_MODEL)engine.o build/engine_common.o build/peer_probe.o build/$(ENG_MODEL)prefill.o build/session.o build/batch.o
 PIC := -Xcompiler -fPIC
 build/kernels_p%.o: src/kernels.cu $(STAMPS)
 	@mkdir -p build

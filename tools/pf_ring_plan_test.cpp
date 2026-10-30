@@ -30,7 +30,8 @@ static PfRingOp op(K k, int part = -1, int hop = -1, int step = -1, bool fin = f
     return o;
 }
 
-// prefill.cu's pf_ring_dir as written for three cards (a = g, b = g - 1, c = g + 1) and two (c = b = the other)
+// the ring as pf_common.cuh's pf_ring_run was written to run it for three cards (a = g, b = g - 1, c = g + 1) and two
+// (c = b = the other)
 static std::vector<PfRingOp> written(int n, int g) {
     const int a = g, b = (g + n - 1) % n, c = (g + 1) % n;
     std::vector<PfRingOp> v = {op(K::PACK, a), op(K::SEND, a, 0), op(K::SIGNAL, -1, -1, 0)};

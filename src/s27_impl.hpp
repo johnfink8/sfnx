@@ -15,6 +15,22 @@
 
 namespace fnx {
 
+// a whole block's sum of v (in every thread): warps folded through shuffles, the warp sums through sh, broadcast from
+// thread 0. The norms' kernels of this model's engine and prompt path share it; sh holds blockDim.x / 32 floats.
+static __device__ float s27_block_sum(float v, float* sh) {
+    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = v;
+    __syncthreads();
+    v = threadIdx.x < (blockDim.x >> 5) ? sh[threadIdx.x] : 0.f;
+    if (threadIdx.x < 32)
+        for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    if (threadIdx.x == 0) sh[0] = v;
+    __syncthreads();
+    const float r = sh[0];
+    __syncthreads();
+    return r;
+}
+
 // a lane's state on one card: its page table, recurrent states and conv histories; the engine's current-lane pointers
 // in CardBuf are a copy of the lane's (Engine::use_lane)
 struct LaneDev {

@@ -484,9 +484,8 @@ __global__ void k_pfr_addend(float* __restrict__ x, const float* __restrict__ pa
 
 
 // one direction's sum of x (C rows of N) over the cards, on stream s; this card is at position g of the direction's
-// ring (its next card: g + 1 there), by the steps of r.plan (pf_ring_plan.hpp, which describes the algorithm). Each
-// copy into the next card is followed by a flag there; the step after waits on this card's flag (stream memory
-// operations: no SM time, no host)
+// ring (its next card: g + 1 there), by the steps of r.plan — pf_ring_run runs them (pf_common.cuh and
+// pf_ring_plan.hpp describe the algorithm)
 void pf_ring_dir(Engine::PfRing& r, int dev, int g, float* x, int C, unsigned seq, unsigned* err, cudaStream_t s) {
     pf_ring_run(r, dev, g, x, C, seq, err, s);
 }

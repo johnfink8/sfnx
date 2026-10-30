@@ -1,4 +1,4 @@
-// The prompt path's chunk sum on the copy engines (prefill.cu, pf_ring_dir) as a list of steps for card g of n: a
+// The prompt path's chunk sum on the copy engines (pf_common.cuh, pf_ring_run) as a list of steps for card g of n: a
 // reduce-scatter then an all-gather round the ring, each card sending only to the next. The rows are cut in n parts
 // (part k: rows [k C / n, (k + 1) C / n)); card g sends its own addend of part g to g + 1, each card after adds its own
 // and sends it on (hop s carries part g - s), so card g finishes part g + 1 after n - 1 hops; the finished parts then go

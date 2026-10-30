@@ -4,7 +4,7 @@
 // through gdn_prompt. Attention over a chunk: each KV head's positions gathered from the pages into one block, then per
 // query head S = q k^T (cuBLAS), the causal softmax (scaled, f16 probabilities), P v (cuBLAS), the gate; the queries in
 // blocks small enough that S stays within FNX_PF_SCORE_MIB. The sums across the cards go round the ring on the copy
-// engines (pf_ring_plan.hpp's steps, prefill.cu's algorithm), f16 rows.
+// engines (pf_ring_plan.hpp's steps, pf_common.cuh's pf_ring_run), f16 rows.
 // What a chunk leaves is the state a run of windows over the same rows leaves: K/V, recurrent states and histories,
 // and with the draft layer attached its K/V (the draft layer over the chunk's final rows, each paired with the token
 // after it, up to its K/V).
@@ -214,6 +214,9 @@ void Engine::prefill_alloc() {
         CardBuf& b = *cb_[(size_t) c];
         const CardW& w = m_.cards[c];
         ckc(cudaSetDevice(b.dev), "set");
+        size_t free0 = 0, tot0 = 0;
+        ckc(cudaMemGetInfo(&free0, &tot0), "mem info");
+        pf_card_bytes = 0;   // palloc's out-of-memory message says what this card's prompt path holds
         Pf* p = new Pf();
         pf_.push_back(p);
         p->dev = b.dev;
@@ -270,6 +273,8 @@ void Engine::prefill_alloc() {
         }
         p->flags = palloc<unsigned>(2 * PF_RING_STEPS);
         ckc(cudaMemset(p->flags, 0, 2 * PF_RING_STEPS * sizeof(unsigned)), "ring flags");
+        if (env_flag("FNX_PF_TIMING"))
+            std::fprintf(stderr, "prefill buffers on card %d: %zu MiB (%zu MiB free before)\n", c, pf_card_bytes >> 20, free0 >> 20);
     }
     for (int c = 0; c < NCARD; ++c) {
         Pf& p = *pf_[(size_t) c];

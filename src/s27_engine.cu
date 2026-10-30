@@ -255,7 +255,7 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
     // graphs captured at first use, cuBLAS's workspaces, the lanes' page tables and rotary tables), at least the whole
     // context and the extra lanes' blocks. A page is the card's own KV heads' worth (s27_attn.cuh counts them per card
     // count): three cards, 8.9 MB — 34.8 KB a position, 16 attention layers and the draft layer, two heads of 256 f16
-    // for K and V; four cards, one head, half that)
+    // for K and V; four cards, one head, half that.
     const long long reserve_mib = env_int("FNX_KV_RESERVE_MIB", 1024);
     if (reserve_mib < 0) throw std::runtime_error("FNX_KV_RESERVE_MIB: want MiB >= 0, got " + std::to_string(reserve_mib));
     const size_t page_bytes = S27_PAGE * sizeof(__half);
