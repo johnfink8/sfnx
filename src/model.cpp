@@ -808,8 +808,17 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
         w.sh_down = up.dense(up.cols(L(l, "ffn_down_shexp.weight"), range(c.ff0 / 32, c.ff1 / 32)));
         if (!w.sh_gu.s.q || !w.sh_down.s.q) throw std::runtime_error("fnx: the shared expert is not Q8_0");
         if (l == PLE_LAYER) {
-            c.ple_key = up.dense(up.rows(L(l, "ple_key.weight"), range(0, (int) L(l, "ple_key.weight").ne[1])));
-            c.ple_value = up.dense(up.rows(L(l, "ple_value.weight"), range(0, (int) L(l, "ple_value.weight").ne[1])));
+            const Tensor& pk = L(l, "ple_key.weight");
+            const Tensor& pv = L(l, "ple_value.weight");
+            // dense() reads N-wide xq rows and writes D-float rows into b->ple_key, N-float into b->ple_val
+            if (pk.ne[0] != N || pk.ne[1] != D)
+                throw std::runtime_error("fnx: " + pk.name + " is " + std::to_string(pk.ne[0]) + " by " + std::to_string(pk.ne[1]) +
+                                         ", not the " + std::to_string(N) + " by " + std::to_string(D) + " its dense into the ple_key rows reads");
+            if (pv.ne[0] != N || pv.ne[1] != N)
+                throw std::runtime_error("fnx: " + pv.name + " is " + std::to_string(pv.ne[0]) + " by " + std::to_string(pv.ne[1]) +
+                                         ", not the " + std::to_string(N) + " by " + std::to_string(N) + " its dense into the ple_val rows reads");
+            c.ple_key = up.dense(up.rows(pk, range(0, (int) pk.ne[1])));
+            c.ple_value = up.dense(up.rows(pv, range(0, (int) pv.ne[1])));
             c.ple_norm_key = up.f32(L(l, "ple_norm_key.weight"), D);
             c.ple_norm_query = up.f32(L(l, "ple_norm_query.weight"), D);
             c.ple_norm_conv = up.f32(L(l, "ple_norm_conv.weight"), D);
@@ -1258,6 +1267,9 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
                                  std::to_string(ple_off.size()) + " offsets and " + std::to_string(ple_vocab.size()) +
                                  " vocab sizes, want 3 and " + std::to_string(PLE_HEADS) + " and " + std::to_string(PLE_HEADS));
     {
+        // a zero multiplier drops its n-gram from the hash silently: the gather still runs, on fewer orders than the model trained with
+        for (int j = 0; j < 3; ++j)
+            if (!ple_mult[j]) throw std::runtime_error("fnx: PLE multiplier " + std::to_string(j) + " is 0, which drops that n-gram from the hash");
         static_assert(PLE_HEADS * PLE_DIM == N, "the gather tiles PLE_HEADS rows of PLE_DIM into one embedding row");
         if (ple_table->ne[0] != PLE_DIM)
             throw std::runtime_error("fnx: " + ple_table->name + " is " + std::to_string(ple_table->ne[0]) + " a row, not the " +
@@ -1268,7 +1280,7 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
             // trips the check instead of slipping past a summed top
             if (!ple_vocab[h]) throw std::runtime_error("fnx: PLE head " + std::to_string(h) + " has an empty vocabulary");
             if (ple_off[h] >= rows || ple_vocab[h] > rows - ple_off[h])
-                throw std::runtime_error("fnx: PLE head " + std::to_string(h) + " gathers from row " + std::to_string(ple_off[h]) +
+                throw std::runtime_error("fnx: PLE head " + std::to_string(h) + " gathers from row " + std::to_string((int64_t) ple_off[h]) +
                                          " for " + std::to_string(ple_vocab[h]) + ", past " + ple_table->name + "'s " + std::to_string(rows));
         }
     }
