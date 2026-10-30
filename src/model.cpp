@@ -1263,7 +1263,7 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
             if (!ple_vocab[h]) throw std::runtime_error("fnx: PLE head " + std::to_string(h) + " has an empty vocabulary");
             top = std::max(top, ple_off[h] + ple_vocab[h]);
         }
-        const int64_t rows = g.t("blk." + std::to_string(PLE_LAYER) + ".ple_key.weight").ne[1];
+        const int64_t rows = ple_table->ne[1];   // the gather reads rows of per_layer_token_embd, not the layer's key table
         if (top > (uint64_t) rows)
             throw std::runtime_error("fnx: a PLE head reaches row " + std::to_string(top) + ", past the table's " + std::to_string(rows));
     }
