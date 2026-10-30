@@ -133,6 +133,7 @@ int main(int argc, char** argv) {
                 if (pf) {
                     ck(cudaEventRecord(fork[c], st[c]), "fork");
                     ck(cudaStreamWaitEvent(st2[c], fork[c], 0), "fork wait");
+                    // clamp in double before the cast: S27_PF_MB is unbounded and a huge MB must not wrap size_t to a small count
                     const size_t nb = (size_t) std::min(pf_mb * 1048576.0, (double) ((size_t) mats[i + 1].rows * mats[i + 1].cols));
                     l2_prefetch(w[c][i + 1].q, nb, st2[c]);
                     ck(cudaEventRecord(join[c], st2[c]), "join");
