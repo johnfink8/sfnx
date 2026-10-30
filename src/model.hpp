@@ -46,6 +46,7 @@ constexpr int MAXT = 16;                               // rows per window
 // shared code, so these stand outside the model block even though only Flash-Next has an indexer
 constexpr int QSA_KEY = 128;
 constexpr int QSA_HEADS = 4;                             // indexer query heads: the qk projection is QSA_HEADS + 1 of these
+constexpr int QSA_TOP_K = 2048;                          // indexer positions kept (metadata top_k): qsa.cuh's QSA_TOP is this over the pool
 // the hc read's grid (src/hc.cuh's H_BLOCKS, held to this there): every block resident at once, one an SM, so a card
 // with fewer SMs is refused at load (src/card_check.hpp)
 #if FNX_27B

@@ -8,15 +8,16 @@
 // attention is dense. Every card computes the same selection from the same inputs.
 namespace {
 
-constexpr int QSA_POOL = 4, QSA_TOP = 2048 / QSA_POOL, QSA_DIM = QSA_KEY, QSA_ROT = NROT;
-constexpr int QSA_ROWS = QSA_HEADS * QSA_DIM + QSA_DIM;   // the projection's rows: q (4 heads), then k
+constexpr int QSA_POOL = 4, QSA_TOP = QSA_TOP_K / QSA_POOL, QSA_DIM = QSA_KEY, QSA_ROT = NROT;
+static_assert(QSA_DIM % 16 == 0 && QSA_ROT <= QSA_DIM, "the score tiles take QSA_DIM in sixteens and the rotary must fit a key");
+constexpr int QSA_ROWS = QSA_HEADS * QSA_DIM + QSA_DIM;   // the projection's rows: q (QSA_HEADS heads), then k
 
 constexpr int QSA_MAXSEL = QSA_TOP * QSA_POOL + QSA_POOL - 1;
 
 __device__ __forceinline__ float bf16f(uint16_t h) { return __uint_as_float((unsigned) h << 16); }
 
-// y[t][r] = W_r . x[t] for the QSA_ROWS rows (r < 512: wq row r, else wk row r - 512), bf16 weights, f32 activations;
-// a warp per row
+// y[t][r] = W_r . x[t] for the QSA_ROWS rows (r < QSA_HEADS * QSA_DIM: wq row r, else wk row r - that many), bf16 weights,
+// f32 activations; a warp per row
 template <int T>
 __global__ void __launch_bounds__(256) k_idx_proj(const uint16_t* __restrict__ wq, const uint16_t* __restrict__ wk,
                                                  const float* __restrict__ x, float* __restrict__ y) {

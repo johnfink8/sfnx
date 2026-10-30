@@ -763,7 +763,13 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
             w.hc_up[h] = up.q8split(L(l, (std::string(hp[h]) + "up.weight").c_str()));
             w.hc_inj[h] = up.bf16(L(l, (std::string(hp[h]) + "inject.weight").c_str()));
         }
-        w.router = up.f32_cat(L(l, "ffn_gate_inp.weight"), L(l, "ffn_gate_inp_shexp.weight"), N);
+        const Tensor& gi = L(l, "ffn_gate_inp.weight");
+        const Tensor& gs = L(l, "ffn_gate_inp_shexp.weight");
+        if (gi.ne[1] != NEXP || gs.ne[1] != 1)
+            throw std::runtime_error("fnx: " + gi.name + " holds " + std::to_string(gi.ne[1]) + " rows and " + gs.name + " " +
+                                     std::to_string(gs.ne[1]) + ", not the " + std::to_string(NEXP) +
+                                     " gate rows and 1 shared row k_router_route reads");
+        w.router = up.f32_cat(gi, gs, N);
         if (!is_attn(l)) {
             w.qkvz = up.dense(up.rows2(L(l, "attn_qkv.weight"), conv_rows, L(l, "attn_gate.weight"), zrows));
             w.ab = up.f32_rows2(L(l, "ssm_alpha.weight"), L(l, "ssm_beta.weight"), vheads, N);
@@ -786,10 +792,11 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
             w.k_norm = up.f32(L(l, "attn_k_norm.weight"), HD);
             const Tensor& iq = L(l, "indexer.q_proj.weight");
             const Tensor& ik = L(l, "indexer.k_proj.weight");
-            if (iq.ne[1] != QSA_HEADS * QSA_KEY || ik.ne[1] != QSA_KEY)
-                throw std::runtime_error("fnx: layer " + std::to_string(l) + "'s indexer projections hold " + std::to_string(iq.ne[1]) +
-                                         " and " + std::to_string(ik.ne[1]) + " rows, not the " + std::to_string(QSA_HEADS * QSA_KEY) +
-                                         " and " + std::to_string(QSA_KEY) + " k_idx_proj reads");
+            if (iq.ne[1] != QSA_HEADS * QSA_KEY || iq.ne[0] != N || ik.ne[1] != QSA_KEY || ik.ne[0] != N)
+                throw std::runtime_error("fnx: " + iq.name + " is " + std::to_string(iq.ne[0]) + " by " + std::to_string(iq.ne[1]) +
+                                         " and " + ik.name + " is " + std::to_string(ik.ne[0]) + " by " + std::to_string(ik.ne[1]) +
+                                         ", not the " + std::to_string(N) + " by " + std::to_string(QSA_HEADS * QSA_KEY) + " and " +
+                                         std::to_string(N) + " by " + std::to_string(QSA_KEY) + " k_idx_proj reads");
             w.idx_wq = up.bf16(iq);
             w.idx_wk = up.bf16(ik);
             w.idx_qn = up.f32(L(l, "indexer.q_norm.weight"), QSA_KEY);
@@ -807,7 +814,7 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
             c.ple_norm_query = up.f32(L(l, "ple_norm_query.weight"), D);
             c.ple_norm_conv = up.f32(L(l, "ple_norm_conv.weight"), D);
             const Tensor& pc = L(l, "ple_conv1d.weight");   // k_ple_conv reads w[ch * 4 + k]: 4 a row, D of them
-            if (pc.ne[0] != 4 || pc.ne[1] != (size_t) D)
+            if (pc.ne[0] != 4 || pc.ne[1] != D)
                 throw std::runtime_error("fnx: ple_conv1d.weight is " + std::to_string(pc.ne[0]) + " by " + std::to_string(pc.ne[1]) +
                                          ", not the 4 by " + std::to_string(D) + " k_ple_conv reads");
             c.ple_conv = up.f32(pc, 4 * D);
@@ -1039,9 +1046,9 @@ void load_mtp_card(const Model& m, const MtpFiles& f, const CardW& c, const std:
     w.q_norm = up.f32(f["self_attn.q_norm.weight"], HD);
     w.k_norm = up.f32(f["self_attn.k_norm.weight"], HD);
     const Tensor& iqk = f["self_attn.indexer.index_qk_proj.weight"];
-    if (iqk.ne[1] != (QSA_HEADS + 1) * QSA_KEY)
-        throw std::runtime_error("mtp: the indexer qk projection holds " + std::to_string(iqk.ne[1]) + " rows, not the " +
-                                 std::to_string((QSA_HEADS + 1) * QSA_KEY) + " (queries then key) it reads");
+    if (iqk.ne[1] != (QSA_HEADS + 1) * QSA_KEY || iqk.ne[0] != N)
+        throw std::runtime_error("mtp: " + iqk.name + " is " + std::to_string(iqk.ne[0]) + " by " + std::to_string(iqk.ne[1]) + ", not the " +
+                                 std::to_string(N) + " by " + std::to_string((QSA_HEADS + 1) * QSA_KEY) + " (queries then key) it reads");
     w.idx_qk = up.dense(up.rows(iqk, range(0, (QSA_HEADS + 1) * QSA_KEY)));
     w.idx_qn = up.f32(f["self_attn.indexer.q_layernorm.weight"], QSA_KEY);
     w.idx_kn = up.f32(f["self_attn.indexer.k_layernorm.weight"], QSA_KEY);
@@ -1136,7 +1143,7 @@ Mtp::Mtp(const Model& m, const std::string& dir, const std::string& vocab_file) 
                                      " of its " + std::to_string((long long) stb.st_size) + " bytes");
         if (vocab.empty()) throw std::runtime_error("mtp: " + vf + " is empty");
         for (int id2 : vocab)
-            if (id2 < 0 || id2 >= m.vocab) throw std::runtime_error("mtp: draft_vocab.bin holds a token outside the vocabulary");
+            if (id2 < 0 || id2 >= m.vocab) throw std::runtime_error("mtp: " + vf + " holds a token outside the vocabulary");
     }
     const MtpFiles files(dir);
     cards.resize(NCARD);
@@ -1191,7 +1198,9 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
         g.i(p + "ssm.group_count") != NKH || g.i(p + "ssm.time_step_rank") != NVH || g.i(p + "attention.head_count") != NQH ||
         g.i(p + "attention.head_count_kv") != NKVH || g.i(p + "hyper_connection.count") != HC ||
         g.i(p + "hyper_connection.low_rank") != LR || g.i(p + "expert_feed_forward_length") != FF ||
-        g.i(p + "attention.indexer.head_count") != QSA_HEADS || g.i(p + "attention.indexer.key_length") != QSA_KEY)
+        g.i(p + "attention.indexer.head_count") != QSA_HEADS || g.i(p + "attention.indexer.key_length") != QSA_KEY ||
+        g.i(p + "attention.indexer.top_k") != QSA_TOP_K || g.i(p + "expert_used_count") != TOPK ||
+        g.i(p + "rope.dimension_count") != NROT)
         throw std::runtime_error("fnx: this GGUF's geometry is not Flash-Next's");
     // the shared expert is split by the routed experts' ff ranges (CardW ff0, ff1)
     for (int l = 0; l < NL; ++l) {
@@ -1242,6 +1251,22 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
     for (int64_t v : g.ia(p + "ple.layer_multipliers")) ple_mult.push_back((uint64_t) v);
     for (int64_t v : g.ia(p + "ple.head_offsets")) ple_off.push_back((uint64_t) v);
     for (int64_t v : g.ia(p + "ple.head_vocab_sizes")) ple_vocab.push_back((uint64_t) v);
+    // the gather reads ple_mult[0..2] and a head h at mixed % ple_vocab[h] + ple_off[h]: the arrays must be that long
+    // and every head's range must stay inside the table, or the gather reads rows (or zero-modulo) the metadata invented
+    if (ple_mult.size() != 3 || ple_off.size() != PLE_HEADS || ple_vocab.size() != PLE_HEADS)
+        throw std::runtime_error("fnx: the PLE metadata holds " + std::to_string(ple_mult.size()) + " multipliers and " +
+                                 std::to_string(ple_off.size()) + " offsets and " + std::to_string(ple_vocab.size()) +
+                                 " vocab sizes, want 3 and " + std::to_string(PLE_HEADS) + " and " + std::to_string(PLE_HEADS));
+    {
+        uint64_t top = 0;
+        for (int h = 0; h < PLE_HEADS; ++h) {
+            if (!ple_vocab[h]) throw std::runtime_error("fnx: PLE head " + std::to_string(h) + " has an empty vocabulary");
+            top = std::max(top, ple_off[h] + ple_vocab[h]);
+        }
+        const int64_t rows = g.t("blk." + std::to_string(PLE_LAYER) + ".ple_key.weight").ne[1];
+        if (top > (uint64_t) rows)
+            throw std::runtime_error("fnx: a PLE head reaches row " + std::to_string(top) + ", past the table's " + std::to_string(rows));
+    }
     ple_eos = g.i(p + "ple.eos_token_id");
     ple_image = g.i(p + "ple.image_token_id");
 #endif
