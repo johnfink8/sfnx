@@ -115,9 +115,10 @@ Its logits are held to the widest gap between llama.cpp's own ways of running th
 with and without int8 products of quantized activations), a bar 4–30x tighter than Flash-Next's. Code, the edit and
 the picture are within it, with top-1 agreement of 100% / 100% / 99.5%; the 62k prompt agrees on every top-1 and sits
 at 1.27x its KL. llama.cpp decodes the 27B Q8_0 at ~24 tok/s on this box, one request. On two of these cards
-(`make FNX_MODEL=27b FNX_NCARD=2`) sFNX decodes the code edit at 255, new code at 133 and prose at 88 tok/s;
-1Cat-vLLM run on the same two cards with the same prompts (NVFP4, 31% fewer bytes, with its DFlash2 drafts) gives 252,
-184 and 78, and reads a 62k prompt at 1,427 tok/s against sFNX's 1,511. Details:
+(`make FNX_MODEL=27b FNX_NCARD=2`) sFNX decodes the code edit at 255, new code at 133 and prose at 88 tok/s.
+1Cat-vLLM run on the same two cards with the same prompts and its DFlash2 drafts gives 224, 150 and 69 on Qwen's FP8
+(the bytes of Q8_0), 252, 184 and 78 on NVFP4 (31% fewer), and reads a 62k prompt at 1,421–1,470 tok/s against
+sFNX's 1,511. Without drafts the two engines are within 7% (38.9 against 41.8 tok/s). Details:
 [docs/benchmarks.md](docs/benchmarks.md#qwen38-27b), [docs/verification.md](docs/verification.md#the-27b).
 
 ## Running it

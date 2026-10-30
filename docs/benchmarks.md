@@ -238,23 +238,28 @@ a card, 13.6 GB of weights a card a row), the same runs, 2026-10-29. GPUs 99% bu
 **The other engines, the same model.** llama.cpp (a37cc46, its layer split over the three cards) decodes ~24 tok/s, one
 request.
 
-1Cat-vLLM 1.5.1 run here on GPUs 1 and 2 with P2P (QUASAR NVFP4, 20 GB of weights against Q8_0's 29, with its DFlash2
-draft of 7 tokens; `quality-test/contenders/run-27b-1cat.sh` on the box), given the same token ids
-(`/v1/completions`; decode timed from the first token to the last, prose2 seeds 1-5 at prod's sampling with top-k
-20), 2026-10-29. GPUs 98% busy, 161 W a card.
+1Cat-vLLM 1.5.1 run here on GPUs 1 and 2 with P2P (`quality-test/contenders/run-27b-1cat.sh` on the box, its model
+taken from `MODEL`), given the same token ids (`/v1/completions`; decode timed from the first token to the last,
+prose2 seeds 1-5 at prod's sampling with top-k 20), 2026-10-29: Qwen's own FP8 checkpoint (`Qwen/Qwen3.8-27B-FP8`,
+29 GB, the bytes of Q8_0's 29 GB), with its DFlash2 draft of 7 tokens and without, and the QUASAR NVFP4 checkpoint
+(20 GB) with DFlash2. GPUs 98–100% busy, 161–165 W a card.
 
-| | 1Cat, two cards | sFNX, two cards | sFNX, three |
-| --- | --- | --- | --- |
-| Code edit, greedy (both stop at token 636) | 252.3 | 255.2 | 317.9 |
-| New code, greedy | 184.1 | 133.4 | 156.9 |
-| Prose reasoning, temperature 0.6 | 77.5 | 88.3 | 114.0 |
-| One lane of `ref/long2`, greedy, with drafts | 77.9 | 85.5 | 107.7 |
-| Prompt: 8,192 / 32,768 / 62,794 tokens | 1,756 / 1,618 / 1,427 | 2,098 / 1,796 / 1,511 | 2,435 / 2,264 / 1,965 |
+| | sFNX, two cards (Q8_0) | 1Cat FP8, DFlash2 | 1Cat FP8, no drafts | 1Cat NVFP4, DFlash2 | sFNX, three |
+| --- | --- | --- | --- | --- | --- |
+| Code edit, greedy (every run stops at token 636) | 255.2 | 223.9 | 38.9 | 252.3 | 317.9 |
+| New code, greedy | 133.4 | 150.4 | 38.9 | 184.1 | 156.9 |
+| Prose reasoning, temperature 0.6 | 88.3 | 68.8 | 38.0 | 77.5 | 114.0 |
+| One token a window, no drafts | 41.8 | | 38.9 | | 53.8 |
+| One lane of `ref/long2`, greedy, with drafts | 85.5 | | | 77.9 | 107.7 |
+| Prompt: 8,192 / 32,768 / 62,794 tokens | 2,098 / 1,796 / 1,511 | 1,728 / 1,603 / 1,421 | 1,792 / 1,679 / 1,470 | 1,756 / 1,618 / 1,427 | 2,435 / 2,264 / 1,965 |
 
-Its drafts carry new code further (3.2–3.4 tokens a step); sFNX reads ~45% more bytes a token. Several lanes at once
-were not measured alike: 1Cat reads the lanes' prompts in turn, so batch_test's 64-token lanes barely overlap. Its
-own numbers: FP8 on two cards 69–73 tok/s without drafts, 222–225 at six lanes with NVFP4 and DFlash2. 1Cat cannot
-split the 27B's 4 KV heads over three cards.
+At the same bytes (FP8 against Q8_0) the engines alone are within 7% (41.8 against 38.9 tok/s); the drafts make the
+rest. sFNX's lookup drafts take the code edit, its draft layer the prose; DFlash2 takes new code. NVFP4's fewer bytes
+lift 1Cat on every decode row. Its DFlash2 accepted 2.6–3.4 tokens a step over these runs together (its log does not
+split them by prompt). Several lanes at once were not measured alike: 1Cat reads the lanes' prompts in turn, so
+batch_test's 64-token lanes barely overlap. Its own published numbers, which this box does not reproduce: FP8 on two
+cards 69–73 tok/s without drafts; 222–225 at six lanes with NVFP4 and DFlash2. 1Cat cannot split the 27B's 4 KV heads
+over three cards.
 
 ## The reference implementation on the same cards
 
