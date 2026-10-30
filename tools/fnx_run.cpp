@@ -37,6 +37,8 @@
 
 #include "../src/engine.hpp"
 #include "batch_check.hpp"
+#include "ref_tokens.hpp"
+#include "../src/env.hpp"
 
 // the draft layer's runtime: Flash-Next's files, or the 27B's own layer in its GGUF (Mtp's "nextn")
 #if FNX_27B
@@ -44,8 +46,6 @@
 #else
 #define MTP_RT FNX_DIR "/data/mtp-rt"
 #endif
-#include "ref_tokens.hpp"
-#include "../src/env.hpp"
 
 // timings: the middle value, and the p-quantile at index p * (n - 1)
 static double pct(std::vector<double> v, double p) {
@@ -1170,6 +1170,7 @@ extern "C" int fnx_run_cmd(fnx::Model* model, int argc, char** argv) {
             std::fwrite(&nd, 4, 1, out);
             std::fwrite(ne, 8, 2, out);
             std::fwrite(v.data(), 4, v.size(), out);
+            if (std::ferror(out)) throw std::runtime_error("check: OUT.bin write failed");
         };
         std::vector<int> next;
         for (size_t i = 0; i < toks.size(); i += W) {

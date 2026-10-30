@@ -25,7 +25,10 @@ if len(sys.argv) != 3:
     raise SystemExit(__doc__)
 ref = {}
 for name, a in records(sys.argv[1]):
-    ref.setdefault(name, a.reshape(-1, a.shape[-1]).astype(np.float64))
+    rows = a.reshape(-1, a.shape[-1]).astype(np.float64)
+    if name in ref:
+        raise SystemExit(f"{sys.argv[1]}: duplicate reference record {name}")
+    ref[name] = rows
 got = {}
 for name, a in records(sys.argv[2]):
     got.setdefault(name, []).append(a.reshape(-1, a.shape[-1]))
@@ -70,8 +73,10 @@ for name in sorted(got, key=order):
     if r.shape[1] != x.shape[1]:
         fails.append(f"{name}: width {x.shape[1]} against the reference's {r.shape[1]}")
         continue
-    n = min(len(x), len(r))
-    x, r = x[:n], r[:n]
+    if len(x) != len(r):  # a dump missing whole rows compares its green prefix and passes: that is the truncation
+        fails.append(f"{name}: dump has {len(x)} rows against the reference's {len(r)}")
+        continue
+    n = len(x)
     cos = float((x * r).sum() / (np.linalg.norm(x) * np.linalg.norm(r) + 1e-30))
     rel = float(np.sqrt(((x - r) ** 2).mean() / ((r**2).mean() + 1e-30)))
     print(f"{name:24s} rows {n:5d}  cos {cos:.6f}  rel {rel:.2e}")
