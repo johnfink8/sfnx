@@ -50,7 +50,11 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "s27: prompt read in %.2f s (%.0f tok/s)\n", std::chrono::duration<double>(t2 - t1).count(),
                  (prompt.size() - 1) / std::chrono::duration<double>(t2 - t1).count());
 
-    if (const char* bs = std::getenv("S27_BENCH"); bs && !std::strcmp(bs, "1")) {
+    long long bench = 0;
+    if (const char* bs = std::getenv("S27_BENCH")) {
+        if (!parse_whole(bs, bench) || bench < 0) throw std::runtime_error(std::string("S27_BENCH: on/off as a whole number, not '") + bs + "'");
+    }
+    if (bench) {
         for (int T : {1, 2, 3, 4, 5, 6, 8, 12, 16}) {
             std::vector<double> ms, card[NCARD];
             for (int r = 0; r < 15; ++r) {
@@ -123,14 +127,13 @@ int main(int argc, char** argv) {
         draft_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc).count();
     }
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t3).count();
-    if (!rounds) {   // GEN 0: the prompt-path benchmark mode (docs/benchmarks.md "Prompts"): nothing was generated
+    if (rounds)
+        std::printf("decode: %zu tokens in %.0f ms, %.1f tok/s, %.2f tokens a round, %.2f ms a round (verify gpu %.2f, drafting %.2f), "
+                    "drafts %ld of %ld, %d of %d rounds lookup\n",
+                    out.size(), ms, out.size() * 1000.0 / ms, (double) out.size() / rounds, ms / rounds, gpu_ms / rounds, draft_ms / rounds,
+                    accepted, offered, lookup_rounds, rounds);
+    else   // GEN 0: the prompt-path benchmark mode (docs/benchmarks.md "Prompts"): nothing was generated
         std::printf("decode: GEN 0, nothing generated (%.0f ms past the prompt)\n", ms);
-        return 0;
-    }
-    std::printf("decode: %zu tokens in %.0f ms, %.1f tok/s, %.2f tokens a round, %.2f ms a round (verify gpu %.2f, drafting %.2f), "
-                "drafts %ld of %ld, %d of %d rounds lookup\n",
-                out.size(), ms, out.size() * 1000.0 / ms, (double) out.size() / rounds, ms / rounds, gpu_ms / rounds, draft_ms / rounds,
-                accepted, offered, lookup_rounds, rounds);
     if (argc > 6) {
         std::FILE* f = std::fopen(argv[6], "w");
         if (!f) throw std::runtime_error(std::string(argv[6]) + ": cannot write");

@@ -42,6 +42,14 @@ int main(int argc, char** argv) {
         Ts.push_back((int) T);
     }
     if (Ts.empty()) Ts = {1, 2, 3, 4, 6, 8, 12, 16};
+    // S27_PF_MB=m: beside each matrix, the first m MB of the next pulled into L2 on a second stream
+    double pf_mb = 0;
+    if (const char* v = std::getenv("S27_PF_MB")) {
+        if (!parse_number(v, pf_mb) || pf_mb < 0) {
+            std::fprintf(stderr, "s27_probe: S27_PF_MB: want MB 0 or more, not '%s'\n", v);
+            return 2;
+        }
+    }
     // card 0's slice: KH0 of the key heads, VH0 of the value heads, its FF blocks, S27_NQ query heads and the S27_NKV KV
     // heads they read
     std::vector<Mat> mats;
@@ -59,7 +67,14 @@ int main(int argc, char** argv) {
     mats.push_back({VOCAB / NCARD + 1, N});                      // output head
     // S27_PROBE_ONE=1: the same bytes as a few 2 GB matrices (the kernel's rate without the boundaries between the
     // window's 257; one matrix would pass q8s's 32-bit offsets)
-    if (std::getenv("S27_PROBE_ONE")) {
+    long long one = 0;
+    if (const char* v = std::getenv("S27_PROBE_ONE")) {
+        if (!parse_whole(v, one)) {
+            std::fprintf(stderr, "s27_probe: S27_PROBE_ONE: on/off as a whole number, not '%s'\n", v);
+            return 2;
+        }
+    }
+    if (one) {
         double b0 = 0;
         for (auto& m : mats) b0 += (double) m.rows * m.cols;
         const int rows = (int) (b0 / N), step = 400000;
@@ -106,14 +121,6 @@ int main(int argc, char** argv) {
             ck(cudaSetDevice(c), "set");
             cudaGraph_t g;
             ck(cudaStreamBeginCapture(st[c], cudaStreamCaptureModeThreadLocal), "capture");
-            // S27_PF_MB=m: beside each matrix, the first m MB of the next pulled into L2 on a second stream
-            static const double pf_mb = [] {
-                const char* v = std::getenv("S27_PF_MB");
-                if (!v) return 0.0;
-                double x = 0;
-                if (!parse_number(v, x) || x < 0) throw std::runtime_error(std::string("S27_PF_MB: MB above 0, not '") + v + "'");
-                return x;
-            }();
             static cudaStream_t st2[NCARD];
             static cudaEvent_t fork[NCARD], join[NCARD];
             if (pf_mb > 0 && !st2[c]) {

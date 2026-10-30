@@ -172,7 +172,15 @@ static int run_logits(fnx::Model& m, fnx::Engine& e, const char* prompt_path, co
         e.window(w);
         put_rows(e.last_logits((int) w.size()), vocab, 0, (int) w.size());
     }
-    std::fclose(out);
+    if (std::ferror(out)) {
+        std::fclose(out);
+        std::fprintf(stderr, "logits: %s: a write failed\n", out_path);
+        return 1;
+    }
+    if (std::fclose(out) != 0) {
+        std::fprintf(stderr, "logits: %s: close failed (a buffered write did not reach the disk)\n", out_path);
+        return 1;
+    }
     std::fprintf(stderr, "logits: %d prompt tokens, %d steps in windows of %d\n", np, written, T);
     return 0;
 }
@@ -1161,7 +1169,10 @@ extern "C" int fnx_run_cmd(fnx::Model* model, int argc, char** argv) {
         std::FILE* out = std::fopen(argv[4], "wb");
         if (!out) { std::perror(argv[4]); return 1; }
         const std::string out_path = argv[4];
-        const int W = argc > 5 ? std::atoi(argv[5]) : 5;
+        long long w_in = 5;
+        if (argc > 5 && (!fnx::parse_whole(argv[5], w_in) || w_in < 1 || w_in > fnx::MAXT))
+            throw std::runtime_error("check: window: want a whole number of rows 1.." + std::to_string(fnx::MAXT) + ", got '" + std::string(argv[5]) + "'");
+        const int W = (int) w_in;
         e.dump = [&](const std::string& name, int layer, int T, int n, const std::vector<float>& v) {
             const std::string full = layer >= 0 ? name + "-" + std::to_string(layer) : name;
             const uint32_t nl = (uint32_t) full.size(), nd = 2;
