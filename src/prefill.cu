@@ -483,9 +483,7 @@ __global__ void k_pfr_addend(float* __restrict__ x, const float* __restrict__ pa
 }
 
 
-// one direction's sum of x (C rows of N) over the cards, on stream s; this card is at position g of the direction's
-// ring (its next card: g + 1 there), by the steps of r.plan — pf_ring_run runs them (pf_common.cuh and
-// pf_ring_plan.hpp describe the algorithm)
+// one direction's sum on stream s, this card at ring position g: pf_ring_run (pf_common.cuh) runs r.plan
 void pf_ring_dir(Engine::PfRing& r, int dev, int g, float* x, int C, unsigned seq, unsigned* err, cudaStream_t s) {
     pf_ring_run(r, dev, g, x, C, seq, err, s);
 }

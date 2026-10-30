@@ -1,6 +1,6 @@
 // The prompt path's copy-engine ring plan (src/pf_ring_plan.hpp), on the CPU alone:
-//   1. two and three cards: the plan is exactly the step sequence prefill.cu ran for them as hand-written code (written
-//      out below), for every card;
+//   1. two and three cards: the plan is exactly the step sequence pf_ring_run (pf_common.cuh) runs for them, written
+//      out below, for every card;
 //   2. every count card_split.hpp allows: the n cards' plans run against each other for several sums in a row, over
 //      the two buffer sets and the sequence-numbered flags the streams use, in many random interleavings: every sum's
 //      parts hold every card's addend once, nothing is read on a card before the flag that covers it for that sum, no

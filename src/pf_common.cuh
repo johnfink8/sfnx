@@ -33,7 +33,8 @@ inline void cud(CUresult e, const char* what) {
     }
 }
 
-// the prompt path's allocations on the card being set up; the engine saves and restores it around its own ones
+// the prompt path's allocations on the card being set up: reset per card as it is built; Flash-Next's later stages
+// save and restore it around their own, and the 27B allocates nothing after prefill_alloc
 inline size_t pf_card_bytes = 0;
 // a buffer of n T's, zeroed and owned. A failure names the card, what is free there and what the prompt path already
 // holds: which of the two this allocation died between is the whole question when the pool is sized from free VRAM

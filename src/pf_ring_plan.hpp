@@ -34,7 +34,7 @@ struct PfRingOp {
 constexpr int pf_ring_steps(int n) { return 2 * n - 2 > 4 ? 2 * n - 2 : 4; }
 
 // card g's steps; every op's part is in [0, n), hop in [0, n - 1) and step in [0, pf_ring_steps(n)) where it has one, so
-// prefill.cu indexes its slots and flags with them unchecked
+// pf_ring_run indexes its slots and flags with them unchecked
 inline std::vector<PfRingOp> pf_ring_plan(int n, int g) {
     if (n < 2 || g < 0 || g >= n)
         throw std::invalid_argument("pf_ring_plan: card " + std::to_string(g) + " of " + std::to_string(n) + " (2 cards at least)");
