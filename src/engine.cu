@@ -25,6 +25,10 @@ namespace fnx {
 
 
 Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
+    // the 27B build's settings: this Flash-Next engine has none of what they set, so one given is a mistake, not a
+    // run of the default
+    for (const char* k : {"FNX_PF_SKIP", "FNX_PF_SKIP_CONFIRM", "FNX_PF_SCORE_MIB", "FNX_KV_PAGES", "FNX_KV_RESERVE_MIB"})
+        if (std::getenv(k)) throw std::runtime_error(std::string(k) + " is the 27B's: Flash-Next has nothing it sets");
     // the rotary's scaling (choose_rope, src/rope.hpp): the model's own YaRN, FNX_ROPE_SCALE / FNX_YARN_ORIG_CTX, or
     // both when they agree; set once here, before any graph capture. Positions past what the rotary covers have angles
     // the model never saw, so a context past that is refused here rather than served
