@@ -9,7 +9,8 @@
 namespace {
 
 constexpr int QSA_POOL = 4, QSA_TOP = QSA_TOP_K / QSA_POOL, QSA_DIM = QSA_KEY, QSA_ROT = NROT;
-static_assert(QSA_DIM % 16 == 0 && QSA_ROT <= QSA_DIM, "the score tiles take QSA_DIM in sixteens and the rotary must fit a key");
+static_assert(QSA_DIM % 16 == 0 && QSA_ROT <= QSA_DIM && QSA_TOP_K % QSA_POOL == 0,
+              "the score tiles take QSA_DIM in sixteens, the rotary must fit a key, and top_k must divide into whole pools");
 constexpr int QSA_ROWS = QSA_HEADS * QSA_DIM + QSA_DIM;   // the projection's rows: q (QSA_HEADS heads), then k
 
 constexpr int QSA_MAXSEL = QSA_TOP * QSA_POOL + QSA_POOL - 1;
