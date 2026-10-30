@@ -8,7 +8,7 @@
 // attention is dense. Every card computes the same selection from the same inputs.
 namespace {
 
-constexpr int QSA_POOL = 4, QSA_TOP = 2048 / QSA_POOL, QSA_HEADS = 4, QSA_DIM = 128, QSA_ROT = NROT;
+constexpr int QSA_POOL = 4, QSA_TOP = 2048 / QSA_POOL, QSA_DIM = QSA_KEY, QSA_ROT = NROT;
 constexpr int QSA_ROWS = QSA_HEADS * QSA_DIM + QSA_DIM;   // the projection's rows: q (4 heads), then k
 
 constexpr int QSA_MAXSEL = QSA_TOP * QSA_POOL + QSA_POOL - 1;

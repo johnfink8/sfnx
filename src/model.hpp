@@ -41,9 +41,11 @@ constexpr int NKH = 16, NVH = 48, HS = 128;            // recurrent: key heads, 
 constexpr int NQH = 24, NKVH = 2, HD = 256, NROT = 64; // attention
 #endif
 constexpr int MAXT = 16;                               // rows per window
-// the indexer's key width (kernels.hpp: ring and pooled rows of 128). The draft layer's loader is shared code, so it
-// stands outside the model block even though only Flash-Next has an indexer
+// the indexer's key width: qsa.cuh's QSA_DIM is defined from this, tying the loader's checks to what k_idx_proj and
+// the pooled rows read (kernels.hpp holds the same 128 in its ring and pooled rows). The draft layer's loader is
+// shared code, so these stand outside the model block even though only Flash-Next has an indexer
 constexpr int QSA_KEY = 128;
+constexpr int QSA_HEADS = 4;                             // indexer query heads: the qk projection is QSA_HEADS + 1 of these
 // the hc read's grid (src/hc.cuh's H_BLOCKS, held to this there): every block resident at once, one an SM, so a card
 // with fewer SMs is refused at load (src/card_check.hpp)
 #if FNX_27B
