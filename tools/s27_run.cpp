@@ -35,6 +35,10 @@ int main(int argc, char** argv) {
     const int gen = arg(3, "GEN", 0, 1 << 20, 0);
     const int K = arg(4, "K", 0, MAXT - 1, 4);
     const int LK = arg(5, "LOOKUP", 0, MAXT - 1, 15), LNG = 3;
+    long long bench = 0;   // S27_BENCH: the window-size sweep instead of decode; a whole number, on when not 0
+    if (const char* bs = std::getenv("S27_BENCH")) {
+        if (!parse_whole(bs, bench)) throw std::runtime_error(std::string("S27_BENCH: on/off as a whole number, not '") + bs + "'");
+    }
     if (prompt.size() < 2) throw std::runtime_error("the prompt needs two tokens or more");
     const int ctx_len = std::max(32768, (int) prompt.size() + gen + 64);
     const char* dv = std::getenv("S27_DRAFT_VOCAB");
@@ -50,10 +54,12 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "s27: prompt read in %.2f s (%.0f tok/s)\n", std::chrono::duration<double>(t2 - t1).count(),
                  (prompt.size() - 1) / std::chrono::duration<double>(t2 - t1).count());
 
-    long long bench = 0;
-    if (const char* bs = std::getenv("S27_BENCH")) {
-        if (!parse_whole(bs, bench) || bench < 0) throw std::runtime_error(std::string("S27_BENCH: on/off as a whole number, not '") + bs + "'");
-    }
+    auto write_ids = [&](const std::vector<int>& ids) {
+        std::FILE* f = std::fopen(argv[6], "w");
+        if (!f) throw std::runtime_error(std::string(argv[6]) + ": cannot write");
+        for (int t : ids) std::fprintf(f, "%d\n", t);
+        if (std::fclose(f) != 0) throw std::runtime_error(std::string(argv[6]) + ": close failed (a buffered write did not reach the disk)");
+    };
     if (bench) {
         for (int T : {1, 2, 3, 4, 5, 6, 8, 12, 16}) {
             std::vector<double> ms, card[NCARD];
@@ -71,6 +77,7 @@ int main(int argc, char** argv) {
             }
             std::printf(")\n");
         }
+        if (argc > 6) write_ids(std::vector<int>{});   // the sweep generates nothing: the file says so, as with GEN 0
         return 0;
     }
     std::vector<int> ctx(prompt), out;
@@ -121,7 +128,7 @@ int main(int argc, char** argv) {
             out.push_back(o[i]);
             ctx.push_back(o[i]);
         }
-        if (o[a] == 248046 || o[a] == 248044) break;   // eos
+        if (o[a] == 248046 || o[a] == 248044) break;   // eos or the BOS id
         const auto tc = std::chrono::steady_clock::now();
         if (K) d1 = e.draft(a + 1, true, 0, std::vector<int>(o.begin(), o.begin() + a + 1), p), d1_row = a;
         draft_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc).count();
@@ -134,11 +141,6 @@ int main(int argc, char** argv) {
                     accepted, offered, lookup_rounds, rounds);
     else   // GEN 0: the prompt-path benchmark mode (docs/benchmarks.md "Prompts"): nothing was generated
         std::printf("decode: GEN 0, nothing generated (%.0f ms past the prompt)\n", ms);
-    if (argc > 6) {
-        std::FILE* f = std::fopen(argv[6], "w");
-        if (!f) throw std::runtime_error(std::string(argv[6]) + ": cannot write");
-        for (int t : out) std::fprintf(f, "%d\n", t);
-        if (std::fclose(f) != 0) throw std::runtime_error(std::string(argv[6]) + ": close failed (a buffered write did not reach the disk)");
-    }
+    if (argc > 6) write_ids(out);
     return 0;
 }

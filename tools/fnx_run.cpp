@@ -1166,13 +1166,13 @@ extern "C" int fnx_run_cmd(fnx::Model* model, int argc, char** argv) {
     const std::vector<int> toks = ref_tokens(argv[3]);
     if (mode == "check") {
         if (argc < 5) { std::fprintf(stderr, "check needs REF.bin OUT.bin [W]\n"); return 2; }
-        std::FILE* out = std::fopen(argv[4], "wb");
-        if (!out) { std::perror(argv[4]); return 1; }
-        const std::string out_path = argv[4];
         long long w_in = 5;
         if (argc > 5 && (!fnx::parse_whole(argv[5], w_in) || w_in < 1 || w_in > fnx::MAXT))
             throw std::runtime_error("check: window: want a whole number of rows 1.." + std::to_string(fnx::MAXT) + ", got '" + std::string(argv[5]) + "'");
         const int W = (int) w_in;
+        std::FILE* out = std::fopen(argv[4], "wb");
+        if (!out) { std::perror(argv[4]); return 1; }
+        const std::string out_path = argv[4];
         e.dump = [&](const std::string& name, int layer, int T, int n, const std::vector<float>& v) {
             const std::string full = layer >= 0 ? name + "-" + std::to_string(layer) : name;
             const uint32_t nl = (uint32_t) full.size(), nd = 2;
