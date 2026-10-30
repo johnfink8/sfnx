@@ -577,8 +577,11 @@ struct Up {
         return w;
     }
     // f32 tensors' rows one after another
-    float* f32_cat(const Tensor& t1, const Tensor& t2) {
+    float* f32_cat(const Tensor& t1, const Tensor& t2, size_t row_floats) {
         if (t1.type != T_F32 || t2.type != T_F32 || t1.ne[0] != t2.ne[0]) throw std::runtime_error(t1.name + " and " + t2.name + " do not stack");
+        if ((size_t) t1.ne[0] != row_floats)
+            throw std::runtime_error(t1.name + " is " + std::to_string(t1.ne[0]) + " floats a row, not the " + std::to_string(row_floats) +
+                                     " its reader takes");
         std::vector<float> h((const float*) t1.data, (const float*) t1.data + t1.ne[0] * t1.ne[1]);
         h.insert(h.end(), (const float*) t2.data, (const float*) t2.data + t2.ne[0] * t2.ne[1]);
         return put<float>(h.data(), h.size() * 4);
@@ -759,12 +762,12 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
         const char** hd = host_experts ? hdn.data() + (size_t) l * NEXP : nullptr;
         const char* hp[2] = {"hc_attn_", "hc_ffn_"};
         for (int h = 0; h < 2; ++h) {
-            w.hc_norm[h] = up.f32(L(l, (std::string(hp[h]) + "norm.weight").c_str()));
+            w.hc_norm[h] = up.f32(L(l, (std::string(hp[h]) + "norm.weight").c_str()), D);
             w.hc_down[h] = up.q8split(L(l, (std::string(hp[h]) + "down.weight").c_str()));
             w.hc_up[h] = up.q8split(L(l, (std::string(hp[h]) + "up.weight").c_str()));
             w.hc_inj[h] = up.bf16(L(l, (std::string(hp[h]) + "inject.weight").c_str()));
         }
-        w.router = up.f32_cat(L(l, "ffn_gate_inp.weight"), L(l, "ffn_gate_inp_shexp.weight"));
+        w.router = up.f32_cat(L(l, "ffn_gate_inp.weight"), L(l, "ffn_gate_inp_shexp.weight"), N);
         if (!is_attn(l)) {
             w.qkvz = up.dense(up.rows2(L(l, "attn_qkv.weight"), conv_rows, L(l, "attn_gate.weight"), zrows));
             w.ab = up.f32_rows2(L(l, "ssm_alpha.weight"), L(l, "ssm_beta.weight"), vheads, N);
@@ -777,18 +780,18 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
             for (int h : vheads) { a.push_back(af[h]); dt.push_back(df[h]); }
             w.ssm_a = up.put<float>(a.data(), a.size() * 4);
             w.dt_bias = up.put<float>(dt.data(), dt.size() * 4);
-            w.ssm_norm = up.f32(L(l, "ssm_norm.weight"));
+            w.ssm_norm = up.f32(L(l, "ssm_norm.weight"), HS);
         } else {
             w.wq = up.dense(up.rows(L(l, "attn_q.weight"), qrows_all));
             w.wk = up.dense(up.rows(L(l, "attn_k.weight"), kvrows_all));
             w.wv = up.dense(up.rows(L(l, "attn_v.weight"), kvrows_all));
             w.wo = up.dense(up.cols(L(l, "attn_output.weight"), woblocks));
-            w.q_norm = up.f32(L(l, "attn_q_norm.weight"));
-            w.k_norm = up.f32(L(l, "attn_k_norm.weight"));
+            w.q_norm = up.f32(L(l, "attn_q_norm.weight"), HD);
+            w.k_norm = up.f32(L(l, "attn_k_norm.weight"), HD);
             w.idx_wq = up.bf16(L(l, "indexer.q_proj.weight"));
             w.idx_wk = up.bf16(L(l, "indexer.k_proj.weight"));
-            w.idx_qn = up.f32(L(l, "indexer.q_norm.weight"));
-            w.idx_kn = up.f32(L(l, "indexer.k_norm.weight"));
+            w.idx_qn = up.f32(L(l, "indexer.q_norm.weight"), QSA_KEY);
+            w.idx_kn = up.f32(L(l, "indexer.k_norm.weight"), QSA_KEY);
         }
         w.gu_e = up.expert_rows2(L(l, "ffn_gate_exps.weight"), L(l, "ffn_up_exps.weight"), c.ff0, c.ff1, w.gu_e_stride, hg);
         w.down_e = up.expert_cols(L(l, "ffn_down_exps.weight"), c.ff0 / 32, c.ff1 / 32, w.down_e_stride, hd);
@@ -798,14 +801,14 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
         if (l == PLE_LAYER) {
             c.ple_key = up.dense(up.rows(L(l, "ple_key.weight"), range(0, (int) L(l, "ple_key.weight").ne[1])));
             c.ple_value = up.dense(up.rows(L(l, "ple_value.weight"), range(0, (int) L(l, "ple_value.weight").ne[1])));
-            c.ple_norm_key = up.f32(L(l, "ple_norm_key.weight"));
-            c.ple_norm_query = up.f32(L(l, "ple_norm_query.weight"));
-            c.ple_norm_conv = up.f32(L(l, "ple_norm_conv.weight"));
-            c.ple_conv = up.f32(L(l, "ple_conv1d.weight"));
+            c.ple_norm_key = up.f32(L(l, "ple_norm_key.weight"), D);
+            c.ple_norm_query = up.f32(L(l, "ple_norm_query.weight"), D);
+            c.ple_norm_conv = up.f32(L(l, "ple_norm_conv.weight"), D);
+            c.ple_conv = up.f32(L(l, "ple_conv1d.weight"), 4 * D);   // conv width 4 across the D channels
         }
         st.done(l);
     }
-    c.head_norm = up.f32(st.t(NL, "output_hc_norm.weight"));
+    c.head_norm = up.f32(st.t(NL, "output_hc_norm.weight"), D);
     c.head_down = up.q8split(st.t(NL, "output_hc_down.weight"));
     c.head_up = up.q8split(st.t(NL, "output_hc_up.weight"));
     c.out = up.dense(up.rows(st.t(NL, "output.weight"), range(c.v0, c.v1)));
@@ -1002,7 +1005,7 @@ void load_mtp_card(const Model& m, const MtpFiles& f, const CardW& c, const std:
     const char* hp[2] = {"attn_hyper_connection.", "mlp_hyper_connection."};
     for (int h = 0; h < 2; ++h) {
         const std::string p = hp[h];
-        w.hc_norm[h] = up.f32(f[p + "hc_norm.weight"]);
+        w.hc_norm[h] = up.f32(f[p + "hc_norm.weight"], D);
         w.hc_down[h] = q8((p + "input_mix_weight_down.weight").c_str());
         w.hc_up[h] = q8((p + "input_mix_weight_up.weight").c_str());
         const Tensor& inj = f[p + "block_inject_weight.weight"];
@@ -1022,11 +1025,11 @@ void load_mtp_card(const Model& m, const MtpFiles& f, const CardW& c, const std:
     w.wk = up.dense(up.rows(f["self_attn.k_proj.weight"], kvrows_all));
     w.wv = up.dense(up.rows(f["self_attn.v_proj.weight"], kvrows_all));
     w.wo = up.dense(up.cols(f["self_attn.o_proj.weight"], woblocks));
-    w.q_norm = up.f32(f["self_attn.q_norm.weight"]);
-    w.k_norm = up.f32(f["self_attn.k_norm.weight"]);
+    w.q_norm = up.f32(f["self_attn.q_norm.weight"], HD);
+    w.k_norm = up.f32(f["self_attn.k_norm.weight"], HD);
     w.idx_qk = up.dense(up.rows(f["self_attn.indexer.index_qk_proj.weight"], range(0, 640)));
-    w.idx_qn = up.f32(f["self_attn.indexer.q_layernorm.weight"]);
-    w.idx_kn = up.f32(f["self_attn.indexer.k_layernorm.weight"]);
+    w.idx_qn = up.f32(f["self_attn.indexer.q_layernorm.weight"], QSA_KEY);
+    w.idx_kn = up.f32(f["self_attn.indexer.k_layernorm.weight"], QSA_KEY);
     w.gu_e = up.expert_rows2(f.gate, f.up, c.ff0, c.ff1, w.gu_e_stride);
     w.down_e = up.expert_cols(f.down, c.ff0 / 32, c.ff1 / 32, w.down_e_stride);
     w.sh_gu = up.dense(up.rows2(f["mlp.shared_expert.gate_proj.weight"], range(c.ff0, c.ff1), f["mlp.shared_expert.up_proj.weight"],
@@ -1034,9 +1037,9 @@ void load_mtp_card(const Model& m, const MtpFiles& f, const CardW& c, const std:
     w.sh_down = up.dense(up.cols(f["mlp.shared_expert.down_proj.weight"], range(c.ff0 / 32, c.ff1 / 32)));
     mc.fc_emb = up.dense(up.rows(f["fc_embedding.weight"], range(0, N)));
     mc.fc_hid = up.dense(up.rows(f["fc_hidden.weight"], range(0, N)));
-    mc.norm_emb = up.f32(f["pre_fc_norm_embedding.weight"]);
-    mc.norm_hid = up.f32(f["pre_fc_norm_hidden.weight"]);
-    mc.mix_norm = up.f32(f["hyper_connection_mixer.hc_norm.weight"]);
+    mc.norm_emb = up.f32(f["pre_fc_norm_embedding.weight"], N);
+    mc.norm_hid = up.f32(f["pre_fc_norm_hidden.weight"], D);
+    mc.mix_norm = up.f32(f["hyper_connection_mixer.hc_norm.weight"], D);
     mc.mix_down = q8("hyper_connection_mixer.input_mix_weight_down.weight");
     mc.mix_up = q8("hyper_connection_mixer.input_mix_weight_up.weight");
     std::vector<int> rows(vocab.begin() + mc.dv0, vocab.begin() + mc.dv1);
