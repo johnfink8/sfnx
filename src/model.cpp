@@ -226,6 +226,15 @@ struct Up {
         if (t.type != T_F32) throw std::runtime_error(t.name + " is not F32");
         return put<float>(t.data, t.nbytes);
     }
+    // a norm as the window reads it: exactly n floats. A tensor of another width would feed garbage rows silently;
+    // the whole tensor must match, so extra rows fail too (the window never reads them)
+    float* f32(const Tensor& t, size_t n) {
+        if (t.type != T_F32) throw std::runtime_error(t.name + " is not F32");
+        if (t.nbytes != n * 4)
+            throw std::runtime_error(t.name + " holds " + std::to_string(t.nbytes / 4) + " floats, not the " + std::to_string(n) +
+                                     " the window reads it at");
+        return put<float>(t.data, t.nbytes);
+    }
     // where a tensor's routed experts are assembled: with an ExpertCache (host_of) their mapped page-locked host copy,
     // else tmp
     uint8_t* expert_buf(size_t bytes, const char** host_of, std::vector<uint8_t>& tmp) {
@@ -344,8 +353,11 @@ struct Up {
         return t.data + (size_t) r * row_bytes;
     }
     // rows `rows` of a 2-D F32 tensor (ne1 indexes rows)
-    float* f32_rows(const Tensor& t, const std::vector<int>& rows) {
+    float* f32_rows(const Tensor& t, const std::vector<int>& rows, size_t row_floats) {
         if (t.type != T_F32) throw std::runtime_error(t.name + " is not F32");
+        if ((size_t) t.ne[0] != row_floats)
+            throw std::runtime_error(t.name + " is " + std::to_string(t.ne[0]) + " floats a row, not the " + std::to_string(row_floats) +
+                                     " its reader takes");
         std::vector<float> h(rows.size() * (size_t) t.ne[0]);
         for (size_t i = 0; i < rows.size(); ++i)
             std::memcpy(&h[i * t.ne[0]], row_of(t, rows[i], (size_t) t.ne[0] * 4), (size_t) t.ne[0] * 4);
@@ -477,10 +489,13 @@ struct Up {
     }
 #endif
     // rows `rows` of t1 then of t2 as f32 (F32 rows as they are, Q8_0 rows dequantized)
-    float* f32_rows2(const Tensor& t1, const Tensor& t2, const std::vector<int>& rows) {
+    float* f32_rows2(const Tensor& t1, const Tensor& t2, const std::vector<int>& rows, size_t row_floats) {
         std::vector<float> h;
         for (const Tensor* t : {&t1, &t2}) {
             const size_t n = (size_t) t->ne[0];
+            if (n != row_floats)
+                throw std::runtime_error(t->name + " is " + std::to_string(n) + " floats a row, not the " + std::to_string(row_floats) +
+                                         " its reader takes");
             for (int r : rows) {
                 if (t->type == T_F32) {
                     const float* row = (const float*) row_of(*t, r, n * 4);
@@ -621,12 +636,12 @@ void load_layers_27b(Stager& st, CardW& c, Up& up, const std::vector<int>& conv_
     auto attn = [&](LayerW& w, auto&& T) {
         w.wq = up.dense(up.rows3(T("attn_q.weight"), qrows, T("attn_k.weight"), kvrows, T("attn_v.weight"), kvrows));
         w.wo = up.dense(up.cols(T("attn_output.weight"), woblocks));
-        w.q_norm = up.f32(T("attn_q_norm.weight"));
-        w.k_norm = up.f32(T("attn_k_norm.weight"));
+        w.q_norm = up.f32(T("attn_q_norm.weight"), HD);
+        w.k_norm = up.f32(T("attn_k_norm.weight"), HD);
     };
     auto ffn = [&](LayerW& w, auto&& T) {
-        w.attn_norm = up.f32(T("attn_norm.weight"));
-        w.ffn_norm = up.f32(T("post_attention_norm.weight"));
+        w.attn_norm = up.f32(T("attn_norm.weight"), N);
+        w.ffn_norm = up.f32(T("post_attention_norm.weight"), N);
         w.ffn_gu = up.dense(up.rows2(T("ffn_gate.weight"), range(c.fd0, c.fd1), T("ffn_up.weight"), range(c.fd0, c.fd1)));
         w.ffn_down = up.dense(up.cols(T("ffn_down.weight"), range(c.fd0 / 32, c.fd1 / 32)));
     };
@@ -636,9 +651,9 @@ void load_layers_27b(Stager& st, CardW& c, Up& up, const std::vector<int>& conv_
         auto T = [&](const char* s) -> const Tensor& { return L(l, s); };
         if (!is_attn(l)) {
             w.qkvz = up.dense(up.rows2(T("attn_qkv.weight"), conv_rows, T("attn_gate.weight"), zrows));
-            w.ab = up.f32_rows2(T("ssm_alpha.weight"), T("ssm_beta.weight"), vheads);
+            w.ab = up.f32_rows2(T("ssm_alpha.weight"), T("ssm_beta.weight"), vheads, 1);
             w.ssm_out = up.dense(up.cols(T("ssm_out.weight"), vblocks));
-            w.conv = up.f32_rows(T("ssm_conv1d.weight"), conv_rows);
+            w.conv = up.f32_rows(T("ssm_conv1d.weight"), conv_rows, 4);
             std::vector<float> a, dt;
             const size_t nh = (size_t) *std::max_element(vheads.begin(), vheads.end()) + 1;
             const float* af = f32_data(T("ssm_a"), nh);
@@ -646,7 +661,7 @@ void load_layers_27b(Stager& st, CardW& c, Up& up, const std::vector<int>& conv_
             for (int h : vheads) { a.push_back(af[h]); dt.push_back(df[h]); }
             w.ssm_a = up.put<float>(a.data(), a.size() * 4);
             w.dt_bias = up.put<float>(dt.data(), dt.size() * 4);
-            w.ssm_norm = up.f32(T("ssm_norm.weight"));
+            w.ssm_norm = up.f32(T("ssm_norm.weight"), HS);
             q8(w.qkvz, "layer " + std::to_string(l) + "'s qkv | gate"), q8(w.ssm_out, "layer " + std::to_string(l) + "'s ssm_out");
             shape(w.qkvz, c.conv_ch() + c.nv() * HS, N, "layer " + std::to_string(l) + "'s qkv | gate");
             shape(w.ssm_out, N, c.nv() * HS, "layer " + std::to_string(l) + "'s ssm_out");
@@ -662,7 +677,7 @@ void load_layers_27b(Stager& st, CardW& c, Up& up, const std::vector<int>& conv_
         shape(w.ffn_down, N, ffs, "layer " + std::to_string(l) + "'s down");
         st.done(l);
     }
-    c.out_norm = up.f32(st.t(NL, "output_norm.weight"));
+    c.out_norm = up.f32(st.t(NL, "output_norm.weight"), N);
     c.out = up.dense(up.rows(st.t(NL, "output.weight"), range(c.v0, c.v1)));
     q8(c.out, "output.weight");
     shape(c.out, c.v1 - c.v0, N, "output.weight's rows");
@@ -672,9 +687,9 @@ void load_layers_27b(Stager& st, CardW& c, Up& up, const std::vector<int>& conv_
         attn(c.mtp, T);
         ffn(c.mtp, T);
         c.mtp_eh = up.dense(up.rows(T("nextn.eh_proj.weight"), range(0, N)));   // every card the whole of it
-        c.mtp_enorm = up.f32(T("nextn.enorm.weight"));
-        c.mtp_hnorm = up.f32(T("nextn.hnorm.weight"));
-        c.mtp_head_norm = up.f32(T("nextn.shared_head_norm.weight"));
+        c.mtp_enorm = up.f32(T("nextn.enorm.weight"), N);
+        c.mtp_hnorm = up.f32(T("nextn.hnorm.weight"), N);
+        c.mtp_head_norm = up.f32(T("nextn.shared_head_norm.weight"), N);
         for (const DW* d : {&c.mtp.wq, &c.mtp.wo, &c.mtp.ffn_gu, &c.mtp.ffn_down, &c.mtp_eh}) q8(*d, "a draft layer matrix");
         shape(c.mtp.wq, qkv, N, "the draft layer's q | k | v");
         shape(c.mtp.wo, N, c.nq * HD, "the draft layer's attn_output");
@@ -752,9 +767,9 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
         w.router = up.f32_cat(L(l, "ffn_gate_inp.weight"), L(l, "ffn_gate_inp_shexp.weight"));
         if (!is_attn(l)) {
             w.qkvz = up.dense(up.rows2(L(l, "attn_qkv.weight"), conv_rows, L(l, "attn_gate.weight"), zrows));
-            w.ab = up.f32_rows2(L(l, "ssm_alpha.weight"), L(l, "ssm_beta.weight"), vheads);
+            w.ab = up.f32_rows2(L(l, "ssm_alpha.weight"), L(l, "ssm_beta.weight"), vheads, 1);
             w.ssm_out = up.dense(up.cols(L(l, "ssm_out.weight"), vblocks));
-            w.conv = up.f32_rows(L(l, "ssm_conv1d.weight"), conv_rows);
+            w.conv = up.f32_rows(L(l, "ssm_conv1d.weight"), conv_rows, 4);
             std::vector<float> a, dt;
             const size_t nh = (size_t) *std::max_element(vheads.begin(), vheads.end()) + 1;
             const float* af = f32_data(L(l, "ssm_a"), nh);
@@ -1048,7 +1063,11 @@ Mtp::Mtp(const Model& m, const std::string& dir, const std::string& vocab_file) 
         }
         int32_t id;
         while (std::fread(&id, 4, 1, f) == 1) vocab.push_back(id);
+        const bool io_bad = std::ferror(f) != 0;
         std::fclose(f);
+        if (io_bad || vocab.size() * 4 != (size_t) stb.st_size)
+            throw std::runtime_error("mtp: " + vocab_file + " stopped at " + std::to_string(vocab.size() * 4) +
+                                     " of its " + std::to_string((long long) stb.st_size) + " bytes");
         if (vocab.empty()) throw std::runtime_error("mtp: " + vocab_file + " is empty");
         for (int id2 : vocab)
             if (id2 < 0 || id2 >= m.vocab) throw std::runtime_error("mtp: " + vocab_file + " holds a token outside the vocabulary");
