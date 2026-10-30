@@ -2,6 +2,10 @@
 // only, so tools/batch_plan_test.cpp checks it without a card.
 #pragma once
 
+#ifndef FNX_27B
+#error "FNX_27B is unset: build through the Makefile (make FNX_MODEL=fnx or 27b)"
+#endif
+
 #include <algorithm>
 #include <stdexcept>
 #include <vector>
@@ -16,8 +20,14 @@ namespace fnx {
 // per count in each of the 36 recurrent layers; plan windows of mixed counts measured ~1.5-2 ms over the rest of this
 // model with 2-3 counts). A window whose layout (each lane's rows) has no graph held pays a capture as well (8-11 ms;
 // the engine's last_capture_ms)
+// The 27B's rows (make FNX_MODEL=27b; s27_run S27_BENCH=1, 2026-10-29): verify 16.1 ms at 1 row, 24.8 at 8 (~1.24 a row),
+// 42.8 at 16 (~2.25 a row past 8); its draft-layer calls and groups are Flash-Next's numbers, not measured on it
 struct RowCost {
+#if FNX_27B
+    double round_ms = 16.5, row_lo = 1.24, row_hi = 2.25, call_ms = 0.7, chain_ms = 0.6, group_ms = 0.8;
+#else
     double round_ms = 10.8, row_lo = 1.5, row_hi = 1.8, call_ms = 0.7, chain_ms = 0.6, group_ms = 0.8;
+#endif
     int knee = 8;
     double row(int t) const { return t <= knee ? row_lo : row_hi; }   // the window's t'th row (t >= 2)
     double rows_ms(int T) const {   // rows 2 .. T

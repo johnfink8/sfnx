@@ -9,6 +9,7 @@
 
 #include "kernels.hpp"
 #include "model.hpp"
+#include "owned.hpp"
 
 namespace fnx {
 
@@ -24,29 +25,6 @@ struct LaneDev {
     int* mrope_buf = nullptr;         // the lane's rotary table ([max_ctx][3]), made at its first image
     int* mrope = nullptr;             // mrope_buf while its sequence holds an image, else null (rotary position = cell)
 };
-
-// what the engine made on the cards and in page-locked memory (buffers, streams, events, handles), each with how to
-// release it; ~Engine releases them, newest first, so a lab process can make and drop engines around one loaded model
-std::vector<std::function<void()>>& owned();
-// the current card, for a release that has to run on it; and the releases of what is made most often
-inline int current_card() {
-    int d = -1;
-    cudaGetDevice(&d);
-    return d;
-}
-inline void own_dev(void* p) {
-    const int d = current_card();
-    owned().push_back([d, p] { cudaSetDevice(d); cudaFree(p); });
-}
-inline void own_pinned(void* p) { owned().push_back([p] { cudaFreeHost(p); }); }
-inline void own_stream(cudaStream_t s) {
-    const int d = current_card();
-    owned().push_back([d, s] { cudaSetDevice(d); cudaStreamDestroy(s); });
-}
-inline void own_event(cudaEvent_t e) {
-    const int d = current_card();
-    owned().push_back([d, e] { cudaSetDevice(d); cudaEventDestroy(e); });
-}
 
 struct CardBuf {
     int dev;
@@ -146,5 +124,43 @@ struct CardBuf {
     int* probe_guess = nullptr;
     unsigned long long* probe_cnt = nullptr;
 };
+
+// what engine_common.cu reads of this model (engine_parts.hpp says what each is)
+constexpr int ROW_W = D;   // the HC streams of N
+constexpr int LANE_ROW_COLS = 2;
+inline void lane_row_extra(const int**, int, const LaneDev&) {}
+inline void card_lane(CardBuf& b, const LaneDev& L) {
+    b.pt = L.pt;
+    b.pg.pt = L.pt;
+    b.S = L.S;
+    b.chist = L.chist;
+    b.ple_hist = L.ple_hist;
+    for (int l = 0; l < NL; ++l)
+        if (is_attn(l)) b.qsa_ring[l] = L.ring[l];
+    b.mtp_qsa_ring = L.mtp_ring;
+    b.mrope = L.mrope;
+}
+inline cudaError_t reset_hists(CardBuf& b) { return cudaMemsetAsync(b.ple_hist, 0, (size_t) 9 * D * 4, b.st); }
+// the PLE history (lane L's, or the current lane's when L is null) from row `at`'s snapshot
+constexpr int HIST_JOBS = 1;
+inline int hist_jobs(CopyJob* jobs, const CardBuf& b, const LaneDev* L, size_t at) {
+    jobs[0] = {L ? L->ple_hist : b.ple_hist, b.ple_hsnap + at * 9 * D, (size_t) 9 * D * 4};
+    return 1;
+}
+inline const float* draft_src(const CardBuf& b, bool from_main) { return from_main ? b.R : b.mtp_R; }
+constexpr bool MTP_HEAD_EVERY_ROW = true;
+inline unsigned* err_word(CardBuf& b) { return b.ring.err; }
+inline const char* window_error(unsigned err, bool draft) {
+    if (err & 1u) return "a ring sum timed out";
+    if (err & 2u) return "a ring sum met a NaN or inf (or, on the fp16 ring, a value past its range)";
+    if (err & 4u) return "an hc read's grid barrier timed out";
+    if (err & 16u) return draft ? "the draft layer's logits hold a NaN or inf" : "the head's logits hold a NaN or inf";
+    if (err) return "an error bit no message names";
+    return nullptr;
+}
+// mtp: the draft layer is attached (its K/V and QSA keys are part of the state); hist_half: the conv history half the
+// next window reads
+std::vector<std::pair<char*, size_t>> state_pieces(CardBuf& b, const CardW& w, bool mtp, int pos, bool kv, unsigned hist_half,
+                                                   const std::vector<int>& pages);
 
 }  // namespace fnx

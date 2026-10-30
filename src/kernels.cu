@@ -437,7 +437,11 @@ __global__ void k_gdn_out_norm(const float* o, const float* z, const float* w, f
     __shared__ float sh[32];
     const float v = o[at];
     const float ms = block_sum(v * v, sh) / (float) HS;
+#if FNX_27B   // the 27B gates with silu(z), Flash-Next with sigmoid(z)
+    y[at] = v * rsqrtf(ms + eps) * w[i] * z[at] * sigm(z[at]);
+#else
     y[at] = v * rsqrtf(ms + eps) * w[i] * sigm(z[at]);
+#endif
 }
 
 #include "gdn_core.cuh"
@@ -752,7 +756,6 @@ __global__ void k_ple_conv(float* R, const float* gated, const float* normd, con
 constexpr int RCH = N / NCARD + 1;     // words per slot row (more than a chunk's pairs)
 constexpr int RSTEPS = NCARD - 1;      // receive slots: the reduce hops
 constexpr int NP = N / 2;          // pairs per row
-constexpr float RING_MAX = 65504.0f;   // fp16's largest finite value
 // fp32 words: one value | tag per word, pair i at words 2i, 2i + 1
 __device__ __forceinline__ void rput32(unsigned long long* p, float2 v, unsigned tag, unsigned* err) {
     if (!(isfinite(v.x) && isfinite(v.y))) atomicOr(err, 2u);
@@ -2032,7 +2035,15 @@ void q8s_run(const Q8Segs& g, int rows, int cols, const void* y, int T, void* st
         if (rows < 8192) throw std::runtime_error("q8s_gemv_segs: compiled for 8192 rows or more (q, k and v)");
         q8s_launch<4, SEG>(g, rows, cols, yq, T, s);
     } else {
+#if FNX_27B
+        // up to 4 rows by the window (the 27B's windows, bin/s27_run S27_BENCH=1: 1 row 19.4 -> 18.3 ms, 4 rows
+        // 24.5 -> 22.3), past that by the matrix (5 to 16 rows: choosing by the window was no faster)
+        if (T <= 2) q8s_launch<2, SEG>(g, rows, cols, yq, T, s);
+        else if (T <= 4) q8s_launch<1, SEG>(g, rows, cols, yq, T, s);
+        else if (rows >= 8192) q8s_launch<4, SEG>(g, rows, cols, yq, T, s);
+#else
         if (rows >= 8192) q8s_launch<4, SEG>(g, rows, cols, yq, T, s);
+#endif
         else if (rows >= 4096) q8s_launch<2, SEG>(g, rows, cols, yq, T, s);
         else q8s_launch<1, SEG>(g, rows, cols, yq, T, s);
     }
@@ -2107,9 +2118,16 @@ void q8s_gemv_f32(const Q8S& w, int rows, int cols, const void* y, float* out, c
     for (int s = 0; s < Q8S_SEGS; ++s) g.q[s] = w.q, g.d[s] = w.d, g.out[s] = out, g.end[s] = rows, g.stride[s] = rows;
     const block_q8_1* yq = (const block_q8_1*) y;
     cudaStream_t s = (cudaStream_t) st;
-    // compiled for its one use, qkvz (4096 to 8191 rows: two a warp, as q8s_gemv alone would run them)
+    // compiled for its one use, qkvz, as q8s_gemv alone would run them: 4096 to 8191 rows two a warp; the 27B's 8192
+    // and more (on two cards) four
+#if FNX_27B
+    if (rows < 4096) throw std::runtime_error("q8s_gemv_f32: compiled for 4096 rows or more (qkvz)");
+    if (rows >= 8192) q8s_ab_launch<4>(g, rows, cols, yq, W, x, yf, rf, T, s);
+    else q8s_ab_launch<2>(g, rows, cols, yq, W, x, yf, rf, T, s);
+#else
     if (rows < 4096 || rows >= 8192) throw std::runtime_error("q8s_gemv_f32: compiled for 4096..8191 rows (qkvz)");
     q8s_ab_launch<2>(g, rows, cols, yq, W, x, yf, rf, T, s);
+#endif
     ck_launch("q8s_gemv_f32");
 }
 #endif

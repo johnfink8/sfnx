@@ -7,7 +7,7 @@
 // Thread (col, part) owns rows [part*32, +32) of its column; the four parts of a column are adjacent lanes, so the sums
 // over rows are two shuffles. The gated RMS norm spans the head's HS columns: each block leaves its outputs and their
 // square sums in scratch, and the head's last block to finish norms, gates and quantizes the head.
-// Output: y = rms_norm(o) * w * sigmoid(z), as q8_1 rows of nv*HS (blocks lv*4 .. lv*4+3 of row t).
+// Output: y = rms_norm(o) * w * sigmoid(z) (the 27B: silu(z)), as q8_1 rows of nv*HS (blocks lv*4 .. lv*4+3 of row t).
 // For a speculative window: snap [MAXT - 1][nv][HS][HS] gets the state after each row but the last, hsnap [MAXT][3][ch]
 // the history the window leaves when only its first n rows are kept (variant n - 1, for n < T).
 namespace {
@@ -60,7 +60,12 @@ __global__ void __launch_bounds__(GDN_THREADS) k_gdn_core(const float* __restric
     if (tid < T) {
         const float* abt = ab + (size_t) tid * 2 * nv;
         const float x = abt[lv] + dt[lv];
+#if FNX_27B   // the decay through double, as gdn_prompt's (gch_exp): __expf's error grows with |x| and compounds in the
+              // state row after row (the 27B's edit1 read through windows: KL 1.1e-6 against llama.cpp, the bar 1.5e-7)
+        gates[tid][0] = (float) exp((double) ((x > 20.0f ? x : (float) log1p(exp((double) x))) * a[lv]));
+#else
         gates[tid][0] = __expf((x > 20.0f ? x : log1pf(__expf(x))) * a[lv]);
+#endif
         gates[tid][1] = 1.0f / (1.0f + __expf(-abt[nv + lv]));
     }
     // ---- conv + silu: q and k channels (all HS of each), this block's v channels
@@ -203,7 +208,11 @@ __global__ void __launch_bounds__(GDN_THREADS) k_gdn_core(const float* __restric
         const float ms = (sqv[0] + sqv[1] + sqv[2] + sqv[3]) / (float) HS;
         const float v = ((const volatile float*) o_all)[(size_t) t * nv * HS + lv * HS + c];
         const float z = qkvz[(size_t) t * row_stride + ch + lv * HS + c];
+#if FNX_27B   // the 27B gates with silu(z), Flash-Next with sigmoid(z)
+        const float xi = v * rsqrtf(ms + eps) * nw[c] * z / (1.0f + __expf(-z));
+#else
         const float xi = v * rsqrtf(ms + eps) * nw[c] / (1.0f + __expf(-z));
+#endif
         if (y32) y32[(size_t) t * nv * HS + lv * HS + c] = xi;
         const float amax = wmax(fabsf(xi)), sm = wsum(xi);
         const float d = amax / 127.0f;

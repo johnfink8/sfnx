@@ -19,15 +19,42 @@ namespace fnx {
 #error "FNX_NCARD is unset: build through the Makefile (make FNX_NCARD=2, 3, 4, 6 or 8)"
 #endif
 constexpr int NCARD = FNX_NCARD;
+// the model a build is for (make FNX_MODEL=27b: Qwen3.8-27B, dense, src/s27.*; the default: Flash-Next). Unset is a
+// build made outside the Makefile, as with FNX_NCARD
+#ifndef FNX_27B
+#error "FNX_27B is unset: build through the Makefile (make FNX_MODEL=fnx or 27b)"
+#endif
+#if FNX_27B
+constexpr int N = 5120, HC = 4, D = N * HC, LR = 320;
+constexpr int NL = 64, NEXP = 512, TOPK = 10, FF = 640, FF_SH = 640;
+constexpr int NKH = 16, NVH = 48, HS = 128;            // recurrent: key heads, value heads, head size
+constexpr int NQH = 24, NKVH = 4, HD = 256, NROT = 64; // attention
+constexpr int FFD = 17408;                             // the dense FFN's width
+// a card's dense FF slice: whole 32-value blocks, the first cards one block wider (544 blocks: 182 / 181 / 181)
+constexpr int ffd_lo(int n, int c) { return 32 * (c * (FFD / 32 / n) + (c < FFD / 32 % n ? c : FFD / 32 % n)); }
+constexpr int FFD_CARD_MAX = (FFD + 32 * NCARD - 1) / (32 * NCARD) * 32;
+constexpr int S27_PP = 256;                            // K/V positions a page (s27_attn.cuh)
+#else
 constexpr int N = 2560, HC = 4, D = N * HC, LR = 320;
 constexpr int NL = 48, NEXP = 512, TOPK = 10, FF = 640, FF_SH = 640;
 constexpr int NKH = 16, NVH = 48, HS = 128;            // recurrent: key heads, value heads, head size
 constexpr int NQH = 24, NKVH = 2, HD = 256, NROT = 64; // attention
+#endif
 constexpr int MAXT = 16;                               // rows per window
+// the indexer's key width: qsa.cuh's QSA_DIM is defined from this, tying the loader's checks to what k_idx_proj and
+// the pooled rows read (kernels.hpp holds the same 128 in its ring and pooled rows). The draft layer's loader is
+// shared code, so these stand outside the model block even though only Flash-Next has an indexer
+constexpr int QSA_KEY = 128;
+constexpr int QSA_HEADS = 4;                             // indexer query heads: the qk projection is QSA_HEADS + 1 of these
+constexpr int QSA_TOP_K = 2048;                          // indexer positions kept (metadata top_k): qsa.cuh's QSA_TOP is this over the pool
 // the hc read's grid (src/hc.cuh's H_BLOCKS, held to this there): every block resident at once, one an SM, so a card
 // with fewer SMs is refused at load (src/card_check.hpp)
+#if FNX_27B
+constexpr int HC_READ_BLOCKS = 1;   // the 27B has no hyper-connections: no grid that must be resident
+#else
 constexpr int HC_READ_BLOCKS = 80;
-constexpr int PLE_LAYER = 1, PLE_HEADS = 16, PLE_DIM = 160;
+#endif
+constexpr int PLE_LAYER = 1, PLE_ORDERS = 3, PLE_HEADS = 16, PLE_DIM = 160;
 
 }  // namespace fnx
 
@@ -126,6 +153,12 @@ struct LayerW {
     DW gu_e, down_e;                   // per expert: [gate; up] [2 ff][N], down [N][ff]; expert stride = rows * row_bytes
     size_t gu_e_stride = 0, down_e_stride = 0;
     DW sh_gu, sh_down;                 // shared expert ff range, gate and up stacked the same way
+#if FNX_27B
+    // pre-norms (copied) and the dense FFN's slice [fd0, fd1): gate rows then up rows; down's input columns
+    const float* attn_norm = nullptr;
+    const float* ffn_norm = nullptr;
+    DW ffn_gu, ffn_down;
+#endif
 };
 
 struct CardW {
@@ -141,6 +174,17 @@ struct CardW {
     int kv0 = 0, nkv = 0;              // KV heads [kv0, kv0 + nkv)
     // ff split
     int ff0 = 0, ff1 = 0;
+#if FNX_27B
+    int fd0 = 0, fd1 = 0;              // the dense FFN's
+    const float* out_norm = nullptr;
+    // the draft (nextn) layer: an attention layer split as the trunk's, its input projection [e | h] -> N (every card
+    // the whole of it), its norms. Its head (rows of output.weight for the draft vocabulary) is the Mtp's
+    LayerW mtp;
+    DW mtp_eh;
+    const float* mtp_enorm = nullptr;
+    const float* mtp_hnorm = nullptr;
+    const float* mtp_head_norm = nullptr;
+#endif
     // output vocabulary split
     int v0 = 0, v1 = 0;
     std::vector<LayerW> L;
@@ -163,7 +207,8 @@ struct CardW {
 };
 
 // the draft (MTP) layer on one card: an attention layer (hc [0] before the attention, [1] before the MoE), its input
-// projections, the final mixer, and this card's rows [dv0, dv1) of the draft head
+// projections, the final mixer, and this card's rows [dv0, dv1) of the draft head. The 27B's: the head alone (its
+// layer is the GGUF's nextn block, loaded with the model: CardW::mtp)
 struct MtpCard {
     LayerW L;
     DW fc_emb, fc_hid;                 // every card: [N][N] each
@@ -182,7 +227,8 @@ struct Model;
 struct Mtp {
     std::vector<MtpCard> cards;        // one per Model card, on the same devices
     std::vector<int> vocab;            // the draft vocabulary: head row -> token id
-    // vocab_file: the draft vocabulary (int32 token ids); empty: rt_dir/draft_vocab.bin
+    // vocab_file: the draft vocabulary (int32 token ids); empty: rt_dir/draft_vocab.bin. The 27B: rt_dir "nextn" (its
+    // layer is the GGUF's), vocab_file required
     Mtp(const Model& m, const std::string& rt_dir, const std::string& vocab_file = "");
     ~Mtp();
     Mtp(const Mtp&) = delete;
@@ -202,7 +248,7 @@ struct Model {
     const Tensor* ple_table = nullptr;
     std::vector<uint64_t> ple_mult, ple_off, ple_vocab;
     int64_t ple_eos = 0;
-    int64_t ple_image = 0;   // what the PLE n-grams read for an image cell
+    int64_t ple_image = 0;   // what the PLE n-grams read for an image cell (the 27B: its image-pad token)
     float eps = 1e-6f, rope_base = 1e7f;
     int ctx_train = 0;   // the GGUF's context_length: the longest context the engine takes unscaled, and YaRN's n_ctx_orig
     double yarn_factor = 0;   // the GGUF's own YaRN (rope.scaling.type yarn): its factor, 0 for none

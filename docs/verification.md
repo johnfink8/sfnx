@@ -73,6 +73,112 @@ On the current build at 49 GiB in RAM (the lab's `logits` against the same CPU t
 code edit 100.00% / 2.79e-6 / 2.1e-5. Both inside the Q4 bar above — llama.cpp's CPU backend against its CUDA one,
 4.85e-4 and 4.12e-6 — as sFNX's Q4 path is.
 
+## The 27B
+
+Qwen3.8-27B Q8_0 (`make FNX_MODEL=27b`, [docs/config.md](config.md#model)). Its bar is its own: the widest gap
+between llama.cpp's (a37cc46) own ways of running the 27B, each teacher-forced on its CUDA greedy run's tokens.
+
+- **Its CPU backend against CUDA** (`ref/fnx_logref` with `FNX_LOGREF_GPU=0`; the picture under llama.cpp's own
+  encoder, `ref/img_logref` with `IMG_LOGREF_GPU=0`), as Flash-Next's bar.
+- **Its CUDA with every product through cuBLAS** against its default CUDA. On a V100, llama.cpp's default multiplies
+  a decode row's Q8_0 matrices with int8 products of activations quantized to q8_1 (MMVQ, and MMQ under 64 rows),
+  and its CPU backend quantizes them to q8_0 the same way; a prompt's batches already go through cuBLAS in f16.
+  `ref/llama_cublas_only.patch` turns the quantized products off under `FNX_CUBLAS_ONLY=1` (and asserts none ran).
+  sFNX multiplies f16 activations, as this path does.
+- **For the 62k prompt**, where the CPU backend would take hours: its q8_0 K/V against its f16 K/V, as Flash-Next's
+  long bar.
+
+The dense model's two llama.cpp backends agree far more closely than Flash-Next's do: code KL 8.95e-5 against
+Flash-Next's 4.85e-4, edit 1.48e-7 against 4.12e-6. Its cuBLAS path is as far from its default as sFNX is (code
+1.25e-4), so a bar from the CPU backend alone (8.95e-5) would be one draw from a spread llama.cpp
+itself does not stay inside.
+
+`bin/fnx_run MODEL exact`, as `serve/sfnx-27b.json` runs it: f16 K/V, the prompt through the prompt path (f16 scores),
+windows of 5. Measured 2026-10-29:
+
+All against llama.cpp's default CUDA run:
+
+| Prompt | | Top-1 agrees | KL mean |
+| --- | --- | --- | --- |
+| Code, 300 steps | sFNX | 100.00% | 1.25e-4 |
+| | llama.cpp CPU | 100.00% | 8.95e-5 |
+| | llama.cpp cuBLAS | 100.00% | 1.25e-4 |
+| Code edit, 300 steps | sFNX | 100.00% | 1.44e-7 |
+| | llama.cpp CPU | 100.00% | 1.48e-7 |
+| | llama.cpp cuBLAS | 100.00% | 1.23e-7 |
+| The logo's source picture, 200 steps | sFNX | 99.50% | 7.56e-4 |
+| | llama.cpp CPU | 99.50% | 4.69e-4 |
+| | llama.cpp cuBLAS | 99.00% | 8.91e-4 |
+| 62,794-token prompt (`ref/long64`), 200 steps | sFNX | 100.00% | 2.65e-4 |
+| | llama.cpp q8_0 K/V | 99.50% | 2.08e-4 |
+| | llama.cpp cuBLAS | 100.00% | 1.04e-4 |
+
+sFNX sits as far from llama.cpp's cuBLAS path as from its default (code 1.16e-4, edit 1.28e-7, picture 9.16e-4) and
+from its CPU backend (code 1.13e-4): about the distance between any two of llama.cpp's own.
+
+Windows of 1, 2, 3, 11 and 16 rows give the 5-row windows' logits byte for byte.
+
+On two cards (`FNX_NCARD=2`, GPUs 1 and 2, its own lab directory) the same: code 100% / 1.34e-4, edit 100% / 1.46e-7,
+the picture 99.0% / 5.95e-4, all within the bar; long64 100% / 3.06e-4, over it as on three; the windows byte for
+byte. Its batched windows and its sums (`bin/s27_ring_test`) pass there too. Four cards build and have never run.
+
+The bar takes the CPU backend's top-1 (the highest of the three) and the widest KL, with Flash-Next's slack on top
+(1.25x; 1.0 for long64).
+
+**Code, edit and the picture are within the bar; long64 is not, and the exact check says so** (`FAIL`, so no base is
+written). Every prompt's top-1 agreement is the bar's or better. long64's KL is 1.27x the bar, where the slack is 1.0,
+and 2.5x the distance between llama.cpp's own two CUDA paths there (1.04e-4): over 62k tokens sFNX drifts further
+than either. Not yet found; the suspects are the f16 scores over 62k keys, the order of the chunked recurrent sums and
+the fp16 sums between the cards.
+
+How much these move with each choice:
+
+| Setting | Code | Picture | long64 |
+| --- | --- | --- | --- |
+| The default, f16 scores | 1.25e-4 | 7.56e-4 | 2.65e-4 |
+| `FNX_PF_SCORES=f32` | 1.13e-4 | 8.82e-4 | 2.89e-4 |
+| 1,024-row prompt chunks (`FNX_PF_ROWS=1024`) | | | 2.88e-4 |
+| The decode decay through `__expf` (before this build) | 9.48e-5 | | |
+
+Each choice moves the numbers by about as much as long64's gap, and none brings it in.
+
+The fp16 sums between the cards are not it: `FNX_RING_F32=1` moved edit1 by 1.45e-7 and left its distance from
+llama.cpp where it was.
+
+**What the checks found on the way:**
+
+- **Every prompt pass after the first re-read the prompt's start.** long64 took the end-of-text token from its first
+  step: top-1 21.5%, KL 3.67. Fixed: the position-to-token mapping takes the history's length once before the passes,
+  as `prefill.cu` does. Prompts of 8,192 tokens or fewer were never affected.
+- **Decode's recurrent decay went through `__expf`.** A prompt read through windows drifted from llama.cpp: edit1 KL
+  1.1e-6, against 2.25e-7 with the decay through double, as `gdn_prompt` already took it. This is the 27B's only; its
+  build has it behind `#if FNX_27B`.
+
+`bin/fnx_run MODEL exact` runs the set, as `tools/lab.sh exact` does for Flash-Next (the lab holds Flash-Next only).
+The 27B's references are `ref/lgr/llama_cuda_Qwen3.8-27B-Q8_0_<prompt>.lgr` and `ref/img/sphinx_Qwen3.8-27B-Q8_0.*`,
+made locally like the rest of `ref/lgr/`; the bar's, `llama_cpu_*` and `llama_cublas_*` (llama.cpp built with
+`ref/llama_cublas_only.patch`, run with `FNX_CUBLAS_ONLY=1`) beside them. `tools/s27_cmp.py` compares a layer dump
+(`bin/fnx_run MODEL check`) with `ref/fnx_ref`'s: on a 19-token prompt every layer's mixer and FFN sums are at cosine
+0.99957 or closer.
+
+Checked on the 27B as on Flash-Next:
+
+- **Batched windows** give each lane its tokens alone, plain and with drafts (`bin/batch_test`, 1 / 2 / 3 / 6 lanes).
+  Each batched row is rotated by its own lane's M-RoPE table.
+- **The speculative sampler** matches plain sampling through three batched lanes with drafts (`SAMPLE_TEST_LANES=3
+  bin/sample_test`, open1, 600 seeds: every p >= 0.116).
+- **Its sums** (`bin/s27_ring_test`): the fp32 ring gives the cards' sum exactly and the fp16 one (three a word)
+  within fp16's rounding of it, at 1, 2, 5 and 16 rows, with no error bit in the timed sums or the checked ones.
+- **The API and pictures through the front end:** `serve/api_smoke.py` 10 of 10, `serve/image_test.py` 6 of 6
+  (three requests at once among them), and `pytest front/` 595 passed.
+
+**Flash-Next on the shared engine gives main's logits.** With what both models share moved into
+`engine_common.cu` (2026-10-29), Flash-Next's exact check against a base written by main's build (ada6d6f) is byte
+for byte identical on all four prompts, and every window size gives the 5-row windows' logits. Its batched windows,
+its sampler and the top-k ties pass. Its decode is main's: edit1 366.1 against 365.5 tok/s, code1 180.4 against
+177.7, prose2 with prod's sampling 120.9 against 121.6 (GPUs 87% busy, 115 W). The 27B's logits on the shared engine
+are byte for byte the ones before the move.
+
 ## Other card counts
 
 Four, six and eight cards build (`make FNX_NCARD=n`, [docs/config.md](config.md#card-count)) but **have never run**:

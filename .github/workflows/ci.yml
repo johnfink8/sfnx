@@ -1,7 +1,7 @@
 # What a hosted runner can check without a GPU: the engine, the lab and the test programs compile and link (sm_70 on
-# every card count, sm_86 on three and four, every other arch the Makefile takes on three), the CPU checks pass, and the
-# front end's tests pass with none skipped. Not built: the picture encoder and the reference tools, which need
-# llama.cpp's CUDA libraries. The GPU checks (AGENTS.md, docs/verification.md) are run on cards by the author and again
+# every card count, sm_86 on three and four, every other arch the Makefile takes on three; the 27B's programs on sm_70
+# and two, three and four cards), the CPU checks pass, and the front end's tests pass with none skipped. Not built: the
+# picture encoder and the reference tools, which need llama.cpp's CUDA libraries. The GPU checks (AGENTS.md, docs/verification.md) are run on cards by the author and again
 # on the V100s before merging.
 name: CI
 
@@ -20,15 +20,29 @@ concurrency:
 
 jobs:
   engine:
-    name: engine sm_${{ matrix.arch }}, ${{ matrix.ncard }} cards
+    name: engine ${{ matrix.model || 'fnx' }} sm_${{ matrix.arch }}, ${{ matrix.ncard }} cards
     runs-on: ubuntu-24.04
     container: nvidia/cuda:12.9.1-devel-ubuntu24.04
     strategy:
       fail-fast: false
       matrix:
+        model: [fnx]
         arch: [70]
         ncard: [2, 3, 4, 6, 8]
         include:
+          # jobs of their own (model is a matrix value, so these do not fold into fnx's sm_70 ones)
+          - model: 27b
+            arch: 70
+            ncard: 2
+            targets: bin/sfnx bin/fnx_run bin/s27_run bin/s27_ring_test bin/s27_probe bin/s27_bw_probe test-bin
+          - model: 27b
+            arch: 70
+            ncard: 3
+            targets: bin/sfnx bin/fnx_run bin/s27_run bin/s27_ring_test bin/s27_probe bin/s27_bw_probe test-bin
+          - model: 27b
+            arch: 70
+            ncard: 4
+            targets: bin/sfnx bin/fnx_run bin/s27_run bin/s27_ring_test bin/s27_probe bin/s27_bw_probe test-bin
           - arch: 86
             ncard: 3
           - arch: 86
@@ -55,7 +69,7 @@ jobs:
           git -C llama.cpp fetch -q --depth 1 https://github.com/ggml-org/llama.cpp a37cc46104eb50900d5ab4a9ba02a0abdac039db
           git -C llama.cpp checkout -q FETCH_HEAD
       - name: Build
-        run: make -j"$(nproc)" ARCH=${{ matrix.arch }} FNX_NCARD=${{ matrix.ncard }} lab bin/sfnx test-bin
+        run: make -j"$(nproc)" FNX_MODEL=${{ matrix.model || 'fnx' }} ARCH=${{ matrix.arch }} FNX_NCARD=${{ matrix.ncard }} ${{ matrix.targets || 'lab bin/sfnx test-bin' }}
       - run: bin/sfnx_input_test
       - run: bin/batch_plan_test
       - run: bin/pf_ring_plan_test

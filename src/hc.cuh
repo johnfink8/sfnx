@@ -23,7 +23,9 @@ static_assert(H_BLOCKS * H_UPC == N, "one up block per down block");
 static_assert(H_UPC * H_TPRU <= H_DT && H_UB <= H_TPRU, "the up lanes");
 // the grid barrier's counter runs modulo H_BAR_MOD, a multiple of the grid size, so every barrier's H_BLOCKS arrivals
 // stay in one generation [k * H_BLOCKS, (k + 1) * H_BLOCKS) across the wrap
+#if !FNX_27B   // the 27B has no hyper-connections
 static_assert(H_BLOCKS == HC_READ_BLOCKS, "model.hpp's HC_READ_BLOCKS: the SMs a card is refused below");
+#endif
 constexpr unsigned H_BAR_MOD = 0xffffffffu / H_BLOCKS * H_BLOCKS;
 
 struct HcArgs {

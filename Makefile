@@ -75,12 +75,28 @@ override FNX_NCARD := $(strip $(FNX_NCARD))
 $(if $(word 2,$(FNX_NCARD)),$(error FNX_NCARD: one value, not '$(FNX_NCARD)'))
 $(if $(filter 2 3 4 6 8,$(FNX_NCARD)),,$(error FNX_NCARD: 2, 3, 4, 6 or 8 (the 24 query heads and 48 value heads split evenly, a 32-value FF block on every card, at most 8 for CUDA's peers a card), not '$(FNX_NCARD)'))
 NVFLAGS += -DFNX_NCARD=$(FNX_NCARD) -DFNX_ARCH=$(ARCH)
+# the model (src/model.hpp): fnx (Flash-Next, prod) or 27b (Qwen3.8-27B: src/s27_*, bin/s27_run). build/model holds
+# it as build/ncard holds the count; the 27B is built for two, three or four cards (src/s27_attn.cuh: every card reads
+# as many KV heads), other counts refused
+FNX_MODEL ?= fnx
+override FNX_MODEL := $(strip $(FNX_MODEL))
+$(if $(filter fnx 27b,$(FNX_MODEL)),,$(error FNX_MODEL: fnx or 27b, not '$(FNX_MODEL)'))
+$(if $(and $(filter 27b,$(FNX_MODEL)),$(filter-out 2 3 4,$(FNX_NCARD))),$(error FNX_MODEL=27b: two, three or four cards (its K/V heads are placed for those), not FNX_NCARD=$(FNX_NCARD)))
+FNX_27B := $(if $(filter 27b,$(FNX_MODEL)),1,0)
+NVFLAGS += -DFNX_27B=$(FNX_27B)
+# the 27B's own programs (make FNX_MODEL=27b), and the lab, which holds Flash-Next only (the 27B loads plain); refused
+# before the stamps below, which a refused make must leave as they were
+S27_BIN := bin/s27_run bin/s27_probe bin/s27_ring_test bin/s27_bw_probe
+FNX_BIN := lab bin/fnx_lab bin/fnx_hold build/libfnx_lab.so
+$(if $(and $(filter 0,$(FNX_27B)),$(filter $(S27_BIN),$(MAKECMDGOALS))),$(error $(filter $(S27_BIN),$(MAKECMDGOALS)): make FNX_MODEL=27b))
+$(if $(and $(filter 1,$(FNX_27B)),$(filter $(FNX_BIN),$(MAKECMDGOALS))),$(error $(filter $(FNX_BIN),$(MAKECMDGOALS)): Flash-Next's, not FNX_MODEL=27b's))
 # the stamps, written with make's own $(file) (4.2 and later), not a shell, so no setting's text runs as one; and only
 # when their text changes, as a rewritten stamp rebuilds everything. stamp(file,text)
 stamp = $(if $(and $(findstring x$(2)x,x$(file <$(1))x),$(findstring x$(file <$(1))x,x$(2)x)),,$(file >$(1),$(2)))
 $(shell mkdir -p build)
 $(call stamp,build/ncard,$(FNX_NCARD))
 $(call stamp,build/arch,$(ARCH))
+$(call stamp,build/model,$(FNX_MODEL))
 # nvcc's last version line, "none" when there is none: the CPU tests still build, anything CUDA fails at its first nvcc.
 # (Running it takes CUDA's path through a shell, as every recipe here does)
 NVCC_VERSION := $(shell "$(NVCC)" --version 2>/dev/null | tail -1)
@@ -88,33 +104,35 @@ NVCC_ID := $(NVCC) $(or $(NVCC_VERSION),none)
 $(if $(NVCC_VERSION),,$(if $(wildcard $(NVCC)),$(warning nvcc at $(NVCC) gave no version: anything CUDA will fail),\
     $(warning no nvcc at $(NVCC) (CUDA=$(CUDA)): only the CPU tests can build)))
 $(call stamp,build/cuda,$(NVCC_ID))
-STAMPS := build/ncard build/arch build/cuda
+STAMPS := build/ncard build/arch build/cuda build/model
 
-bin/gguf_test: tools/gguf_test.cpp src/gguf.cpp src/gguf.hpp src/rope_gguf.hpp
-	mkdir -p bin && g++-14 -O2 -std=c++17 -o $@ tools/gguf_test.cpp src/gguf.cpp
-bin/stage_test: tools/stage_test.cpp src/gguf.cpp src/gguf.hpp
-	mkdir -p bin && g++-14 -O2 -std=c++17 -o $@ tools/stage_test.cpp src/gguf.cpp -lpthread
+bin/gguf_test: tools/gguf_test.cpp src/gguf.cpp src/gguf.hpp src/rope_gguf.hpp build/model
+	mkdir -p bin && g++-14 -O2 -std=c++17 -DFNX_27B=$(FNX_27B) -o $@ tools/gguf_test.cpp src/gguf.cpp
+bin/stage_test: tools/stage_test.cpp src/gguf.cpp src/gguf.hpp build/model
+	mkdir -p bin && g++-14 -O2 -std=c++17 -DFNX_27B=$(FNX_27B) -o $@ tools/stage_test.cpp src/gguf.cpp -lpthread
 bin/sfnx_input_test: tools/sfnx_input_test.cpp tools/sfnx_input.hpp
 	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -pthread -o $@ tools/sfnx_input_test.cpp
 # the batched drafts' row plan, on the CPU alone
-bin/batch_plan_test: tools/batch_plan_test.cpp src/batch_plan.hpp
-	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -o $@ tools/batch_plan_test.cpp
+bin/batch_plan_test: tools/batch_plan_test.cpp src/batch_plan.hpp build/model
+	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -DFNX_27B=$(FNX_27B) -o $@ tools/batch_plan_test.cpp
 # the prompt path's ring plan against the two- and three-card sequences, and every supported count's sum, on the CPU
-bin/pf_ring_plan_test: tools/pf_ring_plan_test.cpp src/pf_ring_plan.hpp src/card_split.hpp src/model.hpp src/gguf.hpp build/ncard
-	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -DFNX_NCARD=$(FNX_NCARD) -o $@ tools/pf_ring_plan_test.cpp
+bin/pf_ring_plan_test: tools/pf_ring_plan_test.cpp src/pf_ring_plan.hpp src/card_split.hpp src/model.hpp src/gguf.hpp build/ncard build/model
+	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -DFNX_NCARD=$(FNX_NCARD) -DFNX_27B=$(FNX_27B) -o $@ tools/pf_ring_plan_test.cpp
 # YaRN's band, angles and magnitude against ggml's, on the CPU alone
 bin/rope_test: tools/rope_test.cpp src/rope.hpp
 	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -o $@ tools/rope_test.cpp
 # the start-up card checks against real cards' numbers and sysfs text, on the CPU alone
-bin/card_check_test: tools/card_check_test.cpp src/card_check.hpp src/peer_probe.hpp src/model.hpp src/card_split.hpp src/gguf.hpp build/ncard
-	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -DFNX_NCARD=$(FNX_NCARD) -o $@ tools/card_check_test.cpp
+bin/card_check_test: tools/card_check_test.cpp src/card_check.hpp src/peer_probe.hpp src/model.hpp src/card_split.hpp src/gguf.hpp build/ncard build/model
+	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -DFNX_NCARD=$(FNX_NCARD) -DFNX_27B=$(FNX_27B) -o $@ tools/card_check_test.cpp
 
 # one object per source in build/ (headers tracked by nvcc's own dependency files), so a change recompiles only the
 # objects it touches; every engine program and the lab's library link the same objects (position independent).
 # kernels.cu compiles as KPARTS objects in parallel (make -j), each with its share of the launchers (FNX_KPART)
 KPARTS := 0 1 2 3 4 5 6 7 8
 KERN_OBJ := $(foreach p,$(KPARTS),build/kernels_p$(p).o)
-ENG_OBJ := build/gguf.o build/model.o build/store.o $(KERN_OBJ) build/moe_mma.o build/engine.o build/peer_probe.o build/prefill.o build/session.o build/batch.o
+# the 27B's Engine (engine.hpp's interface) is its own: s27_engine.cu and its prompt path; everything else links shared
+ENG_MODEL := $(if $(filter 1,$(FNX_27B)),s27_,)
+ENG_OBJ := build/gguf.o build/model.o build/store.o $(KERN_OBJ) build/moe_mma.o build/$(ENG_MODEL)engine.o build/engine_common.o build/peer_probe.o build/$(ENG_MODEL)prefill.o build/session.o build/batch.o
 PIC := -Xcompiler -fPIC
 build/kernels_p%.o: src/kernels.cu $(STAMPS)
 	@mkdir -p build
@@ -136,7 +154,13 @@ build/tool_%.o: tools/%.cu $(STAMPS)
 bin/load_probe: build/tool_load_probe.o build/gguf.o build/model.o build/store.o
 	@mkdir -p bin
 	$(NVCC) $(NVFLAGS) -o $@ $^ -lcuda
-bin/kbench bin/moe_mma_bench bin/topk_test: bin/%: build/tool_%.o $(KERN_OBJ) build/moe_mma.o
+bin/s27_run: build/tool_s27_run.o $(ENG_OBJ)
+	@mkdir -p bin
+	$(NVCC) $(NVFLAGS) -o $@ $^ -lcublas -lcuda -lpthread
+bin/s27_bw_probe: build/tool_s27_bw_probe.o
+	@mkdir -p bin
+	$(NVCC) $(NVFLAGS) -o $@ $^
+bin/kbench bin/s27_probe bin/s27_ring_test bin/moe_mma_bench bin/topk_test: bin/%: build/tool_%.o $(KERN_OBJ) build/moe_mma.o
 	@mkdir -p bin
 	$(NVCC) $(NVFLAGS) -o $@ $^
 bin/sfnx: build/tool_sfnx.o $(ENG_OBJ)
@@ -149,7 +173,7 @@ bin/fnx_run bin/sample_test bin/cache_test bin/lanes_test bin/batch_test: bin/%:
 # the lab (tools/fnx_lab.cpp): bin/fnx_lab keeps the model loaded and runs fnx_run's commands from build/libfnx_lab.so,
 # which holds the engine and is reloaded after a rebuild; both use the shared CUDA runtime, and the lab exports the
 # model's code (gguf, model) to the library
-LAB_OBJ := $(KERN_OBJ) build/moe_mma.o build/engine.o build/peer_probe.o build/prefill.o build/session.o build/batch.o build/pic/tool_fnx_run.o
+LAB_OBJ := $(KERN_OBJ) build/moe_mma.o build/engine.o build/engine_common.o build/peer_probe.o build/prefill.o build/session.o build/batch.o build/pic/tool_fnx_run.o
 build/pic/tool_fnx_run.o: tools/fnx_run.cpp $(STAMPS)
 	@mkdir -p build/pic
 	$(NVCC) $(NVFLAGS) -Xcompiler -fPIC -DFNX_LAB_LIB -MD -MF build/pic/tool_fnx_run.d -c -o $@ $<

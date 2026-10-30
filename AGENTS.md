@@ -16,6 +16,18 @@ the verification and the settings.
   `peer_probe.cu` / `.hpp` (every link written and watched before the engine uses it, and the report and failure text
   it prints). `kernels.cu`
   compiles as nine objects (`-DFNX_KPART=0..8`), each holding its share of the launchers.
+- **Two models, one Engine** (`engine.hpp`): `engine_common.cu` holds what does not depend on the model (lanes and
+  pages, windows over one lane or many, commits, saved states, the draft layer's window, the sampler's candidates, the
+  window graphs), written against `engine_parts.hpp`; each model brings its per-card buffers and the few helpers that
+  header names (`engine_impl.hpp` for Flash-Next, `s27_impl.hpp` for the 27B), its layers and embeddings (`engine.cu`,
+  `s27_engine.cu`) and its prompt path (`prefill.cu`, `s27_prefill.cu`; their shared checks and ring conversions in
+  `pf_common.cuh`). `owned.hpp` is the release list every engine registers on. A third model is a third header and
+  engine file.
+- **The 27B** (`make FNX_MODEL=27b`, Qwen3.8-27B dense, docs/config.md "Model"): `s27_attn.cuh` (head-split paged
+  attention), `s27_ring3.cuh` (its sums); its differences in shared files (the loader, the kernels, the planner) sit
+  in `#if FNX_27B` blocks. Its tools: `s27_run` (a prompt and greedy decode with drafts), `s27_ring_test` (its sums,
+  timed and checked), `s27_probe` / `s27_bw_probe` (the weight-reading floor), `s27_cmp.py` (a layer dump against
+  llama.cpp's), `s27_detok.py`, and `s27.sh` (runs any of them, and the checks, with the memlock limit).
 - **`tools/`**: `sfnx.cpp` is the engine process (a line protocol on stdin, `sfnx_input.hpp`); `fnx_run.cpp` is the
   lab harness; `fnx_hold` / `fnx_lab` + `lab.sh` are the lab; the `*_test` programs and `*_check.sh` scripts are the
   checks (they share `labenv.sh`); the `*_probe` / `*_bench` programs measured the hardware the design rests on.
@@ -35,7 +47,9 @@ the GGUFs, configs and prompts all come from the operator. Missing authenticatio
 finding; a hidden *failure* is.
 
 The bar is correctness first: logits match llama.cpp to the same tolerance as llama.cpp's own CPU backend, on text and
-pictures, at temperature 0, and in distribution when sampled with drafts. `docs/benchmarks.md` is the contract; a
+pictures, at temperature 0, and in distribution when sampled with drafts. For the 27B, whose two llama.cpp backends
+agree 5–30x more closely than Flash-Next's, the tolerance is the widest of llama.cpp's own ways of running it (its
+CPU backend, its CUDA with and without int8 products of quantized activations: docs/verification.md, "The 27B"). `docs/benchmarks.md` is the contract; a
 change that silently moves them is a regression. Prod's settings are the code's defaults; environment settings exist
 to try better ones, and a new behaviour lands off by default until the GPU checks below pass.
 
@@ -85,6 +99,13 @@ Measure speed with `lab.sh decode` (edit1 and code1 greedy, prose2 and code1s wi
 utilization and power in every speed run. Mid perf push, measure speed only; run the exactness checks once the push is
 done.
 
+The 27B (`make FNX_MODEL=27b`, its own worktree: switching models rebuilds everything) has no lab: its checks load it
+plain (~30 s) through `tools/s27.sh` (the memlock limit the loader needs, and this shell's `FNX_*` settings):
+`tools/s27.sh bin/fnx_run models/Q8_0/Qwen3.8-27B-Q8_0.gguf exact` (and `decode`), `tools/s27.sh bin/batch_test MODEL
+nextn data/draft_vocab_en.bin 64 ref/long2.bin ref/code1.bin ref/long2.bin`, `SAMPLE_TEST_LANES=3 tools/s27.sh
+bin/sample_test MODEL nextn data/draft_vocab_en.bin ref/open1.bin 600 24`; serving through `serve/sfnx-27b.json`.
+Its llama.cpp references (docs/verification.md, "The 27B") are made locally like the rest of `ref/lgr/`.
+
 ## The checks (on the GPU, before merging engine changes; the full inventory: `docs/verification.md`)
 
 | Check | What it proves | How it fails |
@@ -98,8 +119,8 @@ done.
 | `.venv/bin/python -m pytest -q front/` | the front end (CPU only) | pytest |
 
 CI (`.github/workflows/ci.yml`, every PR and push to main, no GPU) builds `lab bin/sfnx test-bin` for sm_70 on every
-card count, sm_86 on three and four and every other arch on three, and runs the CPU-only checks above and the front
-end's tests (a skipped test fails it). The GPU rows stay the author's and the lead's to run.
+card count, sm_86 on three and four and every other arch on three, the 27B's programs (`make FNX_MODEL=27b`) on sm_70
+and two, three and four cards, and runs the CPU-only checks above and the front end's tests (a skipped test fails it). The GPU rows stay the author's and the lead's to run.
 
 Bases live in `/tmp/fnx-lab-$UID`, which a reboot empties: regenerate them with the previous build before judging a
 new one.

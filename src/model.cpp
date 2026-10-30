@@ -181,12 +181,23 @@ void lock_in_ram(const Tensor& t) {
 // the stager's groups for load_card: group l every tensor of layer l, group NL the output head's. The head is read
 // through the page cache: the draft layer (Mtp) takes its rows of output.weight from the mapping after the load
 std::vector<Stager::Group> stage_groups(const Gguf& g) {
+#if FNX_27B
+    // and group NL + 1 the draft layer, blk.NL (Flash-Next's comes from separate files, Mtp)
+    std::vector<Stager::Group> gs(NL + 2);
+    for (const auto& kv : g.tensors()) {
+        int l = -1, n = 0;
+        if (std::sscanf(kv.first.c_str(), "blk.%d.%n", &l, &n) == 1 && n > 0 && l >= 0 && l <= NL)
+            gs[(size_t) (l < NL ? l : NL + 1)].names.push_back(kv.first);
+    }
+    gs[NL].names = {"output_norm.weight", "output.weight"};
+#else
     std::vector<Stager::Group> gs(NL + 1);
     for (const auto& kv : g.tensors()) {
         int l = -1, n = 0;
         if (std::sscanf(kv.first.c_str(), "blk.%d.%n", &l, &n) == 1 && n > 0 && l >= 0 && l < NL) gs[(size_t) l].names.push_back(kv.first);
     }
     gs[NL].names = {"output_hc_norm.weight", "output_hc_down.weight", "output_hc_up.weight", "output.weight"};
+#endif
     gs[NL].cached = true;
     return gs;
 }
@@ -211,8 +222,13 @@ struct Up {
         c.bytes += bytes;
         return (T*) d;
     }
-    float* f32(const Tensor& t) {
+    // a norm as the window reads it: exactly n floats. A tensor of another width would feed garbage rows silently;
+    // the whole tensor must match, so extra rows fail too (the window never reads them)
+    float* f32(const Tensor& t, size_t n) {
         if (t.type != T_F32) throw std::runtime_error(t.name + " is not F32");
+        if (t.nbytes != n * 4)
+            throw std::runtime_error(t.name + " holds " + std::to_string(t.nbytes / 4) + " floats, not the " + std::to_string(n) +
+                                     " the window reads it at");
         return put<float>(t.data, t.nbytes);
     }
     // where a tensor's routed experts are assembled: with an ExpertCache (host_of) their mapped page-locked host copy,
@@ -325,12 +341,22 @@ struct Up {
             c.L[(size_t) l].down_e.ep = ec.ep_dn + (size_t) l * NEXP;
         }
     }
+    // row r of t (counting every matrix's rows, in order), which must be one of its rows: a row list made from the model's
+    // geometry would otherwise read the next tensor's bytes from the mapping when a GGUF's tensor is shorter than it
+    static const uint8_t* row_of(const Tensor& t, int r, size_t row_bytes) {
+        if (r < 0 || r >= t.nrows())
+            throw std::runtime_error(t.name + ": row " + std::to_string(r) + " asked for, it has " + std::to_string(t.nrows()));
+        return t.data + (size_t) r * row_bytes;
+    }
     // rows `rows` of a 2-D F32 tensor (ne1 indexes rows)
-    float* f32_rows(const Tensor& t, const std::vector<int>& rows) {
+    float* f32_rows(const Tensor& t, const std::vector<int>& rows, size_t row_floats) {
         if (t.type != T_F32) throw std::runtime_error(t.name + " is not F32");
+        if ((size_t) t.ne[0] != row_floats)
+            throw std::runtime_error(t.name + " is " + std::to_string(t.ne[0]) + " floats a row, not the " + std::to_string(row_floats) +
+                                     " its reader takes");
         std::vector<float> h(rows.size() * (size_t) t.ne[0]);
         for (size_t i = 0; i < rows.size(); ++i)
-            std::memcpy(&h[i * t.ne[0]], t.data + (size_t) rows[i] * t.ne[0] * 4, (size_t) t.ne[0] * 4);
+            std::memcpy(&h[i * t.ne[0]], row_of(t, rows[i], (size_t) t.ne[0] * 4), (size_t) t.ne[0] * 4);
         return put<float>(h.data(), h.size() * 4);
     }
     // Q8_0 -> bf16, the whole tensor; F32 -> bf16 likewise
@@ -420,7 +446,7 @@ struct Up {
         w.n_out = (int) rows.size();
         w.row_bytes = t.row_bytes();
         std::vector<uint8_t> h(rows.size() * w.row_bytes);
-        for (size_t i = 0; i < rows.size(); ++i) std::memcpy(&h[i * w.row_bytes], t.data + (size_t) rows[i] * w.row_bytes, w.row_bytes);
+        for (size_t i = 0; i < rows.size(); ++i) std::memcpy(&h[i * w.row_bytes], row_of(t, rows[i], w.row_bytes), w.row_bytes);
         w.p = put<uint8_t>(h.data(), h.size());
         return w;
     }
@@ -434,21 +460,44 @@ struct Up {
         w.row_bytes = t1.row_bytes();
         std::vector<uint8_t> h((size_t) w.n_out * w.row_bytes);
         size_t o = 0;
-        for (int r : r1) { std::memcpy(&h[o], t1.data + (size_t) r * w.row_bytes, w.row_bytes); o += w.row_bytes; }
-        for (int r : r2) { std::memcpy(&h[o], t2.data + (size_t) r * w.row_bytes, w.row_bytes); o += w.row_bytes; }
+        for (int r : r1) { std::memcpy(&h[o], row_of(t1, r, w.row_bytes), w.row_bytes); o += w.row_bytes; }
+        for (int r : r2) { std::memcpy(&h[o], row_of(t2, r, w.row_bytes), w.row_bytes); o += w.row_bytes; }
         w.p = put<uint8_t>(h.data(), h.size());
         return w;
     }
+#if FNX_27B
+    // rows r1 of t1, r2 of t2, then r3 of t3, one matrix
+    DW rows3(const Tensor& t1, const std::vector<int>& r1, const Tensor& t2, const std::vector<int>& r2, const Tensor& t3,
+             const std::vector<int>& r3) {
+        for (const Tensor* t : {&t2, &t3})
+            if (t1.type != t->type || t1.ne[0] != t->ne[0]) throw std::runtime_error(t1.name + " and " + t->name + " do not stack");
+        DW w;
+        w.type = t1.type;
+        w.n_in = (int) t1.ne[0];
+        w.n_out = (int) (r1.size() + r2.size() + r3.size());
+        w.row_bytes = t1.row_bytes();
+        std::vector<uint8_t> h((size_t) w.n_out * w.row_bytes);
+        size_t o = 0;
+        for (const auto& [t, rs] : {std::pair{&t1, &r1}, std::pair{&t2, &r2}, std::pair{&t3, &r3}})
+            for (int r : *rs) { std::memcpy(&h[o], row_of(*t, r, w.row_bytes), w.row_bytes); o += w.row_bytes; }
+        w.p = put<uint8_t>(h.data(), h.size());
+        return w;
+    }
+#endif
     // rows `rows` of t1 then of t2 as f32 (F32 rows as they are, Q8_0 rows dequantized)
-    float* f32_rows2(const Tensor& t1, const Tensor& t2, const std::vector<int>& rows) {
+    float* f32_rows2(const Tensor& t1, const Tensor& t2, const std::vector<int>& rows, size_t row_floats) {
         std::vector<float> h;
         for (const Tensor* t : {&t1, &t2}) {
             const size_t n = (size_t) t->ne[0];
+            if (n != row_floats)
+                throw std::runtime_error(t->name + " is " + std::to_string(n) + " floats a row, not the " + std::to_string(row_floats) +
+                                         " its reader takes");
             for (int r : rows) {
                 if (t->type == T_F32) {
-                    h.insert(h.end(), (const float*) t->data + (size_t) r * n, (const float*) t->data + (size_t) (r + 1) * n);
+                    const float* row = (const float*) row_of(*t, r, n * 4);
+                    h.insert(h.end(), row, row + n);
                 } else if (t->type == T_Q8_0 && n % 32 == 0) {
-                    const uint8_t* row = t->data + (size_t) r * t->row_bytes();
+                    const uint8_t* row = row_of(*t, r, t->row_bytes());
                     for (size_t b = 0; b < n / 32; ++b) {
                         uint16_t dh;
                         std::memcpy(&dh, row + b * 34, 2);
@@ -471,6 +520,9 @@ struct Up {
         w.n_out = (int) t.ne[1];
         w.row_bytes = blocks.size() * ti.bytes;
         const size_t src_row = t.row_bytes();
+        for (int b : blocks)
+            if (b < 0 || (size_t) (b + 1) * ti.bytes > src_row)
+                throw std::runtime_error(t.name + ": block " + std::to_string(b) + " asked for, a row has " + std::to_string(src_row / ti.bytes));
         std::vector<uint8_t> h((size_t) w.n_out * w.row_bytes);
         for (int r = 0; r < w.n_out; ++r)
             for (size_t b = 0; b < blocks.size(); ++b)
@@ -479,7 +531,13 @@ struct Up {
         return w;
     }
     // per expert: rows [r0, r1) (gate / up), expert-major
+    static void row_range(const Tensor& t, int r0, int r1) {
+        if (r0 < 0 || r1 <= r0 || r1 > t.ne[1])
+            throw std::runtime_error(t.name + ": rows [" + std::to_string(r0) + ", " + std::to_string(r1) + ") asked for, it has " +
+                                     std::to_string(t.ne[1]) + " a matrix");
+    }
     DW expert_rows(const Tensor& t, int r0, int r1, size_t& stride) {
+        row_range(t, r0, r1);
         DW w;
         w.type = t.type;
         w.n_in = (int) t.ne[0];
@@ -495,6 +553,8 @@ struct Up {
     // per expert: rows [r0, r1) of t1 then of t2 (gate; up), expert-major
     DW expert_rows2(const Tensor& t1, const Tensor& t2, int r0, int r1, size_t& stride, const char** host_of = nullptr) {
         if (t1.type != t2.type || t1.ne[0] != t2.ne[0] || t1.ne[2] != t2.ne[2]) throw std::runtime_error(t1.name + " and " + t2.name + " do not stack");
+        row_range(t1, r0, r1);
+        row_range(t2, r0, r1);
         DW w;
         w.type = t1.type;
         w.n_in = (int) t1.ne[0];
@@ -513,8 +573,11 @@ struct Up {
         return w;
     }
     // f32 tensors' rows one after another
-    float* f32_cat(const Tensor& t1, const Tensor& t2) {
+    float* f32_cat(const Tensor& t1, const Tensor& t2, size_t row_floats) {
         if (t1.type != T_F32 || t2.type != T_F32 || t1.ne[0] != t2.ne[0]) throw std::runtime_error(t1.name + " and " + t2.name + " do not stack");
+        if ((size_t) t1.ne[0] != row_floats)
+            throw std::runtime_error(t1.name + " is " + std::to_string(t1.ne[0]) + " floats a row, not the " + std::to_string(row_floats) +
+                                     " its reader takes");
         std::vector<float> h((const float*) t1.data, (const float*) t1.data + t1.ne[0] * t1.ne[1]);
         h.insert(h.end(), (const float*) t2.data, (const float*) t2.data + t2.ne[0] * t2.ne[1]);
         return put<float>(h.data(), h.size() * 4);
@@ -529,6 +592,9 @@ struct Up {
         w.row_bytes = (size_t) (b1 - b0) * ti.bytes;
         stride = (size_t) w.n_out * w.row_bytes;
         const size_t src_row = t.row_bytes(), src_mat = (size_t) t.ne[1] * src_row;
+        if (b0 < 0 || b1 <= b0 || (size_t) b1 * ti.bytes > src_row)
+            throw std::runtime_error(t.name + ": blocks [" + std::to_string(b0) + ", " + std::to_string(b1) + ") asked for, a row has " +
+                                     std::to_string(src_row / ti.bytes));
         std::vector<uint8_t> tmp;
         const size_t bytes = (size_t) t.ne[2] * stride;
         uint8_t* h = expert_buf(bytes, host_of, tmp);
@@ -545,6 +611,94 @@ std::vector<int> range(int a, int b) {
     for (int i = a; i < b; ++i) v.push_back(i);
     return v;
 }
+
+#if FNX_27B
+// The 27B's layers on a card, from load_card's channel lists: the recurrent layers as Flash-Next's; attention split by
+// heads (K/V too: each card keeps its own heads' cache, src/s27_attn.cuh), q | gate, K and V stacked in one matrix;
+// the dense FFN by FF width; then the head, and the draft layer (blk.NL, stage group NL + 1). Every matrix q8s reads
+// is Q8_0: the 27B's path has no other matvec
+void load_layers_27b(Stager& st, CardW& c, Up& up, const std::vector<int>& conv_rows, const std::vector<int>& zrows,
+                     const std::vector<int>& vblocks, const std::vector<int>& qrows, const std::vector<int>& kvrows,
+                     const std::vector<int>& woblocks) {
+    auto L = [&](int l, const char* s) -> const Tensor& { return st.t(l, "blk." + std::to_string(l) + "." + s); };
+    const std::vector<int>& vheads = c.vheads;
+    auto q8 = [](const DW& d, const std::string& what) {
+        if (!d.s.q) throw std::runtime_error("27b: " + what + " is not Q8_0 (the 27B's matvecs read Q8_0 only)");
+    };
+    // the shape the window writes and reads it at (rows are the output stride; a wrong one would land at another)
+    auto shape = [](const DW& d, int out, int in, const std::string& what) {
+        if (d.n_out != out || d.n_in != in)
+            throw std::runtime_error("27b: " + what + " is " + std::to_string(d.n_out) + " x " + std::to_string(d.n_in) + ", not " +
+                                     std::to_string(out) + " x " + std::to_string(in));
+    };
+    const int ffs = c.fd1 - c.fd0, qkv = c.nq * 2 * HD + 2 * c.nkv * HD;
+    auto attn = [&](LayerW& w, auto&& T) {
+        w.wq = up.dense(up.rows3(T("attn_q.weight"), qrows, T("attn_k.weight"), kvrows, T("attn_v.weight"), kvrows));
+        w.wo = up.dense(up.cols(T("attn_output.weight"), woblocks));
+        w.q_norm = up.f32(T("attn_q_norm.weight"), HD);
+        w.k_norm = up.f32(T("attn_k_norm.weight"), HD);
+    };
+    auto ffn = [&](LayerW& w, auto&& T) {
+        w.attn_norm = up.f32(T("attn_norm.weight"), N);
+        w.ffn_norm = up.f32(T("post_attention_norm.weight"), N);
+        w.ffn_gu = up.dense(up.rows2(T("ffn_gate.weight"), range(c.fd0, c.fd1), T("ffn_up.weight"), range(c.fd0, c.fd1)));
+        w.ffn_down = up.dense(up.cols(T("ffn_down.weight"), range(c.fd0 / 32, c.fd1 / 32)));
+    };
+    c.L.resize(NL);
+    for (int l = 0; l < NL; ++l) {
+        LayerW& w = c.L[l];
+        auto T = [&](const char* s) -> const Tensor& { return L(l, s); };
+        if (!is_attn(l)) {
+            w.qkvz = up.dense(up.rows2(T("attn_qkv.weight"), conv_rows, T("attn_gate.weight"), zrows));
+            w.ab = up.f32_rows2(T("ssm_alpha.weight"), T("ssm_beta.weight"), vheads, N);
+            w.ssm_out = up.dense(up.cols(T("ssm_out.weight"), vblocks));
+            w.conv = up.f32_rows(T("ssm_conv1d.weight"), conv_rows, 4);
+            std::vector<float> a, dt;
+            const size_t nh = (size_t) *std::max_element(vheads.begin(), vheads.end()) + 1;
+            const float* af = f32_data(T("ssm_a"), nh);
+            const float* df = f32_data(T("ssm_dt.bias"), nh);
+            for (int h : vheads) { a.push_back(af[h]); dt.push_back(df[h]); }
+            w.ssm_a = up.put<float>(a.data(), a.size() * 4);
+            w.dt_bias = up.put<float>(dt.data(), dt.size() * 4);
+            w.ssm_norm = up.f32(T("ssm_norm.weight"), HS);
+            q8(w.qkvz, "layer " + std::to_string(l) + "'s qkv | gate"), q8(w.ssm_out, "layer " + std::to_string(l) + "'s ssm_out");
+            shape(w.qkvz, c.conv_ch() + c.nv() * HS, N, "layer " + std::to_string(l) + "'s qkv | gate");
+            shape(w.ssm_out, N, c.nv() * HS, "layer " + std::to_string(l) + "'s ssm_out");
+        } else {
+            attn(w, T);
+            q8(w.wq, "layer " + std::to_string(l) + "'s q | k | v"), q8(w.wo, "layer " + std::to_string(l) + "'s attn_output");
+            shape(w.wq, qkv, N, "layer " + std::to_string(l) + "'s q | k | v");
+            shape(w.wo, N, c.nq * HD, "layer " + std::to_string(l) + "'s attn_output");
+        }
+        ffn(w, T);
+        q8(w.ffn_gu, "layer " + std::to_string(l) + "'s gate | up"), q8(w.ffn_down, "layer " + std::to_string(l) + "'s down");
+        shape(w.ffn_gu, 2 * ffs, N, "layer " + std::to_string(l) + "'s gate | up");
+        shape(w.ffn_down, N, ffs, "layer " + std::to_string(l) + "'s down");
+        st.done(l);
+    }
+    c.out_norm = up.f32(st.t(NL, "output_norm.weight"), N);
+    c.out = up.dense(up.rows(st.t(NL, "output.weight"), range(c.v0, c.v1)));
+    q8(c.out, "output.weight");
+    shape(c.out, c.v1 - c.v0, N, "output.weight's rows");
+    st.done(NL);
+    {
+        auto T = [&](const char* s) -> const Tensor& { return st.t(NL + 1, "blk." + std::to_string(NL) + "." + s); };
+        attn(c.mtp, T);
+        ffn(c.mtp, T);
+        c.mtp_eh = up.dense(up.rows(T("nextn.eh_proj.weight"), range(0, N)));   // every card the whole of it
+        c.mtp_enorm = up.f32(T("nextn.enorm.weight"), N);
+        c.mtp_hnorm = up.f32(T("nextn.hnorm.weight"), N);
+        c.mtp_head_norm = up.f32(T("nextn.shared_head_norm.weight"), N);
+        for (const DW* d : {&c.mtp.wq, &c.mtp.wo, &c.mtp.ffn_gu, &c.mtp.ffn_down, &c.mtp_eh}) q8(*d, "a draft layer matrix");
+        shape(c.mtp.wq, qkv, N, "the draft layer's q | k | v");
+        shape(c.mtp.wo, N, c.nq * HD, "the draft layer's attn_output");
+        shape(c.mtp.ffn_gu, 2 * ffs, N, "the draft layer's gate | up");
+        shape(c.mtp.ffn_down, N, ffs, "the draft layer's down");
+        shape(c.mtp_eh, N, 2 * N, "the draft layer's eh_proj");
+        st.done(NL + 1);
+    }
+}
+#endif
 
 // The tensors come from st: group l is layer l's, group NL the output head's (stage_groups); each group is given back
 // once this card is through with it.
@@ -587,6 +741,11 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
     }
     for (int h = c.kv0; h < c.kv0 + c.nkv; ++h)
         for (int i = 0; i < HD; ++i) kvrows.push_back(h * HD + i);
+#if FNX_27B
+    (void) resident, (void) arena_score, (void) host_experts;
+    load_layers_27b(st, c, up, conv_rows, zrows, vblocks, qrows, kvrows, woblocks);
+    return;
+#endif
     // the K/V cache is split by position: every card projects q for every head and k/v for both KV heads
     std::vector<int> qrows_all, kvrows_all;
     for (int i = 0; i < NQH * 2 * HD; ++i) qrows_all.push_back(i);
@@ -599,17 +758,23 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
         const char** hd = host_experts ? hdn.data() + (size_t) l * NEXP : nullptr;
         const char* hp[2] = {"hc_attn_", "hc_ffn_"};
         for (int h = 0; h < 2; ++h) {
-            w.hc_norm[h] = up.f32(L(l, (std::string(hp[h]) + "norm.weight").c_str()));
+            w.hc_norm[h] = up.f32(L(l, (std::string(hp[h]) + "norm.weight").c_str()), D);
             w.hc_down[h] = up.q8split(L(l, (std::string(hp[h]) + "down.weight").c_str()));
             w.hc_up[h] = up.q8split(L(l, (std::string(hp[h]) + "up.weight").c_str()));
             w.hc_inj[h] = up.bf16(L(l, (std::string(hp[h]) + "inject.weight").c_str()));
         }
-        w.router = up.f32_cat(L(l, "ffn_gate_inp.weight"), L(l, "ffn_gate_inp_shexp.weight"));
+        const Tensor& gi = L(l, "ffn_gate_inp.weight");
+        const Tensor& gs = L(l, "ffn_gate_inp_shexp.weight");
+        if (gi.ne[1] != NEXP || gs.ne[1] != 1)
+            throw std::runtime_error("fnx: " + gi.name + " holds " + std::to_string(gi.ne[1]) + " rows and " + gs.name + " " +
+                                     std::to_string(gs.ne[1]) + ", not the " + std::to_string(NEXP) +
+                                     " gate rows and 1 shared row k_router_route reads");
+        w.router = up.f32_cat(gi, gs, N);
         if (!is_attn(l)) {
             w.qkvz = up.dense(up.rows2(L(l, "attn_qkv.weight"), conv_rows, L(l, "attn_gate.weight"), zrows));
-            w.ab = up.f32_rows2(L(l, "ssm_alpha.weight"), L(l, "ssm_beta.weight"), vheads);
+            w.ab = up.f32_rows2(L(l, "ssm_alpha.weight"), L(l, "ssm_beta.weight"), vheads, N);
             w.ssm_out = up.dense(up.cols(L(l, "ssm_out.weight"), vblocks));
-            w.conv = up.f32_rows(L(l, "ssm_conv1d.weight"), conv_rows);
+            w.conv = up.f32_rows(L(l, "ssm_conv1d.weight"), conv_rows, 4);
             std::vector<float> a, dt;
             const size_t nh = (size_t) *std::max_element(vheads.begin(), vheads.end()) + 1;
             const float* af = f32_data(L(l, "ssm_a"), nh);
@@ -617,18 +782,25 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
             for (int h : vheads) { a.push_back(af[h]); dt.push_back(df[h]); }
             w.ssm_a = up.put<float>(a.data(), a.size() * 4);
             w.dt_bias = up.put<float>(dt.data(), dt.size() * 4);
-            w.ssm_norm = up.f32(L(l, "ssm_norm.weight"));
+            w.ssm_norm = up.f32(L(l, "ssm_norm.weight"), HS);
         } else {
             w.wq = up.dense(up.rows(L(l, "attn_q.weight"), qrows_all));
             w.wk = up.dense(up.rows(L(l, "attn_k.weight"), kvrows_all));
             w.wv = up.dense(up.rows(L(l, "attn_v.weight"), kvrows_all));
             w.wo = up.dense(up.cols(L(l, "attn_output.weight"), woblocks));
-            w.q_norm = up.f32(L(l, "attn_q_norm.weight"));
-            w.k_norm = up.f32(L(l, "attn_k_norm.weight"));
-            w.idx_wq = up.bf16(L(l, "indexer.q_proj.weight"));
-            w.idx_wk = up.bf16(L(l, "indexer.k_proj.weight"));
-            w.idx_qn = up.f32(L(l, "indexer.q_norm.weight"));
-            w.idx_kn = up.f32(L(l, "indexer.k_norm.weight"));
+            w.q_norm = up.f32(L(l, "attn_q_norm.weight"), HD);
+            w.k_norm = up.f32(L(l, "attn_k_norm.weight"), HD);
+            const Tensor& iq = L(l, "indexer.q_proj.weight");
+            const Tensor& ik = L(l, "indexer.k_proj.weight");
+            if (iq.ne[1] != QSA_HEADS * QSA_KEY || iq.ne[0] != N || ik.ne[1] != QSA_KEY || ik.ne[0] != N)
+                throw std::runtime_error("fnx: " + iq.name + " is " + std::to_string(iq.ne[0]) + " by " + std::to_string(iq.ne[1]) +
+                                         " and " + ik.name + " is " + std::to_string(ik.ne[0]) + " by " + std::to_string(ik.ne[1]) +
+                                         ", not the " + std::to_string(N) + " by " + std::to_string(QSA_HEADS * QSA_KEY) + " and " +
+                                         std::to_string(N) + " by " + std::to_string(QSA_KEY) + " k_idx_proj reads");
+            w.idx_wq = up.bf16(iq);
+            w.idx_wk = up.bf16(ik);
+            w.idx_qn = up.f32(L(l, "indexer.q_norm.weight"), QSA_KEY);
+            w.idx_kn = up.f32(L(l, "indexer.k_norm.weight"), QSA_KEY);
         }
         w.gu_e = up.expert_rows2(L(l, "ffn_gate_exps.weight"), L(l, "ffn_up_exps.weight"), c.ff0, c.ff1, w.gu_e_stride, hg);
         w.down_e = up.expert_cols(L(l, "ffn_down_exps.weight"), c.ff0 / 32, c.ff1 / 32, w.down_e_stride, hd);
@@ -636,16 +808,29 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
         w.sh_down = up.dense(up.cols(L(l, "ffn_down_shexp.weight"), range(c.ff0 / 32, c.ff1 / 32)));
         if (!w.sh_gu.s.q || !w.sh_down.s.q) throw std::runtime_error("fnx: the shared expert is not Q8_0");
         if (l == PLE_LAYER) {
-            c.ple_key = up.dense(up.rows(L(l, "ple_key.weight"), range(0, (int) L(l, "ple_key.weight").ne[1])));
-            c.ple_value = up.dense(up.rows(L(l, "ple_value.weight"), range(0, (int) L(l, "ple_value.weight").ne[1])));
-            c.ple_norm_key = up.f32(L(l, "ple_norm_key.weight"));
-            c.ple_norm_query = up.f32(L(l, "ple_norm_query.weight"));
-            c.ple_norm_conv = up.f32(L(l, "ple_norm_conv.weight"));
-            c.ple_conv = up.f32(L(l, "ple_conv1d.weight"));
+            const Tensor& pk = L(l, "ple_key.weight");
+            const Tensor& pv = L(l, "ple_value.weight");
+            // dense() reads N-wide xq rows and writes D-float rows into b->ple_key, N-float into b->ple_val
+            if (pk.ne[0] != N || pk.ne[1] != D)
+                throw std::runtime_error("fnx: " + pk.name + " is " + std::to_string(pk.ne[0]) + " by " + std::to_string(pk.ne[1]) +
+                                         ", not the " + std::to_string(N) + " by " + std::to_string(D) + " its dense into the ple_key rows reads");
+            if (pv.ne[0] != N || pv.ne[1] != N)
+                throw std::runtime_error("fnx: " + pv.name + " is " + std::to_string(pv.ne[0]) + " by " + std::to_string(pv.ne[1]) +
+                                         ", not the " + std::to_string(N) + " by " + std::to_string(N) + " its dense into the ple_val rows reads");
+            c.ple_key = up.dense(up.rows(pk, range(0, (int) pk.ne[1])));
+            c.ple_value = up.dense(up.rows(pv, range(0, (int) pv.ne[1])));
+            c.ple_norm_key = up.f32(L(l, "ple_norm_key.weight"), D);
+            c.ple_norm_query = up.f32(L(l, "ple_norm_query.weight"), D);
+            c.ple_norm_conv = up.f32(L(l, "ple_norm_conv.weight"), D);
+            const Tensor& pc = L(l, "ple_conv1d.weight");   // k_ple_conv reads w[ch * 4 + k]: 4 a row, D of them
+            if (pc.ne[0] != 4 || pc.ne[1] != D)
+                throw std::runtime_error("fnx: " + pc.name + " is " + std::to_string(pc.ne[0]) + " by " + std::to_string(pc.ne[1]) +
+                                         ", not the 4 by " + std::to_string(D) + " k_ple_conv reads");
+            c.ple_conv = up.f32(pc, 4 * D);
         }
         st.done(l);
     }
-    c.head_norm = up.f32(st.t(NL, "output_hc_norm.weight"));
+    c.head_norm = up.f32(st.t(NL, "output_hc_norm.weight"), D);
     c.head_down = up.q8split(st.t(NL, "output_hc_down.weight"));
     c.head_up = up.q8split(st.t(NL, "output_hc_up.weight"));
     c.out = up.dense(up.rows(st.t(NL, "output.weight"), range(c.v0, c.v1)));
@@ -722,7 +907,9 @@ struct MtpFiles {
         constexpr size_t ROW_GU = H / 4, ROW_D = F / 4, SC_GU = H / 64, SC_D = F / 64;
         constexpr size_t O_D = 2ull * F * ROW_GU, O_GS = O_D + (size_t) H * ROW_D, O_DS = O_GS + 2ull * F * SC_GU * 2;
         constexpr size_t BLOB = O_DS + (size_t) H * SC_D * 2;
+#if !FNX_27B
         static_assert(BLOB == 1382400, "Strata's Q2_0 expert blob");
+#endif
         std::FILE* f = std::fopen(path.c_str(), "rb");
         if (!f) throw std::runtime_error("mtp: cannot open " + path);
         const size_t qrow_gu = (size_t) H / 32 * 18, qrow_d = (size_t) F / 32 * 18;
@@ -840,7 +1027,7 @@ void load_mtp_card(const Model& m, const MtpFiles& f, const CardW& c, const std:
     const char* hp[2] = {"attn_hyper_connection.", "mlp_hyper_connection."};
     for (int h = 0; h < 2; ++h) {
         const std::string p = hp[h];
-        w.hc_norm[h] = up.f32(f[p + "hc_norm.weight"]);
+        w.hc_norm[h] = up.f32(f[p + "hc_norm.weight"], D);
         w.hc_down[h] = q8((p + "input_mix_weight_down.weight").c_str());
         w.hc_up[h] = q8((p + "input_mix_weight_up.weight").c_str());
         const Tensor& inj = f[p + "block_inject_weight.weight"];
@@ -848,23 +1035,32 @@ void load_mtp_card(const Model& m, const MtpFiles& f, const CardW& c, const std:
     }
     {   // the router's rows, then the shared expert's gate, as f32
         const Tensor &r = f["mlp.gate.weight"], &sg = f["mlp.shared_expert_gate.weight"];
-        std::vector<float> h((size_t) (r.ne[1] + sg.ne[1]) * N);
+        if (r.ne[1] != NEXP || r.ne[0] != N)
+            throw std::runtime_error("mtp: mlp.gate.weight is " + std::to_string(r.ne[0]) + " by " + std::to_string(r.ne[1]) +
+                                     ", not the " + std::to_string(N) + " by " + std::to_string(NEXP) + " the router reads");
+        if (sg.ne[0] != N || sg.ne[1] != 1)
+            throw std::runtime_error("mtp: mlp.shared_expert_gate.weight is " + std::to_string(sg.ne[0]) + " by " +
+                                     std::to_string(sg.ne[1]) + ", not the " + std::to_string(N) + " by 1 it reads");
+        std::vector<float> h((size_t) (NEXP + 1) * N);
         const uint16_t* a = bf16_of(r);
-        for (size_t i = 0; i < (size_t) r.ne[1] * N; ++i) { const uint32_t u = (uint32_t) a[i] << 16; std::memcpy(&h[i], &u, 4); }
+        for (size_t i = 0; i < (size_t) NEXP * N; ++i) { const uint32_t u = (uint32_t) a[i] << 16; std::memcpy(&h[i], &u, 4); }
         const uint16_t* b = bf16_of(sg);
-        for (size_t i = 0; i < (size_t) N; ++i) { const uint32_t u = (uint32_t) b[i] << 16; std::memcpy(&h[(size_t) r.ne[1] * N + i], &u, 4); }
-        if (r.ne[1] != NEXP || r.ne[0] != N || sg.ne[1] != 1) throw std::runtime_error("mtp: router shape");
+        for (size_t i = 0; i < (size_t) N; ++i) { const uint32_t u = (uint32_t) b[i] << 16; std::memcpy(&h[(size_t) NEXP * N + i], &u, 4); }
         w.router = up.put<float>(h.data(), h.size() * 4);
     }
     w.wq = up.dense(up.rows(f["self_attn.q_proj.weight"], qrows_all));
     w.wk = up.dense(up.rows(f["self_attn.k_proj.weight"], kvrows_all));
     w.wv = up.dense(up.rows(f["self_attn.v_proj.weight"], kvrows_all));
     w.wo = up.dense(up.cols(f["self_attn.o_proj.weight"], woblocks));
-    w.q_norm = up.f32(f["self_attn.q_norm.weight"]);
-    w.k_norm = up.f32(f["self_attn.k_norm.weight"]);
-    w.idx_qk = up.dense(up.rows(f["self_attn.indexer.index_qk_proj.weight"], range(0, 640)));
-    w.idx_qn = up.f32(f["self_attn.indexer.q_layernorm.weight"]);
-    w.idx_kn = up.f32(f["self_attn.indexer.k_layernorm.weight"]);
+    w.q_norm = up.f32(f["self_attn.q_norm.weight"], HD);
+    w.k_norm = up.f32(f["self_attn.k_norm.weight"], HD);
+    const Tensor& iqk = f["self_attn.indexer.index_qk_proj.weight"];
+    if (iqk.ne[1] != (QSA_HEADS + 1) * QSA_KEY || iqk.ne[0] != N)
+        throw std::runtime_error("mtp: " + iqk.name + " is " + std::to_string(iqk.ne[0]) + " by " + std::to_string(iqk.ne[1]) + ", not the " +
+                                 std::to_string(N) + " by " + std::to_string((QSA_HEADS + 1) * QSA_KEY) + " (queries then key) it reads");
+    w.idx_qk = up.dense(up.rows(iqk, range(0, (QSA_HEADS + 1) * QSA_KEY)));
+    w.idx_qn = up.f32(f["self_attn.indexer.q_layernorm.weight"], QSA_KEY);
+    w.idx_kn = up.f32(f["self_attn.indexer.k_layernorm.weight"], QSA_KEY);
     w.gu_e = up.expert_rows2(f.gate, f.up, c.ff0, c.ff1, w.gu_e_stride);
     w.down_e = up.expert_cols(f.down, c.ff0 / 32, c.ff1 / 32, w.down_e_stride);
     w.sh_gu = up.dense(up.rows2(f["mlp.shared_expert.gate_proj.weight"], range(c.ff0, c.ff1), f["mlp.shared_expert.up_proj.weight"],
@@ -872,9 +1068,9 @@ void load_mtp_card(const Model& m, const MtpFiles& f, const CardW& c, const std:
     w.sh_down = up.dense(up.cols(f["mlp.shared_expert.down_proj.weight"], range(c.ff0 / 32, c.ff1 / 32)));
     mc.fc_emb = up.dense(up.rows(f["fc_embedding.weight"], range(0, N)));
     mc.fc_hid = up.dense(up.rows(f["fc_hidden.weight"], range(0, N)));
-    mc.norm_emb = up.f32(f["pre_fc_norm_embedding.weight"]);
-    mc.norm_hid = up.f32(f["pre_fc_norm_hidden.weight"]);
-    mc.mix_norm = up.f32(f["hyper_connection_mixer.hc_norm.weight"]);
+    mc.norm_emb = up.f32(f["pre_fc_norm_embedding.weight"], N);
+    mc.norm_hid = up.f32(f["pre_fc_norm_hidden.weight"], D);
+    mc.mix_norm = up.f32(f["hyper_connection_mixer.hc_norm.weight"], D);
     mc.mix_down = q8("hyper_connection_mixer.input_mix_weight_down.weight");
     mc.mix_up = q8("hyper_connection_mixer.input_mix_weight_up.weight");
     std::vector<int> rows(vocab.begin() + mc.dv0, vocab.begin() + mc.dv1);
@@ -885,17 +1081,78 @@ void load_mtp_card(const Model& m, const MtpFiles& f, const CardW& c, const std:
 
 }  // namespace
 
+#if FNX_27B
+// the 27B's draft head: this card's rows of output.weight for its share of the draft vocabulary (the layer itself came
+// with the model). dir names where the layer comes from, so a Flash-Next runtime directory in a 27B config fails here
+Mtp::Mtp(const Model& m, const std::string& dir, const std::string& vocab_file) {
+    if (dir != "nextn") throw std::runtime_error("mtp: the 27B's draft layer is the GGUF's own: its directory is \"nextn\", not \"" + dir + "\"");
+    if (vocab_file.empty()) throw std::runtime_error("mtp: the 27B needs a draft vocabulary file");
+    {
+        std::FILE* f = std::fopen(vocab_file.c_str(), "rb");
+        if (!f) throw std::runtime_error("mtp: cannot open " + vocab_file);
+        struct stat stb{};
+        if (fstat(fileno(f), &stb) != 0 || stb.st_size % 4 != 0) {
+            std::fclose(f);
+            throw std::runtime_error("mtp: " + vocab_file + " is not whole int32 token ids (" + std::to_string((long long) stb.st_size) + " bytes)");
+        }
+        int32_t id;
+        while (std::fread(&id, 4, 1, f) == 1) vocab.push_back(id);
+        const bool io_bad = std::ferror(f) != 0;
+        std::fclose(f);
+        if (io_bad || vocab.size() * 4 != (size_t) stb.st_size)
+            throw std::runtime_error("mtp: " + vocab_file + " stopped at " + std::to_string(vocab.size() * 4) +
+                                     " of its " + std::to_string((long long) stb.st_size) + " bytes");
+        if (vocab.empty()) throw std::runtime_error("mtp: " + vocab_file + " is empty");
+        for (int id2 : vocab)
+            if (id2 < 0 || id2 >= m.vocab) throw std::runtime_error("mtp: " + vocab_file + " holds a token outside the vocabulary");
+    }
+    cards.resize(NCARD);
+    const int step = ((int) vocab.size() + NCARD - 1) / NCARD;
+    std::vector<std::thread> th;
+    std::vector<std::string> errs(NCARD);
+    for (int c = 0; c < NCARD; ++c) {
+        cards[c].dv0 = std::min((int) vocab.size(), c * step);
+        cards[c].dv1 = std::min((int) vocab.size(), (c + 1) * step);
+        th.emplace_back([&, c] {
+            try {
+                MtpCard& mc = cards[c];
+                ck(cudaSetDevice(m.cards[c].dev), "cudaSetDevice");
+                CardW sink;   // Up counts bytes into a CardW
+                sink.dev = mc.dev = m.cards[c].dev;
+                Up up{sink, nullptr, &mc.allocs};
+                mc.head = up.dense(up.rows(*m.g.find("output.weight"), std::vector<int>(vocab.begin() + mc.dv0, vocab.begin() + mc.dv1)));
+                if (!mc.head.s.q) throw std::runtime_error("mtp: output.weight is not Q8_0");
+            } catch (const std::exception& e) { errs[c] = e.what(); }
+        });
+    }
+    for (auto& t : th) t.join();
+    for (int c = 0; c < NCARD; ++c)
+        if (!errs[c].empty()) {
+            free_mtp_cards(cards);
+            throw std::runtime_error("mtp card " + std::to_string(c) + ": " + errs[c]);
+        }
+}
+#else
 Mtp::Mtp(const Model& m, const std::string& dir, const std::string& vocab_file) {
     {
         const std::string vf = vocab_file.empty() ? dir + "/draft_vocab.bin" : vocab_file;
         std::FILE* f = std::fopen(vf.c_str(), "rb");
         if (!f) throw std::runtime_error("mtp: cannot open " + vf);
+        struct stat stb{};
+        if (fstat(fileno(f), &stb) != 0 || stb.st_size % 4 != 0) {
+            std::fclose(f);
+            throw std::runtime_error("mtp: " + vf + " is not whole int32 token ids (" + std::to_string((long long) stb.st_size) + " bytes)");
+        }
         int32_t id;
         while (std::fread(&id, 4, 1, f) == 1) vocab.push_back(id);
+        const bool io_bad = std::ferror(f) != 0;
         std::fclose(f);
-        if (vocab.empty()) throw std::runtime_error("mtp: draft_vocab.bin is empty");
+        if (io_bad || vocab.size() * 4 != (size_t) stb.st_size)
+            throw std::runtime_error("mtp: " + vf + " stopped at " + std::to_string(vocab.size() * 4) +
+                                     " of its " + std::to_string((long long) stb.st_size) + " bytes");
+        if (vocab.empty()) throw std::runtime_error("mtp: " + vf + " is empty");
         for (int id2 : vocab)
-            if (id2 < 0 || id2 >= m.vocab) throw std::runtime_error("mtp: draft_vocab.bin holds a token outside the vocabulary");
+            if (id2 < 0 || id2 >= m.vocab) throw std::runtime_error("mtp: " + vf + " holds a token outside the vocabulary");
     }
     const MtpFiles files(dir);
     cards.resize(NCARD);
@@ -917,6 +1174,7 @@ Mtp::Mtp(const Model& m, const std::string& dir, const std::string& vocab_file) 
             throw std::runtime_error("mtp card " + std::to_string(c) + ": " + errs[c]);
         }
 }
+#endif
 
 Mtp::~Mtp() { free_mtp_cards(cards); }
 
@@ -933,11 +1191,25 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
                                      " of them, or build for " + std::to_string(ndev) + " (make FNX_NCARD=" + std::to_string(ndev) + ")");
         check_cards();
     }
+#if FNX_27B
+    const std::string p = "qwen35.";
+    // block_count holds the draft (nextn) layer too
+    if (g.i(p + "block_count") != NL + g.i(p + "nextn_predict_layers") || g.i(p + "nextn_predict_layers") != 1 ||
+        g.i(p + "embedding_length") != N || g.i(p + "feed_forward_length") != FFD || g.i(p + "ssm.group_count") != NKH ||
+        g.i(p + "ssm.time_step_rank") != NVH || g.i(p + "attention.head_count") != NQH ||
+        g.i(p + "attention.head_count_kv") != NKVH || g.i(p + "full_attention_interval") != 4 ||
+        g.i(p + "attention.key_length") != HD || g.i(p + "attention.value_length") != HD || g.i(p + "ssm.state_size") != HS ||
+        g.i(p + "ssm.inner_size") != NVH * HS || g.i(p + "ssm.conv_kernel") != 4 || g.i(p + "rope.dimension_count") != NROT)
+        throw std::runtime_error("27b: this GGUF's geometry is not Qwen3.8-27B's");
+#else
     const std::string p = "qwen4exp.";
     if (g.i(p + "block_count") != NL || g.i(p + "embedding_length") != N || g.i(p + "expert_count") != NEXP ||
         g.i(p + "ssm.group_count") != NKH || g.i(p + "ssm.time_step_rank") != NVH || g.i(p + "attention.head_count") != NQH ||
         g.i(p + "attention.head_count_kv") != NKVH || g.i(p + "hyper_connection.count") != HC ||
-        g.i(p + "hyper_connection.low_rank") != LR || g.i(p + "expert_feed_forward_length") != FF)
+        g.i(p + "hyper_connection.low_rank") != LR || g.i(p + "expert_feed_forward_length") != FF ||
+        g.i(p + "attention.indexer.head_count") != QSA_HEADS || g.i(p + "attention.indexer.key_length") != QSA_KEY ||
+        g.i(p + "attention.indexer.top_k") != QSA_TOP_K || g.i(p + "expert_used_count") != TOPK ||
+        g.i(p + "rope.dimension_count") != NROT)
         throw std::runtime_error("fnx: this GGUF's geometry is not Flash-Next's");
     // the shared expert is split by the routed experts' ff ranges (CardW ff0, ff1)
     for (int l = 0; l < NL; ++l) {
@@ -945,6 +1217,7 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
         if (g.t(b + "ffn_gate_shexp.weight").ne[1] != FF || g.t(b + "ffn_up_shexp.weight").ne[1] != FF || g.t(b + "ffn_down_shexp.weight").ne[0] != FF)
             throw std::runtime_error("fnx: layer " + std::to_string(l) + "'s shared expert is not " + std::to_string(FF) + " wide");
     }
+#endif
     eps = (float) g.f(p + "attention.layer_norm_rms_epsilon");
     rope_base = (float) g.f(p + "rope.freq_base");
     // the trained length bounds the context (Engine refuses past it, or past it x FNX_ROPE_SCALE), so a model must name it
@@ -960,6 +1233,18 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
         yarn_orig = mr.yarn_orig;
     }
     tok_embd = &g.t("token_embd.weight");
+#if FNX_27B
+    if (tok_embd->type != T_Q8_0) throw std::runtime_error("27b: token_embd.weight is not Q8_0 (the host's embedding reads Q8_0)");
+    vocab = (int) tok_embd->ne[1];
+    if (g.t("output.weight").ne[1] != vocab || g.t("output.weight").ne[0] != N)
+        throw std::runtime_error("27b: output.weight is not [" + std::to_string(N) + "][" + std::to_string(vocab) + "] (token_embd's vocabulary)");
+    {   // the host gathers its rows every window: a row read from the disk costs milliseconds, so keep it in RAM
+        const auto t0 = std::chrono::steady_clock::now();
+        lock_in_ram(*tok_embd);
+        std::fprintf(stderr, "27b: %s (%.1f GB) locked in RAM in %.1f s\n", tok_embd->name.c_str(), tok_embd->nbytes / 1e9,
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
+#else
     ple_table = &g.t("per_layer_token_embd.weight");
     if (tok_embd->type != T_Q8_0) throw std::runtime_error("fnx: token_embd.weight is not Q8_0 (the host's embedding reads Q8_0)");
     if (ple_table->type != T_IQ4_NL && ple_table->type != T_Q8_0)
@@ -975,8 +1260,34 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
     for (int64_t v : g.ia(p + "ple.layer_multipliers")) ple_mult.push_back((uint64_t) v);
     for (int64_t v : g.ia(p + "ple.head_offsets")) ple_off.push_back((uint64_t) v);
     for (int64_t v : g.ia(p + "ple.head_vocab_sizes")) ple_vocab.push_back((uint64_t) v);
+    // the gather reads ple_mult[0..PLE_ORDERS) and a head h at mixed % ple_vocab[h] + ple_off[h]: the arrays must be that
+    // long and every head's range must stay inside the table, or the gather reads rows (or zero-modulo) the metadata invented
+    if (ple_mult.size() != PLE_ORDERS || ple_off.size() != PLE_HEADS || ple_vocab.size() != PLE_HEADS)
+        throw std::runtime_error("fnx: the PLE metadata holds " + std::to_string(ple_mult.size()) + " multipliers and " +
+                                 std::to_string(ple_off.size()) + " offsets and " + std::to_string(ple_vocab.size()) +
+                                 " vocab sizes, want " + std::to_string(PLE_ORDERS) + " and " + std::to_string(PLE_HEADS) + " and " +
+                                 std::to_string(PLE_HEADS));
+    {
+        // a zero multiplier drops its n-gram from the hash silently: the gather still runs, on fewer orders than the model trained with
+        for (int j = 0; j < PLE_ORDERS; ++j)
+            if (!ple_mult[j]) throw std::runtime_error("fnx: PLE multiplier " + std::to_string(j) + " is 0, which drops that n-gram from the hash");
+        static_assert(PLE_HEADS * PLE_DIM == N, "the gather tiles PLE_HEADS rows of PLE_DIM into one embedding row");
+        if (ple_table->ne[0] != PLE_DIM)
+            throw std::runtime_error("fnx: " + ple_table->name + " is " + std::to_string(ple_table->ne[0]) + " a row, not the " +
+                                     std::to_string(PLE_DIM) + " the gather tiles into the embedding");
+        const uint64_t rows = (uint64_t) ple_table->ne[1];   // the gather reads rows of per_layer_token_embd, not the layer's key table
+        for (int h = 0; h < PLE_HEADS; ++h) {
+            // head h gathers rows [off, off+vocab): bound each side on its own so a negative offset (which wraps huge)
+            // trips the check instead of slipping past a summed top
+            if (!ple_vocab[h]) throw std::runtime_error("fnx: PLE head " + std::to_string(h) + " has an empty vocabulary");
+            if (ple_off[h] >= rows || ple_vocab[h] > rows - ple_off[h])
+                throw std::runtime_error("fnx: PLE head " + std::to_string(h) + " gathers from row " + std::to_string((int64_t) ple_off[h]) +
+                                         " for " + std::to_string(ple_vocab[h]) + ", past " + ple_table->name + "'s " + std::to_string(rows));
+        }
+    }
     ple_eos = g.i(p + "ple.eos_token_id");
     ple_image = g.i(p + "ple.image_token_id");
+#endif
     cards.resize(NCARD);
     // key heads per card (their q and k), value heads (numbered s * NKH + k, listed ascending: the order the card's
     // slices are laid out in) and FF slices, by card_split.hpp's rule
@@ -1029,6 +1340,23 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
         cw.v0 = c * vstep;
         cw.v1 = std::min(vocab, (c + 1) * vstep);
     }
+#if FNX_27B
+    for (int c = 0; c < NCARD; ++c) cards[c].fd0 = ffd_lo(NCARD, c), cards[c].fd1 = ffd_lo(NCARD, c + 1);
+    if (cards[NCARD - 1].fd1 != FFD) throw std::runtime_error("27b: the cards' dense FF slices do not cover its width");
+    {   // the image-pad token, whose runs in a prompt are a picture's cells (tools/sfnx.cpp, GENI)
+        const std::vector<std::string>& toks = g.tokens();
+        const auto it = std::find(toks.begin(), toks.end(), "<|image_pad|>");
+        if (it == toks.end()) throw std::runtime_error("27b: the tokenizer has no <|image_pad|> token");
+        ple_image = it - toks.begin();
+        // the ids the engine process stops and starts turns on (tools/sfnx.cpp's EOS and 248045, front/engine_limits.py's
+        // EOS_IDS), which are Flash-Next's tokenizer's: a GGUF tokenized otherwise would run past its turns' ends
+        for (const auto& [id, want] : {std::pair{248044, "<|endoftext|>"}, std::pair{248045, "<|im_start|>"}, std::pair{248046, "<|im_end|>"}})
+            if ((size_t) id >= toks.size() || toks[(size_t) id] != want)
+                throw std::runtime_error("27b: token " + std::to_string(id) + " is '" + ((size_t) id < toks.size() ? toks[(size_t) id] : "") +
+                                         "', the engine stops on it as " + want);
+    }
+    if (how != Load::PLAIN) throw std::runtime_error("27b: plain loads only (the lab's holder does not hold the 27B)");
+#endif
     if (how == Load::ATTACH) {   // a lab worker: the holder's weights are mapped already; take its tables, place the experts
         if (!image) throw std::runtime_error("fnx: attaching needs the holder's image");
         if (!store) throw std::runtime_error("fnx: attaching needs the store the holder's memory is mapped in");
@@ -1037,7 +1365,9 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
         return;
     }
     if (how == Load::HOLD && !store) throw std::runtime_error("fnx: holding needs a store");
+#if !FNX_27B
     if (how == Load::PLAIN) choose_residency();   // the holder leaves that to its workers: every expert to a host copy
+#endif
     const auto t0 = std::chrono::steady_clock::now();
     Stager st(g, stage_groups(g), NCARD);
     std::vector<std::thread> th;
@@ -1212,7 +1542,9 @@ void card_fields(CardW& c, F f) {
     f(c.vmap), f(c.head_norm), f(c.head_down), f(c.head_up), f(c.out), f(c.ple_key), f(c.ple_value), f(c.ple_norm_key),
         f(c.ple_norm_query), f(c.ple_norm_conv), f(c.ple_conv), f(c.bytes), f(c.host_bytes);
 }
+#if !FNX_27B   // the 27B has no holder (plain loads only)
 static_assert(sizeof(CardW) == 896, "CardW changed: put what load_card stores in card_fields, then update this size");
+#endif
 // every address load_card stores, in a card and in a layer: a worker moves them to where it mapped the holder's memory
 template <typename F>
 void card_ptrs(CardW& c, F f) {
@@ -1231,7 +1563,9 @@ void card_ptrs(CardW& c, F f) {
     for (const char*& p : c.ec_host_gu) f(p);
     for (const char*& p : c.ec_host_dn) f(p);
 }
+#if !FNX_27B
 static_assert(sizeof(LayerW) == 952, "LayerW changed: put its new addresses in card_ptrs, then update this size");
+#endif
 }  // namespace
 
 std::string Model::image() const {

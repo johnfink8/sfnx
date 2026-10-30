@@ -137,6 +137,13 @@ void Gguf::load_shard(const std::string& path, bool meta) {
             const uint32_t et = c.get<uint32_t>();
             const uint64_t n = c.get<uint64_t>();
             if (et == 8) {
+#if FNX_27B   // the tokenizer's tokens: the 27B finds its image-pad token there (Flash-Next's GGUF names it)
+                if (meta && key == "tokenizer.ggml.tokens") {
+                    std::vector<std::string> v(n);
+                    for (uint64_t k = 0; k < n; ++k) v[k] = c.str();
+                    str_arrays_[key] = std::move(v);
+                } else
+#endif
                 for (uint64_t k = 0; k < n; ++k) c.str();
             } else {
                 const int sz = scalar_size(et);
@@ -230,6 +237,14 @@ const std::string& Gguf::s(const std::string& key) const {
     if (it == strs_.end()) throw std::runtime_error("gguf: no string key " + key);
     return it->second;
 }
+#if FNX_27B
+const std::vector<std::string>& Gguf::tokens() const {
+    auto it = str_arrays_.find("tokenizer.ggml.tokens");
+    if (it == str_arrays_.end()) throw std::runtime_error("gguf: no tokenizer.ggml.tokens");
+    return it->second;
+}
+#endif
+
 std::vector<int64_t> Gguf::ia(const std::string& key) const {
     auto it = int_arrays_.find(key);
     if (it == int_arrays_.end()) throw std::runtime_error("gguf: no integer array " + key);

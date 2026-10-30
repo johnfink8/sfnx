@@ -158,7 +158,9 @@ int main() {
     arch("NVIDIA GeForce RTX 4090", 8, 9, 128, 86, "make ARCH=89");
     arch("NVIDIA A100-PCIE-40GB", 8, 0, 108, 86, "make ARCH=80");
     arch("NVIDIA GeForce RTX 4090", 8, 9, 128, 89, "");             // a build for its arch: refused only by what else it lacks
+#if !FNX_27B   // Flash-Next's hc read needs 80 SMs; the 27B has no hc read
     arch("NVIDIA GeForce RTX 3080", 8, 6, 68, 86, "68 SMs");          // sm_86, too few SMs for the hc read
+#endif
     arch("an sm_86 card with the SMs exactly", 8, 6, fnx::HC_READ_BLOCKS, 86, "");
 
     bdf("0000:3B:00.0", "0000:3b:00.0");        // cudaDeviceGetPCIBusId

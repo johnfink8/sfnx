@@ -1,4 +1,4 @@
-// The prompt path's chunk sum on the copy engines (prefill.cu, pf_ring_dir) as a list of steps for card g of n: a
+// The prompt path's chunk sum on the copy engines (pf_common.cuh, pf_ring_run) as a list of steps for card g of n: a
 // reduce-scatter then an all-gather round the ring, each card sending only to the next. The rows are cut in n parts
 // (part k: rows [k C / n, (k + 1) C / n)); card g sends its own addend of part g to g + 1, each card after adds its own
 // and sends it on (hop s carries part g - s), so card g finishes part g + 1 after n - 1 hops; the finished parts then go
@@ -34,7 +34,7 @@ struct PfRingOp {
 constexpr int pf_ring_steps(int n) { return 2 * n - 2 > 4 ? 2 * n - 2 : 4; }
 
 // card g's steps; every op's part is in [0, n), hop in [0, n - 1) and step in [0, pf_ring_steps(n)) where it has one, so
-// prefill.cu indexes its slots and flags with them unchecked
+// pf_ring_run indexes its slots and flags with them unchecked
 inline std::vector<PfRingOp> pf_ring_plan(int n, int g) {
     if (n < 2 || g < 0 || g >= n)
         throw std::invalid_argument("pf_ring_plan: card " + std::to_string(g) + " of " + std::to_string(n) + " (2 cards at least)");

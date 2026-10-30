@@ -96,6 +96,31 @@ has fewer SMs than the hc read keeps resident (80, `HC_READ_BLOCKS`), sits in a 
 smaller than its memory. Before the first window it writes across every link between the cards and stops, naming the
 pair, if anything does not arrive; a link under 1 GB/s gets a warning. What a box needs and what each refusal says: [docs/config.md](docs/config.md#other-gpus).
 
+## The 27B (dense)
+
+`make FNX_MODEL=27b` builds sFNX for Qwen3.8-27B, the family's dense model, at Q8_0 (`serve/sfnx-27b.json`): the same
+front end, lanes, drafts, conversation cache and pictures, from an engine of its own behind the same interface
+([docs/config.md](docs/config.md#model)). Every layer splits across the three cards as Flash-Next's does, except
+attention, which splits by heads: the 27B's 4 KV heads let each card keep the K/V of the heads it reads.
+
+| Workload, one request through the lab's runs unless the row says otherwise | |
+| --- | --- |
+| Code edit, greedy | 318 tok/s |
+| New code, greedy | 157 tok/s |
+| Prose, prod's sampling | 114 tok/s |
+| Six conversations decoding at once, with drafts | 224 tok/s combined (`bin/batch_test`, `ref/long2` and `ref/code1`) |
+| Prompt reading: 8k / 32k / 62k / 114k tokens | 2,435 / 2,264 / 1,965 / 1,602 tok/s |
+
+Its logits are held to the widest gap between llama.cpp's own ways of running the 27B (its CPU backend, its CUDA
+with and without int8 products of quantized activations), a bar 4–30x tighter than Flash-Next's. Code, the edit and
+the picture are within it, with top-1 agreement of 100% / 100% / 99.5%; the 62k prompt agrees on every top-1 and sits
+at 1.27x its KL. llama.cpp decodes the 27B Q8_0 at ~24 tok/s on this box, one request. On two of these cards
+(`make FNX_MODEL=27b FNX_NCARD=2`) sFNX decodes the code edit at 255, new code at 133 and prose at 88 tok/s.
+1Cat-vLLM run on the same two cards with the same prompts and its DFlash2 drafts gives 224, 150 and 69 on Qwen's FP8
+(the bytes of Q8_0), 252, 184 and 78 on NVFP4 (31% fewer), and reads a 62k prompt at 1,421–1,470 tok/s against
+sFNX's 1,511. Without drafts the two engines are within 7% (38.9 against 41.8 tok/s). Details:
+[docs/benchmarks.md](docs/benchmarks.md#qwen38-27b), [docs/verification.md](docs/verification.md#the-27b).
+
 ## Running it
 
 Needs CUDA 12.9 (`make CUDA=path` for a toolkit other than `/usr/local/cuda`), g++-14, llama.cpp at a37cc46 checked
@@ -125,7 +150,7 @@ and the files they read: [docs/config.md](docs/config.md).
 
 | | |
 | --- | --- |
-| `src/` | the engine: kernels (`.cuh`), `engine.cu`, `prefill.cu`, `model.cpp`, `session.cpp`, `batch.cpp`; the start-up checks (`card_check.hpp`, `peer_probe.cu`) |
+| `src/` | the engine: kernels (`.cuh`), `engine_common.cu` (what both models share), each model's layers and prompt path (`engine.cu` and `prefill.cu` for Flash-Next, `s27_engine.cu` and `s27_prefill.cu` for the 27B), `model.cpp`, `session.cpp`, `batch.cpp`; the start-up checks (`card_check.hpp`, `peer_probe.cu`) |
 | `tools/` | the engine process, the lab harness, the checks, probes and benchmarks |
 | `front/` | the Python serving layer and web UI (from Strata's `serve/`, MIT) |
 | `serve/` | configs, the systemd unit's template, run scripts, served tests |
@@ -134,7 +159,8 @@ and the files they read: [docs/config.md](docs/config.md).
 
 ## Limits
 
-- One model, measured on one box: three `sm_70` cards (or two; four, six or eight build but are untested). RTX 3090s
+- Two models (Flash-Next; the 27B as a build of its own, at Q8_0 only, on two or three cards; four build and are
+  untested), measured on one box: three `sm_70` cards (or two; four, six or eight build but are untested). RTX 3090s
   (`ARCH=86`) run at a tester's, not yet checked against llama.cpp; 80, 89, 90, 100 and 120 build but have never run,
   and Turing is refused. No FP8, and no CUDA 13 (it drops `sm_70`).
 - Every pair of cards must be CUDA peers over PCIe: GeForce cards need a community driver patch and full Resizable BAR
