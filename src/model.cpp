@@ -815,7 +815,7 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
             c.ple_norm_conv = up.f32(L(l, "ple_norm_conv.weight"), D);
             const Tensor& pc = L(l, "ple_conv1d.weight");   // k_ple_conv reads w[ch * 4 + k]: 4 a row, D of them
             if (pc.ne[0] != 4 || pc.ne[1] != D)
-                throw std::runtime_error("fnx: ple_conv1d.weight is " + std::to_string(pc.ne[0]) + " by " + std::to_string(pc.ne[1]) +
+                throw std::runtime_error("fnx: " + pc.name + " is " + std::to_string(pc.ne[0]) + " by " + std::to_string(pc.ne[1]) +
                                          ", not the 4 by " + std::to_string(D) + " k_ple_conv reads");
             c.ple_conv = up.f32(pc, 4 * D);
         }
@@ -1258,14 +1258,19 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
                                  std::to_string(ple_off.size()) + " offsets and " + std::to_string(ple_vocab.size()) +
                                  " vocab sizes, want 3 and " + std::to_string(PLE_HEADS) + " and " + std::to_string(PLE_HEADS));
     {
-        uint64_t top = 0;
+        static_assert(PLE_HEADS * PLE_DIM == N, "the gather tiles PLE_HEADS rows of PLE_DIM into one embedding row");
+        if (ple_table->ne[0] != PLE_DIM)
+            throw std::runtime_error("fnx: " + ple_table->name + " is " + std::to_string(ple_table->ne[0]) + " a row, not the " +
+                                     std::to_string(PLE_DIM) + " the gather tiles into the embedding");
+        const uint64_t rows = (uint64_t) ple_table->ne[1];   // the gather reads rows of per_layer_token_embd, not the layer's key table
         for (int h = 0; h < PLE_HEADS; ++h) {
+            // head h gathers rows [off, off+vocab): bound each side on its own so a negative offset (which wraps huge)
+            // trips the check instead of slipping past a summed top
             if (!ple_vocab[h]) throw std::runtime_error("fnx: PLE head " + std::to_string(h) + " has an empty vocabulary");
-            top = std::max(top, ple_off[h] + ple_vocab[h]);
+            if (ple_off[h] >= rows || ple_vocab[h] > rows - ple_off[h])
+                throw std::runtime_error("fnx: PLE head " + std::to_string(h) + " gathers from row " + std::to_string(ple_off[h]) +
+                                         " for " + std::to_string(ple_vocab[h]) + ", past " + ple_table->name + "'s " + std::to_string(rows));
         }
-        const int64_t rows = ple_table->ne[1];   // the gather reads rows of per_layer_token_embd, not the layer's key table
-        if (top > (uint64_t) rows)
-            throw std::runtime_error("fnx: a PLE head reaches row " + std::to_string(top) + ", past the table's " + std::to_string(rows));
     }
     ple_eos = g.i(p + "ple.eos_token_id");
     ple_image = g.i(p + "ple.image_token_id");
