@@ -1,7 +1,8 @@
 // The Engine (engine.hpp) for Qwen3.8-27B (make FNX_MODEL=27b): dense, split across the cards as Flash-Next is. Every
 // layer on every card: the recurrent heads, the FFN by FF width (ffd_lo), the attention by heads (s27_attn.cuh: each
-// card's K/V for its own two KV heads, no exchange), the vocabulary; the residual and the norms copied, two sums a
-// layer (s27_ring3.cuh). The draft layer is the GGUF's nextn block (CardW::mtp), its head the Mtp's rows.
+// card's K/V for its own KV heads (s27_attn.cuh counts them for the build's card count), no exchange), the
+// vocabulary; the residual and the norms copied, two sums a layer (s27_ring3.cuh). The draft layer is the GGUF's
+// nextn block (CardW::mtp), its head the Mtp's rows.
 // Its layers, embeddings, pages and prompt path are here and in s27_prefill.cu; lanes, windows, commits, states, the
 // draft layer's window, the sampler's candidates and the window graphs are engine_common.cu's (engine_parts.hpp).
 #include "engine.hpp"
@@ -27,19 +28,6 @@
 namespace fnx {
 
 namespace {
-__device__ float block_sum1024(float v, float* sh) {
-    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-    if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = v;
-    __syncthreads();
-    v = threadIdx.x < (blockDim.x >> 5) ? sh[threadIdx.x] : 0.f;
-    if (threadIdx.x < 32)
-        for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-    if (threadIdx.x == 0) sh[0] = v;
-    __syncthreads();
-    const float r = sh[0];
-    __syncthreads();
-    return r;
-}
 // R[t] += pend[t] (a half's sum, when pend is not null), then y[t] = rms(R[t]) * w: the next half's input; with tq, also
 // quantized as quantize_q8_1 does into the split twin (tq, td) of a q8_1 buffer of N-wide rows, which is all q8s reads
 __global__ void k_add_norm(float* R, const float* pend, const float* w, float* y, int8_t* tq, float* td, float eps) {
@@ -51,7 +39,7 @@ __global__ void k_add_norm(float* R, const float* pend, const float* w, float* y
         if (pend) r[i] = x += pend[(size_t) blockIdx.x * N + i];
         q += x * x;
     }
-    const float s = rsqrtf(block_sum1024(q, sh) / (float) N + eps);
+    const float s = rsqrtf(s27_block_sum(q, sh) / (float) N + eps);
     const int lane = threadIdx.x & 31;
     for (int bl = threadIdx.x >> 5; bl < N / 32; bl += blockDim.x >> 5) {
         const int i = bl * 32 + lane;
@@ -78,7 +66,7 @@ __global__ void k_norm_cat(const float* e, const float* h, const float* we, cons
     for (int s = 0; s < 2; ++s) {
         float q = 0.f;
         for (int i = threadIdx.x; i < N; i += blockDim.x) q += x[s][i] * x[s][i];
-        const float r = rsqrtf(block_sum1024(q, sh) / (float) N + eps);
+        const float r = rsqrtf(s27_block_sum(q, sh) / (float) N + eps);
         for (int i = threadIdx.x; i < N; i += blockDim.x) out[(size_t) t * 2 * N + s * N + i] = x[s][i] * r * w[s][i];
     }
 }
@@ -114,7 +102,7 @@ struct Rows {
 };
 
 // an attention layer's mixer half on one card: the last half's sum folded into R (pend) and the norm, the card's q heads
-// and their two KV heads projected, the window's K/V stored, attention over every position, the card's heads through
+// and their share of the KV heads projected, the window's K/V stored, attention over every position, the card's heads through
 // wo, summed across the cards into b.bo (folded into R by the next half)
 void attn_half(CardBuf& b, const LayerW& L, float* R, bool pend, int slot, const Rows& rows, int q0, int kv0, int call, int T, float eps,
                const Rope& rope) {
@@ -265,8 +253,9 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
     prefill_alloc();
     // the K/V pool: as many pages as every card's free VRAM holds beside FNX_KV_RESERVE_MIB (default 1024: the window
     // graphs captured at first use, cuBLAS's workspaces, the lanes' page tables and rotary tables), at least the whole
-    // context and the extra lanes' blocks. A page is 8.9 MB a card (34.8 KB a position: 16 attention layers and the
-    // draft layer, two KV heads of 256 f16 for K and V)
+    // context and the extra lanes' blocks. A page is the card's own KV heads' worth (s27_attn.cuh counts them per card
+    // count): three cards, 8.9 MB — 34.8 KB a position, 16 attention layers and the draft layer, two heads of 256 f16
+    // for K and V; four cards, one head, half that)
     const long long reserve_mib = env_int("FNX_KV_RESERVE_MIB", 1024);
     if (reserve_mib < 0) throw std::runtime_error("FNX_KV_RESERVE_MIB: want MiB >= 0, got " + std::to_string(reserve_mib));
     const size_t page_bytes = S27_PAGE * sizeof(__half);
@@ -559,9 +548,6 @@ void Engine::enqueue_batch(const std::vector<int>& lanes) {
         },
         false);
 }
-
-namespace {
-}  // namespace
 
 // enqueue_batch()'s layers for a window of several rows a lane (verify_rows): each lane's recurrent rows chained through
 // its state as a window of its own (snapshots kept for commit_rows), every row's attention at its own position

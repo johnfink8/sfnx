@@ -51,26 +51,6 @@ struct Arena {
     }
 };
 
-size_t pf_card_bytes = 0;   // the prompt path's allocations on the card being set up
-template <typename T> T* palloc(size_t n) {
-    void* p = nullptr;
-    const cudaError_t e = cudaMalloc(&p, n * sizeof(T));
-    if (e != cudaSuccess) {
-        cudaGetLastError();
-        size_t fr = 0, tot = 0;
-        cudaMemGetInfo(&fr, &tot);
-        int dev = -1;
-        cudaGetDevice(&dev);
-        throw std::runtime_error("prefill: cudaMalloc of " + std::to_string(n * sizeof(T) >> 20) + " MiB on card " + std::to_string(dev) +
-                                 ": " + cudaGetErrorString(e) + " (" + std::to_string(fr >> 20) + " MiB free; the prompt path holds " +
-                                 std::to_string(pf_card_bytes >> 20) + " MiB there already)");
-    }
-    pf_card_bytes += n * sizeof(T);
-    ckc(cudaMemset(p, 0, n * sizeof(T)), "cudaMemset");
-    own_dev(p);
-    return (T*) p;
-}
-
 __device__ __forceinline__ float pf_sigm(float x) { return 1.0f / (1.0f + __expf(-x)); }
 __device__ __forceinline__ float pf_silu(float x) { return x / (1.0f + __expf(-x)); }
 __device__ __forceinline__ float pf_wsum(float v) {
@@ -96,14 +76,6 @@ __device__ float pf_block_sum(float v, float* sh) {
 }
 
 // ---------------------------------------------------------------- conversions
-// the split Q8_0 layout (int8 rows, f16 scale per 32) to f16, d * q as ggml's dequantization to f16 rounds it
-__global__ void k_q8s_f16(const int8_t* __restrict__ q, const uint16_t* __restrict__ d, size_t n, __half* __restrict__ out) {
-    for (size_t e = blockIdx.x * (size_t) blockDim.x + threadIdx.x; e < n; e += (size_t) gridDim.x * blockDim.x)
-        out[e] = __float2half(__half2float(__ushort_as_half(d[e / 32])) * (float) q[e]);
-}
-__global__ void k_f32_f16(const float* __restrict__ x, size_t n, __half* __restrict__ y) {
-    for (size_t e = blockIdx.x * (size_t) blockDim.x + threadIdx.x; e < n; e += (size_t) gridDim.x * blockDim.x) y[e] = __float2half(x[e]);
-}
 __global__ void k_f16_f32(const __half* __restrict__ x, int rows, int cols, float* __restrict__ y, int ldy) {
     for (size_t e = blockIdx.x * (size_t) blockDim.x + threadIdx.x; e < (size_t) rows * cols; e += (size_t) gridDim.x * blockDim.x)
         y[(e / cols) * ldy + e % cols] = __half2float(x[e]);
@@ -312,8 +284,6 @@ __global__ void k_pf_swiglu(const float* __restrict__ gu, int ffs, int C, __half
     }
 }
 
-unsigned grid_for(size_t n) { return (unsigned) std::min<size_t>(4096, (n + 255) / 256); }
-
 }  // namespace
 
 // ---------------------------------------------------------------- per-card buffers
@@ -517,47 +487,8 @@ __global__ void k_pfr_addend(float* __restrict__ x, const float* __restrict__ pa
 // ring (its next card: g + 1 there), by the steps of r.plan (pf_ring_plan.hpp, which describes the algorithm). Each
 // copy into the next card is followed by a flag there; the step after waits on this card's flag (stream memory
 // operations: no SM time, no host)
-constexpr int PF_RING_STEPS = pf_ring_steps(NCARD);   // flags a set holds
 void pf_ring_dir(Engine::PfRing& r, int dev, int g, float* x, int C, unsigned seq, unsigned* err, cudaStream_t s) {
-    if (r.plan.empty() || r.plan.front().part != g) throw std::runtime_error("prefill: the ring's plan is not card " + std::to_string(g) + "'s");
-    const int set = (int) (seq & 1u);
-    auto r0 = [&](int k) { return k * C / NCARD; };
-    auto rows = [&](int k) { return r0(k + 1) - r0(k); };
-    CUstream cs = (CUstream) s;
-    auto signal = [&](int step) {
-        cud(cuStreamWriteValue32(cs, (CUdeviceptr) (r.nflags + set * PF_RING_STEPS + step), seq, 0), "ring flag");
-    };
-    auto wait = [&](int step) {
-        cud(cuStreamWaitValue32(cs, (CUdeviceptr) (r.flags + set * PF_RING_STEPS + step), seq, CU_STREAM_WAIT_VALUE_GEQ), "ring wait");
-    };
-    auto copy = [&](__half* dst, const __half* src, int nrows) {
-        ckc(cudaMemcpyPeerAsync(dst, r.next_dev, src, dev, (size_t) nrows * N * sizeof(__half), s), "ring copy");
-    };
-    // a part can be empty (a chunk of fewer rows than cards: a read cut at a checkpoint): its kernels are skipped, its
-    // copies move nothing, its flags still step
-    auto add = [&](const __half* in, int part, __half* out) {
-        if (rows(part) == 0) return;
-        k_pfr_add<<<grid_for((size_t) rows(part) * N / 2), 256, 0, s>>>((const __half2*) in, (const float2*) (x + (size_t) r0(part) * N),
-                                                                       rows(part) * N / 2, (__half2*) out, err);
-    };
-    for (const PfRingOp& o : r.plan) {
-        switch (o.k) {
-            case PfRingOp::PACK:
-                if (rows(o.part) > 0)
-                    k_pfr_pack<<<grid_for((size_t) rows(o.part) * N / 2), 256, 0, s>>>((const float2*) (x + (size_t) r0(o.part) * N),
-                                                                                       rows(o.part) * N / 2, (__half2*) r.send, err);
-                break;
-            case PfRingOp::ADD: add(r.in[o.hop][set], o.part, o.fin ? r.ag[set] + (size_t) r0(o.part) * N : r.send); break;
-            case PfRingOp::SEND: copy(r.nin[o.hop][set], r.send, rows(o.part)); break;
-            case PfRingOp::PASS: copy(r.nag[set] + (size_t) r0(o.part) * N, r.ag[set] + (size_t) r0(o.part) * N, rows(o.part)); break;
-            case PfRingOp::SIGNAL: signal(o.step); break;
-            case PfRingOp::WAIT: wait(o.step); break;
-            case PfRingOp::OUT:
-                k_pfr_out<<<grid_for((size_t) C * N / 2), 256, 0, s>>>((const __half2*) r.ag[set], (float2*) x, C * N / 2);
-                break;
-            default: throw std::runtime_error("prefill: a ring step of unknown kind " + std::to_string((int) o.k));
-        }
-    }
+    pf_ring_run(r, dev, g, x, C, seq, err, s);
 }
 
 // the sum of x (C rows of N) over the cards on card g, one way round (each card's link is busy both ways already: it

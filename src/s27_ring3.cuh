@@ -1,4 +1,4 @@
-// The 27B's sums across the cards (included by s27.cu): the ring of kernels.cu's k_ring, with words of three fp16
+// The 27B's sums across the cards (included by s27_impl.hpp): the ring of kernels.cu's k_ring, with words of three fp16
 // values and a 16-bit tag instead of two and a 32-bit one. The box's GPU 0 is on the other socket from 1 and 2, and a
 // sum's time grows with its bytes (~0.6 ms a window row for 128 sums at two values a word); a third fewer words.
 // A 16-bit tag wraps every 65536 exchanges (256 windows): a word left in a slot from exactly that many exchanges back
@@ -12,6 +12,22 @@
 #include "model.hpp"
 
 namespace fnx {
+
+// a whole block's sum of v (in every thread): warps folded through shuffles, the warp sums through sh, broadcast from
+// thread 0. This model's engine and prompt-path files share it for their norms' kernels.
+static __device__ float s27_block_sum(float v, float* sh) {
+    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = v;
+    __syncthreads();
+    v = threadIdx.x < (blockDim.x >> 5) ? sh[threadIdx.x] : 0.f;
+    if (threadIdx.x < 32)
+        for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    if (threadIdx.x == 0) sh[0] = v;
+    __syncthreads();
+    const float r = sh[0];
+    __syncthreads();
+    return r;
+}
 
 // a card's buffers: words in from the card before, finished words gathered; the next card's
 struct R3 {

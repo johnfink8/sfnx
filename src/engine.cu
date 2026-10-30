@@ -713,9 +713,6 @@ int Engine::add_lane() {
     return (int) lanes_.size() - 1;
 }
 
-namespace {
-}  // namespace
-
 // the token rows into each of the HC streams, and the PLE rows
 void Engine::embed_into(int r, int k, int p0, const std::function<int(int)>& tok_at, const char*) {
     if (!h_.ple) h_.ple = halloc<float>((size_t) MAXT * N);
@@ -1032,9 +1029,6 @@ void Engine::enqueue_batch(const std::vector<int>& lanes) {
         argmax(b.head_logits, w.v1 - w.v0, T, w.v0, b.best_v, b.best_i, b.am_keys, b.ring.err, b.st);
     });
 }
-
-namespace {
-}  // namespace
 
 // enqueue_batch()'s layers for a window of several rows a lane (verify_rows): the shared work over all rows as there;
 // each lane's own work over its rows as a window of its own does it (the rows chained through its recurrent state, the

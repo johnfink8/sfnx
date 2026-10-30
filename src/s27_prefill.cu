@@ -29,43 +29,6 @@
 namespace fnx {
 
 namespace {
-template <typename T> T* palloc(size_t n) {
-    void* p = nullptr;
-    const cudaError_t e = cudaMalloc(&p, n * sizeof(T));
-    if (e != cudaSuccess) {
-        cudaGetLastError();
-        size_t fr = 0, tot = 0;
-        cudaMemGetInfo(&fr, &tot);
-        throw std::runtime_error("prefill: cudaMalloc of " + std::to_string((n * sizeof(T)) >> 20) + " MiB: " + cudaGetErrorString(e) + " (" +
-                                 std::to_string(fr >> 20) + " MiB free)");
-    }
-    own_dev(p);
-    return (T*) p;
-}
-unsigned grid_for(size_t n) { return (unsigned) std::min<size_t>(4096, (n + 255) / 256); }
-
-// the split Q8_0 layout (int8 rows, f16 scale per 32) to f16, d * q as ggml's dequantization to f16 rounds it
-__global__ void k_q8s_f16(const int8_t* __restrict__ q, const uint16_t* __restrict__ d, size_t n, __half* __restrict__ out) {
-    for (size_t e = blockIdx.x * (size_t) blockDim.x + threadIdx.x; e < n; e += (size_t) gridDim.x * blockDim.x)
-        out[e] = __float2half(__half2float(__ushort_as_half(d[e / 32])) * (float) q[e]);
-}
-__global__ void k_f32_f16(const float* __restrict__ x, size_t n, __half* __restrict__ y) {
-    for (size_t e = blockIdx.x * (size_t) blockDim.x + threadIdx.x; e < n; e += (size_t) gridDim.x * blockDim.x) y[e] = __float2half(x[e]);
-}
-
-__device__ float pf_block_sum(float v, float* sh) {
-    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-    if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = v;
-    __syncthreads();
-    v = threadIdx.x < (blockDim.x >> 5) ? sh[threadIdx.x] : 0.f;
-    if (threadIdx.x < 32)
-        for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-    if (threadIdx.x == 0) sh[0] = v;
-    __syncthreads();
-    const float r = sh[0];
-    __syncthreads();
-    return r;
-}
 // row t: R[t] += pend[t] (when pend), y = rms(R[t]) * w as f32 (yf, when not null) and f16 (yh); the decode path's add_norm
 __global__ void k_pf_add_norm(float* R, const float* pend, const float* w, float* yf, __half* yh, float eps) {
     __shared__ float sh[32];
@@ -76,7 +39,7 @@ __global__ void k_pf_add_norm(float* R, const float* pend, const float* w, float
         if (pend) r[i] = x += pend[(size_t) blockIdx.x * N + i];
         q += x * x;
     }
-    const float s = rsqrtf(pf_block_sum(q, sh) / (float) N + eps);
+    const float s = rsqrtf(s27_block_sum(q, sh) / (float) N + eps);
     for (int i = threadIdx.x; i < N; i += blockDim.x) {
         const float v = r[i] * s * w[i];
         if (yf) yf[(size_t) blockIdx.x * N + i] = v;
@@ -92,7 +55,7 @@ __global__ void k_pf_norm_cat(const float* e, const float* h, const float* we, c
     for (int s = 0; s < 2; ++s) {
         float q = 0.f;
         for (int i = threadIdx.x; i < N; i += blockDim.x) q += x[s][i] * x[s][i];
-        const float r = rsqrtf(pf_block_sum(q, sh) / (float) N + eps);
+        const float r = rsqrtf(s27_block_sum(q, sh) / (float) N + eps);
         for (int i = threadIdx.x; i < N; i += blockDim.x) out[(size_t) t * 2 * N + s * N + i] = __float2half(x[s][i] * r * w[s][i]);
     }
 }
@@ -135,7 +98,7 @@ __global__ void k_pf_softmax(const float* __restrict__ S, int P, int p0, __half*
     __syncthreads();
     float z = 0.f;
     for (int p = threadIdx.x; p < len; p += blockDim.x) z += __expf(s[p] * scale - m);
-    z = pf_block_sum(z, sh);
+    z = s27_block_sum(z, sh);
     const float iz = 1.f / z;
     __half* o = prob + (size_t) t * P;
     for (int p = threadIdx.x; p < P; p += blockDim.x) o[p] = __float2half(p < len ? __expf(s[p] * scale - m) * iz : 0.f);
@@ -177,7 +140,6 @@ __global__ void k_pf_gate(const float* __restrict__ O, const float* __restrict__
         att[t * S27_NQ * HD + h * HD + d] = __float2half(O[e] / (1.f + __expf(-g)));
     }
 }
-constexpr int PF_RING_STEPS = pf_ring_steps(NCARD);
 constexpr unsigned PF_SEQ_RESET = 1u << 31;
 constexpr int PF_K = 2;   // chunks a pass: one's sums cross the links while the other computes
 }  // namespace
@@ -231,42 +193,11 @@ void pf_dense(Engine::Pf& p, const DW& w, const __half* X, int C, float* out) {
     k_q8s_f16<<<grid_for(n), 256, 0, p.st>>>(w.s.q, w.s.d, n, p.wh);
     pf_gemm(p, p.wh, w.n_out, w.n_in, X, C, out, w.n_out);
 }
-// x (C rows of N on card g) summed over the cards, one way round the ring by r.plan (prefill.cu's pf_ring_dir)
+// x (C rows of N on card g) summed over the cards, one way round the ring by r.plan (pf_common.cuh's pf_ring_run);
+// this ring takes its sequence number from itself and runs on its copy-engine stream r.rst
 void pf_ring(Engine::Pf& r, int g, float* x, int C, unsigned* err) {
     const unsigned seq = ++r.seq;
-    if (r.plan.empty() || r.plan.front().part != g) throw std::runtime_error("prefill: the ring's plan is not card " + std::to_string(g) + "'s");
-    const int set = (int) (seq & 1u);
-    auto r0 = [&](int k) { return k * C / NCARD; };
-    auto rows = [&](int k) { return r0(k + 1) - r0(k); };
-    CUstream cs = (CUstream) r.rst;
-    auto copy = [&](__half* dst, const __half* src, int nrows) {
-        ckc(cudaMemcpyPeerAsync(dst, r.next_dev, src, r.dev, (size_t) nrows * N * sizeof(__half), r.rst), "ring copy");
-    };
-    auto add = [&](const __half* in, int part, __half* out) {
-        if (rows(part) == 0) return;
-        k_pfr_add<<<grid_for((size_t) rows(part) * N / 2), 256, 0, r.rst>>>((const __half2*) in, (const float2*) (x + (size_t) r0(part) * N),
-                                                                         rows(part) * N / 2, (__half2*) out, err);
-    };
-    for (const PfRingOp& o : r.plan) {
-        switch (o.k) {
-            case PfRingOp::PACK:
-                if (rows(o.part) > 0)
-                    k_pfr_pack<<<grid_for((size_t) rows(o.part) * N / 2), 256, 0, r.rst>>>((const float2*) (x + (size_t) r0(o.part) * N),
-                                                                                       rows(o.part) * N / 2, (__half2*) r.send, err);
-                break;
-            case PfRingOp::ADD: add(r.in[o.hop][set], o.part, o.fin ? r.ag[set] + (size_t) r0(o.part) * N : r.send); break;
-            case PfRingOp::SEND: copy(r.nin[o.hop][set], r.send, rows(o.part)); break;
-            case PfRingOp::PASS: copy(r.nag[set] + (size_t) r0(o.part) * N, r.ag[set] + (size_t) r0(o.part) * N, rows(o.part)); break;
-            case PfRingOp::SIGNAL:
-                cud(cuStreamWriteValue32(cs, (CUdeviceptr) (r.nflags + set * PF_RING_STEPS + o.step), seq, 0), "ring flag");
-                break;
-            case PfRingOp::WAIT:
-                cud(cuStreamWaitValue32(cs, (CUdeviceptr) (r.flags + set * PF_RING_STEPS + o.step), seq, CU_STREAM_WAIT_VALUE_GEQ), "ring wait");
-                break;
-            case PfRingOp::OUT: k_pfr_out<<<grid_for((size_t) C * N / 2), 256, 0, r.rst>>>((const __half2*) r.ag[set], (float2*) x, C * N / 2); break;
-            default: throw std::runtime_error("prefill: a ring step of unknown kind " + std::to_string((int) o.k));
-        }
-    }
+    pf_ring_run(r, r.dev, g, x, C, seq, err, r.rst);
     ckc(cudaGetLastError(), "ring");
 }
 }  // namespace
