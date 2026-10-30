@@ -107,7 +107,13 @@ int main(int argc, char** argv) {
             cudaGraph_t g;
             ck(cudaStreamBeginCapture(st[c], cudaStreamCaptureModeThreadLocal), "capture");
             // S27_PF_MB=m: beside each matrix, the first m MB of the next pulled into L2 on a second stream
-            static const double pf_mb = std::getenv("S27_PF_MB") ? std::atof(std::getenv("S27_PF_MB")) : 0.0;
+            static const double pf_mb = [] {
+                const char* v = std::getenv("S27_PF_MB");
+                if (!v) return 0.0;
+                double x = 0;
+                if (!parse_number(v, x) || x < 0) throw std::runtime_error(std::string("S27_PF_MB: MB above 0, not '") + v + "'");
+                return x;
+            }();
             static cudaStream_t st2[NCARD];
             static cudaEvent_t fork[NCARD], join[NCARD];
             if (pf_mb > 0 && !st2[c]) {

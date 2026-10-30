@@ -123,6 +123,10 @@ int main(int argc, char** argv) {
         draft_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc).count();
     }
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t3).count();
+    if (!rounds) {   // GEN 0: the prompt-path benchmark mode (docs/benchmarks.md "Prompts"): nothing was generated
+        std::printf("decode: GEN 0, nothing generated (%.0f ms past the prompt)\n", ms);
+        return 0;
+    }
     std::printf("decode: %zu tokens in %.0f ms, %.1f tok/s, %.2f tokens a round, %.2f ms a round (verify gpu %.2f, drafting %.2f), "
                 "drafts %ld of %ld, %d of %d rounds lookup\n",
                 out.size(), ms, out.size() * 1000.0 / ms, (double) out.size() / rounds, ms / rounds, gpu_ms / rounds, draft_ms / rounds,
@@ -131,7 +135,7 @@ int main(int argc, char** argv) {
         std::FILE* f = std::fopen(argv[6], "w");
         if (!f) throw std::runtime_error(std::string(argv[6]) + ": cannot write");
         for (int t : out) std::fprintf(f, "%d\n", t);
-        std::fclose(f);
+        if (std::fclose(f) != 0) throw std::runtime_error(std::string(argv[6]) + ": close failed (a buffered write did not reach the disk)");
     }
     return 0;
 }

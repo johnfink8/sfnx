@@ -1160,6 +1160,7 @@ extern "C" int fnx_run_cmd(fnx::Model* model, int argc, char** argv) {
         if (argc < 5) { std::fprintf(stderr, "check needs REF.bin OUT.bin [W]\n"); return 2; }
         std::FILE* out = std::fopen(argv[4], "wb");
         if (!out) { std::perror(argv[4]); return 1; }
+        const std::string out_path = argv[4];
         const int W = argc > 5 ? std::atoi(argv[5]) : 5;
         e.dump = [&](const std::string& name, int layer, int T, int n, const std::vector<float>& v) {
             const std::string full = layer >= 0 ? name + "-" + std::to_string(layer) : name;
@@ -1170,7 +1171,7 @@ extern "C" int fnx_run_cmd(fnx::Model* model, int argc, char** argv) {
             std::fwrite(&nd, 4, 1, out);
             std::fwrite(ne, 8, 2, out);
             std::fwrite(v.data(), 4, v.size(), out);
-            if (std::ferror(out)) throw std::runtime_error("check: OUT.bin write failed");
+            if (std::ferror(out)) throw std::runtime_error("check: " + out_path + " write failed");
         };
         std::vector<int> next;
         for (size_t i = 0; i < toks.size(); i += W) {
@@ -1179,7 +1180,7 @@ extern "C" int fnx_run_cmd(fnx::Model* model, int argc, char** argv) {
             next.insert(next.end(), o.begin(), o.end());
             std::printf("window at %zu: %zu rows in %.1f ms\n", i, w.size(), e.last_ms);
         }
-        std::fclose(out);
+        if (std::fclose(out) != 0) throw std::runtime_error("check: " + out_path + ": close failed (a buffered write did not reach the disk)");
         std::printf("greedy next token per row:");
         for (int t : next) std::printf(" %d", t);
         std::printf("\n");
