@@ -483,17 +483,12 @@ __global__ void k_pfr_addend(float* __restrict__ x, const float* __restrict__ pa
 }
 
 
-// one direction's sum on stream s, this card at ring position g: pf_ring_run (pf_common.cuh) runs r.plan
-void pf_ring_dir(Engine::PfRing& r, int dev, int g, float* x, int C, unsigned seq, unsigned* err, cudaStream_t s) {
-    pf_ring_run(r, dev, g, x, C, seq, err, s);
-}
-
 // the sum of x (C rows of N) over the cards on card g, one way round (each card's link is busy both ways already: it
 // sends to g + 1 while it takes from g - 1; measured, the other direction at once halves both)
 void pf_ring(Engine::Pf& p, int g, float* x, int C, const RingMoe* m, unsigned* err, cudaStream_t s) {
     const unsigned seq = ++p.seq;
     if (m) k_pfr_addend<<<grid_for((size_t) C * N), 256, 0, s>>>(x, m->part, m->topw, m->logits, C);
-    pf_ring_dir(p.ring_ce, p.dev, g, x, C, seq, err, s);
+    pf_ring_run(p.ring_ce, p.dev, g, x, C, seq, err, s);
     ckc(cudaGetLastError(), "ring");
 }
 
