@@ -73,7 +73,7 @@ for name in sorted(got, key=order):
     if r.shape[1] != x.shape[1]:
         fails.append(f"{name}: width {x.shape[1]} against the reference's {r.shape[1]}")
         continue
-    if len(x) != len(r):  # a dump missing whole rows compares its green prefix and passes: that is the truncation
+    if len(x) != len(r):  # whole missing rows would otherwise compare the shared prefix and pass: count them
         fails.append(f"{name}: dump has {len(x)} rows against the reference's {len(r)}")
         continue
     n = len(x)
