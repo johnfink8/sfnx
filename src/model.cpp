@@ -651,7 +651,7 @@ void load_layers_27b(Stager& st, CardW& c, Up& up, const std::vector<int>& conv_
         auto T = [&](const char* s) -> const Tensor& { return L(l, s); };
         if (!is_attn(l)) {
             w.qkvz = up.dense(up.rows2(T("attn_qkv.weight"), conv_rows, T("attn_gate.weight"), zrows));
-            w.ab = up.f32_rows2(T("ssm_alpha.weight"), T("ssm_beta.weight"), vheads, 1);
+            w.ab = up.f32_rows2(T("ssm_alpha.weight"), T("ssm_beta.weight"), vheads, N);
             w.ssm_out = up.dense(up.cols(T("ssm_out.weight"), vblocks));
             w.conv = up.f32_rows(T("ssm_conv1d.weight"), conv_rows, 4);
             std::vector<float> a, dt;
@@ -767,7 +767,7 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
         w.router = up.f32_cat(L(l, "ffn_gate_inp.weight"), L(l, "ffn_gate_inp_shexp.weight"));
         if (!is_attn(l)) {
             w.qkvz = up.dense(up.rows2(L(l, "attn_qkv.weight"), conv_rows, L(l, "attn_gate.weight"), zrows));
-            w.ab = up.f32_rows2(L(l, "ssm_alpha.weight"), L(l, "ssm_beta.weight"), vheads, 1);
+            w.ab = up.f32_rows2(L(l, "ssm_alpha.weight"), L(l, "ssm_beta.weight"), vheads, N);
             w.ssm_out = up.dense(up.cols(L(l, "ssm_out.weight"), vblocks));
             w.conv = up.f32_rows(L(l, "ssm_conv1d.weight"), conv_rows, 4);
             std::vector<float> a, dt;
