@@ -745,17 +745,17 @@ void Engine::embed_rows(int p0, int T, const std::function<int(int)>& tok_at_cel
     for (int t = 0; t < T; ++t) {
         const int p = p0 + t;
         embed_token(tok_at_cell(p), p, emb + (size_t) t * N);
-        // PLE rows: n-grams of this token and the two before it (EOS / sequence start cut the window)
-        int64_t ctx[3];
+        // PLE rows: n-grams of this token and the PLE_ORDERS - 1 before it (EOS / sequence start cut the window)
+        int64_t ctx[PLE_ORDERS];
         ctx[0] = tok_at(p);
         bool cut = false;
-        for (int s = 1; s < 3; ++s) {
+        for (int s = 1; s < PLE_ORDERS; ++s) {
             const int q = p - s;
             const int64_t tk = q >= 0 ? tok_at(q) : -1;
             cut = cut || tk < 0 || tk == m_.ple_eos;
             ctx[s] = cut ? m_.ple_eos : tk;
         }
-        for (int n = 2; n <= 3; ++n) {
+        for (int n = 2; n <= PLE_ORDERS; ++n) {
             uint64_t mixed = (uint64_t) ctx[0] * m_.ple_mult[0];
             for (int j = 1; j < n; ++j) mixed ^= (uint64_t) ctx[j] * m_.ple_mult[j];
             for (int gi = 0; gi < 8; ++gi) {

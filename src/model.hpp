@@ -54,7 +54,7 @@ constexpr int HC_READ_BLOCKS = 1;   // the 27B has no hyper-connections: no grid
 #else
 constexpr int HC_READ_BLOCKS = 80;
 #endif
-constexpr int PLE_LAYER = 1, PLE_HEADS = 16, PLE_DIM = 160;
+constexpr int PLE_LAYER = 1, PLE_ORDERS = 3, PLE_HEADS = 16, PLE_DIM = 160;
 
 }  // namespace fnx
 

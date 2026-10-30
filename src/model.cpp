@@ -1260,15 +1260,16 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
     for (int64_t v : g.ia(p + "ple.layer_multipliers")) ple_mult.push_back((uint64_t) v);
     for (int64_t v : g.ia(p + "ple.head_offsets")) ple_off.push_back((uint64_t) v);
     for (int64_t v : g.ia(p + "ple.head_vocab_sizes")) ple_vocab.push_back((uint64_t) v);
-    // the gather reads ple_mult[0..2] and a head h at mixed % ple_vocab[h] + ple_off[h]: the arrays must be that long
-    // and every head's range must stay inside the table, or the gather reads rows (or zero-modulo) the metadata invented
-    if (ple_mult.size() != 3 || ple_off.size() != PLE_HEADS || ple_vocab.size() != PLE_HEADS)
+    // the gather reads ple_mult[0..PLE_ORDERS) and a head h at mixed % ple_vocab[h] + ple_off[h]: the arrays must be that
+    // long and every head's range must stay inside the table, or the gather reads rows (or zero-modulo) the metadata invented
+    if (ple_mult.size() != PLE_ORDERS || ple_off.size() != PLE_HEADS || ple_vocab.size() != PLE_HEADS)
         throw std::runtime_error("fnx: the PLE metadata holds " + std::to_string(ple_mult.size()) + " multipliers and " +
                                  std::to_string(ple_off.size()) + " offsets and " + std::to_string(ple_vocab.size()) +
-                                 " vocab sizes, want 3 and " + std::to_string(PLE_HEADS) + " and " + std::to_string(PLE_HEADS));
+                                 " vocab sizes, want " + std::to_string(PLE_ORDERS) + " and " + std::to_string(PLE_HEADS) + " and " +
+                                 std::to_string(PLE_HEADS));
     {
         // a zero multiplier drops its n-gram from the hash silently: the gather still runs, on fewer orders than the model trained with
-        for (int j = 0; j < 3; ++j)
+        for (int j = 0; j < PLE_ORDERS; ++j)
             if (!ple_mult[j]) throw std::runtime_error("fnx: PLE multiplier " + std::to_string(j) + " is 0, which drops that n-gram from the hash");
         static_assert(PLE_HEADS * PLE_DIM == N, "the gather tiles PLE_HEADS rows of PLE_DIM into one embedding row");
         if (ple_table->ne[0] != PLE_DIM)
