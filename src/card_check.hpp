@@ -1,6 +1,6 @@
 #pragma once
 // What the engine checks of every card as the model loads, before anything is placed on one (model.cpp,
-// check_cards): the compute capability and SMs the build needs, the PCI address and BAR1 as sysfs spells them. Kept
+// check_cards): the compute capability the build needs, the PCI address and BAR1 as sysfs spells them. Kept
 // apart from CUDA and the files so a CPU test holds the rules to real cards' numbers and sysfs text
 // (tools/card_check_test.cpp). The links between the cards are tried later, by the engine (src/peer_probe.hpp)
 #include <cstdio>
@@ -12,17 +12,14 @@ namespace fnx {
 
 // The kernels are compiled for one compute capability (make ARCH=...). On any other card the driver compiles their
 // PTX at load without a word, a different program from the one the checks ran, so a card must be the build's arch
-// exactly. The hc read (src/hc.cuh) needs all hc_need_sms of its blocks resident at once, one an SM: a card with
-// fewer SMs hangs in its grid barrier. arch: the build's (FNX_ARCH); major, minor, sms: the card's
-inline void require_card_arch(int dev, const std::string& name, int major, int minor, int sms, int arch, int hc_need_sms) {
+// exactly. Any SM count runs (the hc read sizes its grid to the card, src/hc.cuh). arch: the build's (FNX_ARCH); major,
+// minor: the card's
+inline void require_card_arch(int dev, const std::string& name, int major, int minor, int arch) {
     const int cc = major * 10 + minor;
     if (cc != arch)
         throw std::runtime_error("card " + std::to_string(dev) + " (" + name + ") is compute capability " + std::to_string(major) + "." +
                                  std::to_string(minor) + " and this build is for sm_" + std::to_string(arch) +
                                  ": rebuild with make ARCH=" + std::to_string(cc) + " (the Makefile says if it builds for that one)");
-    if (sms < hc_need_sms)
-        throw std::runtime_error("card " + std::to_string(dev) + " (" + name + ") has " + std::to_string(sms) + " SMs: the hc read (src/hc.cuh) needs " +
-                                 std::to_string(hc_need_sms) + " blocks resident at once, one an SM");
 }
 
 // s as 1 to max_digits hex digits (after a 0x when prefix allows one) and nothing else, max_digits at most 16 (more would

@@ -92,7 +92,7 @@ on 24 GB cards. Workstation and datacenter cards generally allow it with NVIDIA'
 says for a given box). There is no fallback for a box without it: a layer split, as Strata does, runs anywhere.
 
 The engine checks each card as it loads, before anything is placed on it, and refuses one that is not the build's arch,
-has fewer SMs than the hc read keeps resident (80, `HC_READ_BLOCKS`), sits in a translated IOMMU domain or has a BAR1
+sits in a translated IOMMU domain or has a BAR1
 smaller than its memory. Before the first window it writes across every link between the cards and stops, naming the
 pair, if anything does not arrive; a link under 1 GB/s gets a warning. What a box needs and what each refusal says: [docs/config.md](docs/config.md#other-gpus).
 

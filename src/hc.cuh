@@ -1,4 +1,4 @@
-// The hyper-connection read (build_hc_mix) in one launch of H_NS * H_RG = 80 blocks, one per SM, with two grid barriers
+// The hyper-connection read (build_hc_mix) in one launch of H_NS * H_RG = 80 blocks' work, with two grid barriers
 // (included by kernels.cu). The Q8_0 mixes run on int8 activations with dp4a, as llama.cpp's CUDA path quantizes a
 // Q8_0 matmul's input to q8_1.
 //   down:   block (slice s of 512 columns, row group): R' = R + bo * 2 sigmoid(inj / HC) for the slice, xs = R' * w_norm,
@@ -8,7 +8,9 @@
 //           lo = silu(rs-weighted sum of the slices' partials / HC) as int8 per 32; the inject rows likewise.
 //   up:     (after the second barrier) block b = 32 columns: every stream's up row of each column . lo, then
 //           mixed = mean_c xn_c * sigmoid(.), R <- R' when a write was folded in, mixed as q8_1 when asked.
-// The barriers need all 80 blocks resident at once: nothing else may run on the card during a read (the engine's
+// The barriers need every block of the grid resident at once: the grid is one block per SM, up to 80 (hc_prepare), and a
+// block of a card with fewer SMs (a 72-SM PG500-216) takes the down and up parts of 80 / SMs of them in turn, each the
+// same sums in the same order, so the same bits. Nothing else may run on the card during a read (the engine's
 // second-stream branches fork after it). A barrier that waits too long sets bit 4 of err.
 namespace {
 
@@ -21,12 +23,9 @@ constexpr int H_TPRD = 8, H_DT = (H_RPG * H_TPRD + 31) / 32 * 32, H_BLOCKS = H_N
 constexpr int H_UPC = 32, H_TPRU = 16, H_UB = LR / 32;
 static_assert(H_BLOCKS * H_UPC == N, "one up block per down block");
 static_assert(H_UPC * H_TPRU <= H_DT && H_UB <= H_TPRU, "the up lanes");
-// the grid barrier's counter runs modulo H_BAR_MOD, a multiple of the grid size, so every barrier's H_BLOCKS arrivals
-// stay in one generation [k * H_BLOCKS, (k + 1) * H_BLOCKS) across the wrap
-#if !FNX_27B   // the 27B has no hyper-connections
-static_assert(H_BLOCKS == HC_READ_BLOCKS, "model.hpp's HC_READ_BLOCKS: the SMs a card is refused below");
-#endif
-constexpr unsigned H_BAR_MOD = 0xffffffffu / H_BLOCKS * H_BLOCKS;
+// the grid barrier's counter runs modulo hc_bar_mod(g), a multiple of the grid size g, so every barrier's g arrivals
+// stay in one generation [k * g, (k + 1) * g) across the wrap
+__host__ __device__ constexpr unsigned hc_bar_mod(unsigned g) { return 0xffffffffu / g * g; }
 
 struct HcArgs {
     float* R;
@@ -43,7 +42,7 @@ struct HcArgs {
     float* ssp;    // [T][H_NS]: the slices' square sums
     int8_t* loq;   // [T][LR]: lo as int8 per 32
     float* lod;    // [T][LR / 32]: their scales
-    unsigned* bar;       // the grid barrier's counter (modulo H_BAR_MOD)
+    unsigned* bar;       // the grid barrier's counter (modulo hc_bar_mod(grid))
     unsigned* err;       // bit 4: a barrier timed out
     block_q8_1* q8;      // mixed as q8_1 too, or null
     int8_t* tq = nullptr;   // and its split twin, or null
@@ -67,19 +66,20 @@ __device__ __forceinline__ void q8_block(float v, int8_t* q, float* d) {
     if ((threadIdx.x & 31) == 0) *d = sc;
 }
 
-// every block of the grid gets here before any goes on (the counter grows by the grid size per barrier, modulo
-// H_BAR_MOD). The block's last thread arrives and waits until the counter has left its barrier's generation: it is then
-// 1 to 2 * H_BLOCKS - 1 past the generation's start, as no block can pass the next barrier before this one does. A fence
+// every block of the grid gets here before any goes on (the counter grows by the grid size g per barrier, modulo
+// hc_bar_mod(g)). The block's last thread arrives and waits until the counter has left its barrier's generation: it is
+// then 1 to 2 * g - 1 past the generation's start, as no block can pass the next barrier before this one does. A fence
 // waits for the thread's own loads too, and that thread loads no up weights
-__device__ __forceinline__ void grid_sync(unsigned* bar, unsigned* err) {
+__device__ __forceinline__ void grid_sync(unsigned* bar, unsigned* err, unsigned g) {
     __syncthreads();
     if (threadIdx.x == blockDim.x - 1) {
         __threadfence();
-        const unsigned old = atomicInc(bar, H_BAR_MOD - 1u), base = old - old % H_BLOCKS;
+        const unsigned mod = hc_bar_mod(g);
+        const unsigned old = atomicInc(bar, mod - 1u), base = old - old % g;
         const long long t0 = clock64();
         for (;;) {
             const unsigned cur = *(volatile unsigned*) bar;
-            if ((cur >= base ? cur - base : cur + (H_BAR_MOD - base)) >= (unsigned) H_BLOCKS) break;
+            if ((cur >= base ? cur - base : cur + (mod - base)) >= g) break;
             if (clock64() - t0 > 2000000000LL) {
                 atomicOr(err, 4u);
                 break;
@@ -110,7 +110,10 @@ template <int T> struct HcUp {
 // ONE: one grid barrier instead of two: after it every block makes the whole of lo itself (the same sums in the same
 // order, so the same bits) from the slices' partials in L2, and block 0 the inject rows; ~T * 77 KB of L2 reads a block,
 // so for small windows only
-template <int T, bool ONE>
+// WALK: the grid is short of H_BLOCKS and each block takes the shares vb = blockIdx.x + k * gridDim.x in turn; else
+// vb = blockIdx.x alone, without the loops (the walk costs a register over the 79 of 80 SMs' form, and a stack slot at
+// T = 15)
+template <int T, bool ONE, bool WALK>
 __global__ void __launch_bounds__(H_DT, 1) k_hc(HcArgs a) {
     static_assert(sizeof(HcUp<T>) <= sizeof(float) * T * H_SL && LR % 16 == 0, "the up part's arrays inside xs, aligned");
     __shared__ __align__(16) float xs[T][H_SL];
@@ -123,9 +126,14 @@ __global__ void __launch_bounds__(H_DT, 1) k_hc(HcArgs a) {
     auto& rs = up.rs;
     auto& ms = up.ms;
     auto& gs = up.gs;
-    const int t = threadIdx.x, s = blockIdx.x / H_RG, grp = blockIdx.x % H_RG, warp = t >> 5, lane = t & 31;
+    const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+    const unsigned grid = WALK ? gridDim.x : (unsigned) H_BLOCKS;
+    // ---------------- down, for each of the block's shares vb
+    int vb = blockIdx.x;
+    do {
+    if (vb != blockIdx.x) __syncthreads();   // the last share's dots are done with xs / xq / xd
+    const int s = vb / H_RG, grp = vb % H_RG;
     const int col0 = s * H_SL, c = col0 / N, i0 = col0 - c * N;
-    // ---------------- down
     // thread t < H_SL takes column t of every row, the rows' loads side by side (a row at a time, each cost a memory
     // latency: T of them on the group-0 blocks, which the others then waited for at the first barrier)
     static_assert(H_SL <= H_DT, "a thread per column");
@@ -208,23 +216,28 @@ __global__ void __launch_bounds__(H_DT, 1) k_hc(HcArgs a) {
             }
         }
     }
-    // the up weights of this block's 32 columns, in flight through the reduction (nothing reads them before the
-    // barrier, so nothing waits for them): lane uj < H_UB of column udd takes block uj of each stream's row
-    const int uj = t % H_TPRU, udd = t / H_TPRU, ud = blockIdx.x * H_UPC + udd;
+    } while (WALK && (vb += grid) < H_BLOCKS);
+    // the up weights of share vb's 32 columns: lane uj < H_UB of column udd takes block uj of each stream's row. The
+    // block's first share's are in flight through the reduction (nothing reads them before the barrier, so nothing
+    // waits for them); a later share's load after the last share's up part
+    const int uj = t % H_TPRU, udd = t / H_TPRU;
     const bool ulive = t < H_UPC * H_TPRU && uj < H_UB;
     static_assert(H_UPC * H_TPRU < H_DT, "the block's last thread has no up lane (it runs the grid barrier)");
     uint4 wq[HC][2] = {};
     uint16_t wsh[HC] = {};
-    if (ulive)
+    const auto load_up = [&](int vb) {
+        if (ulive)
 #pragma unroll
-        for (int cc = 0; cc < HC; ++cc) {
-            const size_t urow = (size_t) cc * N + ud;
-            const uint4* wp = reinterpret_cast<const uint4*>(a.w_up.q + urow * LR + uj * 32);
-            wq[cc][0] = __ldg(wp);
-            wq[cc][1] = __ldg(wp + 1);
-            wsh[cc] = __ldg(a.w_up.d + urow * (LR / 32) + uj);
-        }
-    grid_sync(a.bar, a.err);
+            for (int cc = 0; cc < HC; ++cc) {
+                const size_t urow = (size_t) cc * N + vb * H_UPC + udd;
+                const uint4* wp = reinterpret_cast<const uint4*>(a.w_up.q + urow * LR + uj * 32);
+                wq[cc][0] = __ldg(wp);
+                wq[cc][1] = __ldg(wp + 1);
+                wsh[cc] = __ldg(a.w_up.d + urow * (LR / 32) + uj);
+            }
+    };
+    load_up(blockIdx.x);
+    grid_sync(a.bar, a.err, grid);
     if constexpr (ONE) {
         // ---------------- reduce, in every block: rs, then lo per (token k, lo block b) a warp into lq / ld
         if (t < T * HC) rs[t / HC][t % HC] = rs_of(a, t / HC, t % HC);
@@ -264,7 +277,7 @@ __global__ void __launch_bounds__(H_DT, 1) k_hc(HcArgs a) {
     // ---------------- reduce: item (token k, lo block b) per warp, then each token's inject rows
     {
         constexpr int ITEMS = T * (LR / 32) + T;
-        for (int it = blockIdx.x * (H_DT / 32) + warp; it < ITEMS; it += H_BLOCKS * (H_DT / 32)) {
+        for (int it = blockIdx.x * (H_DT / 32) + warp; it < ITEMS; it += grid * (H_DT / 32)) {
             const bool inj_item = it >= T * (LR / 32);
             const int k = inj_item ? it - T * (LR / 32) : it / (LR / 32);
             // every lane runs the same path (q8_block shuffles across the warp); only an inject item's first HC lanes
@@ -287,12 +300,19 @@ __global__ void __launch_bounds__(H_DT, 1) k_hc(HcArgs a) {
             } else q8_block(silu_(sum / (float) HC), a.loq + k * LR + (r & ~31), a.lod + k * (LR / 32) + r / 32);
         }
     }
-    grid_sync(a.bar, a.err);
+    grid_sync(a.bar, a.err, grid);
     // ---------------- up
     if (t < T * HC) rs[t / HC][t % HC] = rs_of(a, t / HC, t % HC);
     for (int e = t; e < T * LR / 4; e += H_DT) reinterpret_cast<int*>(&lq[0][0])[e] = __ldcg(reinterpret_cast<const int*>(a.loq) + e);
     for (int e = t; e < T * (LR / 32); e += H_DT) ld[e / (LR / 32)][e % (LR / 32)] = __ldcg(a.lod + e);
     __syncthreads();
+    }
+    // ---------------- up, share vb = 32 columns b
+    vb = blockIdx.x;
+    do {
+    if (vb != blockIdx.x) {
+        __syncthreads();   // the last share is done with gs / ms
+        load_up(vb);
     }
     float wsc[HC];
 #pragma unroll
@@ -326,7 +346,7 @@ __global__ void __launch_bounds__(H_DT, 1) k_hc(HcArgs a) {
     }
     __syncthreads();
     // item (k, c, col): this block's 32 columns of stream c, row k, coalesced along the columns
-    const int b = blockIdx.x;
+    const int b = vb;
     for (int e = t; e < T * HC * H_UPC; e += H_DT) {
         const int col = e % H_UPC, cc = (e / H_UPC) % HC, k = e / (H_UPC * HC), dc = b * H_UPC + col;
         const float rv = rprime(a, k, cc, dc);
@@ -340,7 +360,7 @@ __global__ void __launch_bounds__(H_DT, 1) k_hc(HcArgs a) {
         a.mixed[(size_t) k * N + b * H_UPC + col] = sum;
         ms[k][col] = sum;
     }
-    if (!a.q8) return;
+    if (!a.q8) continue;
     __syncthreads();
     static_assert(H_UPC == 32, "one q8_1 block per token per up block");
     if (warp < T) {
@@ -356,17 +376,20 @@ __global__ void __launch_bounds__(H_DT, 1) k_hc(HcArgs a) {
             if (lane == 0) a.td[(size_t) warp * (N / 32) + b] = __half2float(__float2half(dq));
         }
     }
+    } while (WALK && (vb += grid) < H_BLOCKS);
 }
 
-// one: k_hc's one-barrier form (built for windows of up to 8 rows)
-template <int T> void hc_launch(const HcArgs& a, cudaStream_t st, bool one) {
+// one: k_hc's one-barrier form (built for windows of up to 8 rows); grid: the card's, from hc_prepare
+template <int T> void hc_launch(const HcArgs& a, cudaStream_t st, bool one, int grid) {
     if constexpr (T <= 8) {
         if (one) {
-            k_hc<T, true><<<H_BLOCKS, H_DT, 0, st>>>(a);
+            if (grid < H_BLOCKS) k_hc<T, true, true><<<grid, H_DT, 0, st>>>(a);
+            else k_hc<T, true, false><<<grid, H_DT, 0, st>>>(a);
             return;
         }
     }
-    k_hc<T, false><<<H_BLOCKS, H_DT, 0, st>>>(a);
+    if (grid < H_BLOCKS) k_hc<T, false, true><<<grid, H_DT, 0, st>>>(a);
+    else k_hc<T, false, false><<<grid, H_DT, 0, st>>>(a);
 }
 
 }  // namespace

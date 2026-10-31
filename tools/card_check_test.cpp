@@ -1,4 +1,4 @@
-// src/card_check.hpp and src/peer_probe.hpp's CPU side: a card's compute capability and SMs against the build's arch;
+// src/card_check.hpp and src/peer_probe.hpp's CPU side: a card's compute capability against the build's arch;
 // CUDA's and nvidia-smi's PCI addresses in sysfs's spelling, BAR1's size from real cards'
 // /sys/bus/pci/devices/<bdf>/resource text, the text it refuses, and the BAR1-against-memory check the engine makes as
 // it loads: prod's V100s pass, an RTX 3090 with a pre-ReBAR VBIOS (256 MiB) is refused, one at full ReBAR passes; and
@@ -99,10 +99,10 @@ void covers(const char* name, unsigned long long bar, unsigned long long vram, b
     }
 }
 
-// require_card_arch on a card (major.minor, SMs) against a build (arch); refused when `says` is not empty, saying it
-void arch(const char* name, int major, int minor, int sms, int build, const std::string& says) {
+// require_card_arch on a card (major.minor) against a build (arch); refused when `says` is not empty, saying it
+void arch(const char* name, int major, int minor, int build, const std::string& says) {
     try {
-        fnx::require_card_arch(0, name, major, minor, sms, build, fnx::HC_READ_BLOCKS);
+        fnx::require_card_arch(0, name, major, minor, build);
         if (!says.empty()) fail(std::string(name) + " on an sm_" + std::to_string(build) + " build passed, want it refused");
     } catch (const std::runtime_error& e) {
         if (says.empty()) fail(std::string(name) + " on an sm_" + std::to_string(build) + " build refused: " + e.what());
@@ -150,18 +150,15 @@ fnx::PeerFailure failure(int from, int to, int ncard, bool copy, unsigned missin
 }  // namespace
 
 int main() {
-    // SM counts as the cards report them: prod's V100s 80, an RTX 3090 82
-    arch("Tesla V100-PCIE-32GB", 7, 0, 80, 70, "");
-    arch("NVIDIA GeForce RTX 3090", 8, 6, 82, 86, "");
-    arch("NVIDIA GeForce RTX 3090", 8, 6, 82, 70, "make ARCH=86");    // prod's build on a 3090: the PTX compiled at load
-    arch("Tesla V100-PCIE-32GB", 7, 0, 80, 86, "make ARCH=70");
-    arch("NVIDIA GeForce RTX 4090", 8, 9, 128, 86, "make ARCH=89");
-    arch("NVIDIA A100-PCIE-40GB", 8, 0, 108, 86, "make ARCH=80");
-    arch("NVIDIA GeForce RTX 4090", 8, 9, 128, 89, "");             // a build for its arch: refused only by what else it lacks
-#if !FNX_27B   // Flash-Next's hc read needs 80 SMs; the 27B has no hc read
-    arch("NVIDIA GeForce RTX 3080", 8, 6, 68, 86, "68 SMs");          // sm_86, too few SMs for the hc read
-#endif
-    arch("an sm_86 card with the SMs exactly", 8, 6, fnx::HC_READ_BLOCKS, 86, "");
+    arch("Tesla V100-PCIE-32GB", 7, 0, 70, "");
+    arch("Tesla PG500-216", 7, 0, 70, "");                     // 72 SMs: the hc read walks its 80 blocks of work on them
+    arch("NVIDIA GeForce RTX 3090", 8, 6, 86, "");
+    arch("NVIDIA GeForce RTX 3090", 8, 6, 70, "make ARCH=86");    // prod's build on a 3090: the PTX compiled at load
+    arch("Tesla V100-PCIE-32GB", 7, 0, 86, "make ARCH=70");
+    arch("NVIDIA GeForce RTX 4090", 8, 9, 86, "make ARCH=89");
+    arch("NVIDIA A100-PCIE-40GB", 8, 0, 86, "make ARCH=80");
+    arch("NVIDIA GeForce RTX 4090", 8, 9, 89, "");             // a build for its arch: refused only by what else it lacks
+    arch("NVIDIA GeForce RTX 3080", 8, 6, 86, "");             // 68 SMs
 
     bdf("0000:3B:00.0", "0000:3b:00.0");        // cudaDeviceGetPCIBusId
     bdf("00000000:3B:00.0", "0000:3b:00.0");    // nvidia-smi

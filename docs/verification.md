@@ -300,9 +300,11 @@ To check one: the steps there with `ARCH=86` on every make and a lab directory o
 
 What differs from a V100, as far as the code goes: the kernels are the same source, compiled for sm_86. The
 `mma.sync.m8n8k4` in `src/moe_mma.cuh` runs there, but NVIDIA documents it as tuned for sm_70 and possibly much slower
-on later cards. The hc read (`src/hc.cuh`) needs its 80 blocks resident at once: a 3090 has 82 SMs, and the engine
-refuses as it loads a card with fewer or of another arch than the build's (`src/card_check.hpp`; `src/hc.cuh`
-holds its grid to `HC_READ_BLOCKS` in `src/model.hpp` at compile time).
+on later cards. The hc read (`src/hc.cuh`) keeps one block per SM resident, up to its 80 blocks of work: a 3090's 82
+SMs run them one a block, as a V100's 80 do. A card with fewer SMs walks them, each of its blocks taking several in
+turn: on a V100 with the grid held to 72 (`kbench`, as a 72-SM PG500-216 runs it) a read took x1.36-1.47 as long at
+1-5 rows, x1.69 at 8 and x2.00 at 16, the blocks with two shares setting the pace. The engine refuses as it loads a
+card of another arch than the build's (`src/card_check.hpp`).
 
 ## The test inventory
 
@@ -319,7 +321,7 @@ holds its grid to `HC_READ_BLOCKS` in `src/model.hpp` at compile time).
 | The batched-draft row plan against a brute force over every split | `bin/batch_plan_test` |
 | The prompt path's ring steps: two and three cards' sequences, and consecutive sums over both buffer sets on every supported count (CPU) | `bin/pf_ring_plan_test` |
 | YaRN's band, per-pair angles and magnitude against ggml's formulas, and the settings it refuses | `bin/rope_test` |
-| The card checks at load: a card's compute capability and SMs against the build's arch; PCI addresses; BAR1 from a V100's and an RTX 3090's sysfs text and one made from the 3090's at full ReBAR; the text it refuses, signs and over-wide fields included; which cards pass; the link probe's report (a pair left out refused), slow pairs warned and lost words named (CPU) | `bin/card_check_test` |
+| The card checks at load: a card's compute capability against the build's arch; PCI addresses; BAR1 from a V100's and an RTX 3090's sysfs text and one made from the 3090's at full ReBAR; the text it refuses, signs and over-wide fields included; which cards pass; the link probe's report (a pair left out refused), slow pairs warned and lost words named (CPU) | `bin/card_check_test` |
 | The link probe on the cards (`src/peer_probe.cu`): its watcher's self-check and the healthy path run at every start, prod's included (the rates measured: [docs/config.md](config.md#boot-requirement)); its failure paths need a broken link and have run nowhere, checked by review only | engine start-up |
 | The Makefile's checks of `ARCH` and `FNX_NCARD`: every bad value refused with its message before a stamp is written, a value padded with spaces the same setting (CPU) | `tools/build_guards_check.sh` |
 | The top-k ties | `bin/topk_test` |

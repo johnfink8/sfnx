@@ -166,6 +166,7 @@ int main() {
             cudaMalloc(&injo, MAXT * HC * 4);
             cudaMalloc(&scratch, hc_scratch_floats(MAXT) * 4);
             cudaMemset(scratch, 0, hc_scratch_floats(MAXT) * 4);
+            hc_prepare(scratch);
             unsigned* herr;
             cudaMalloc(&herr, 4);
             cudaMemset(herr, 0, 4);
@@ -176,6 +177,14 @@ int main() {
                 hc_read(R, bo, inj, wn, wd, wu, wi, 1e-6f, mixed, injo, scratch, herr, T, s, q8);
             });
             std::printf("T=%d hc_read       %7.1f us (%5.1f MB, %4.0f GB/s)\n", T, us, mb, mb / us * 1e3);
+            for (const int g : {72, 64, 40}) {   // as a card of g SMs runs it (a 72-SM PG500-216)
+                hc_prepare(scratch, g);
+                const float ug = time_us([&](cudaStream_t s) {
+                    hc_read(R, bo, inj, wn, wd, wu, wi, 1e-6f, mixed, injo, scratch, herr, T, s, q8);
+                });
+                std::printf("T=%d hc_read on %d %7.1f us (x%.2f)\n", T, g, ug, ug / us);
+            }
+            hc_prepare(scratch);
             {   // the same with the down weights pulled into L2 first (not timed)
                 cudaStream_t st;
                 cudaStreamCreate(&st);
@@ -197,6 +206,9 @@ int main() {
                 std::sort(ts.begin(), ts.end());
                 std::printf("T=%d hc_read, down weights in L2: %7.1f us\n", T, ts[ts.size() / 2]);
             }
+            unsigned herr_h = 0;
+            cudaMemcpy(&herr_h, herr, 4, cudaMemcpyDeviceToHost);
+            if (herr_h & 4u) throw std::runtime_error("kbench: an hc read's grid barrier timed out (its times above are not the read's)");
         }
         {   // recurrent core, a card's share: 6 key heads, 16 value heads (card 0's map)
             const int nk = 6, nv = 16, ch = (2 * nk + nv) * HS;

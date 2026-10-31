@@ -105,6 +105,8 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         b->inj_a = dalloc<float>(MAXT * HC);
         b->inj_f = dalloc<float>(MAXT * HC);
         b->hcs = dalloc<float>(hc_scratch_floats(MAXT));
+        if (const int g = hc_prepare(b->hcs); g < hc_blocks())
+            std::fprintf(stderr, "fnx: card %d: %d SMs: the hc read runs its %d blocks of work on %d\n", c, g, hc_blocks(), g);
         if (std::getenv("FNX_HC_BAR_WRAP")) {
             const long long n = env_int("FNX_HC_BAR_WRAP", 0);
             if (n <= 0 || n > 0xffffffffLL) throw std::runtime_error("FNX_HC_BAR_WRAP: want a barrier count > 0, got " + std::to_string(n));

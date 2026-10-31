@@ -19,7 +19,7 @@ NVCC := $(CUDA)/bin/nvcc
 # cudaGraphInstantiate); its numbers are theirs (docs/verification.md). 80, 89, 90, 100 and 120 compile (every object,
 # nvcc 12.9) and have never run; what a card must be beyond its arch the engine checks when it starts
 # (docs/config.md, Other GPUs). 75 is refused here: the prompt path's recurrent kernel takes ~73 KB of shared memory a
-# block (GCH_REC_SMEM, src/gdn_prompt.cuh) and Turing gives 64, and no Turing card has HC_READ_BLOCKS SMs anyway.
+# block (GCH_REC_SMEM, src/gdn_prompt.cuh) and Turing gives 64.
 # build/arch holds the arch the objects in build/ were made for, as build/ncard holds the count, and build/cuda the nvcc
 # and its version
 ARCH ?= 70

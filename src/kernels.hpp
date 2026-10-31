@@ -51,9 +51,15 @@ void gemv_f32(const float* W, const float* x, float* y, int rows, int n, int T, 
 // the hyper-connection read (build_hc_mix) with the previous half's write folded in when bo_prev is not null:
 // R' = R + bo_prev * 2 sigmoid(inj_prev / HC); R <- R'; mixed = mean_c xn_c * sigmoid(up . silu(down . xn / HC));
 // inject = w_inj . xn (when w_inj); mixed also as q8_1 rows into q8 when not null. scratch: hc_scratch_floats(MAXT)
-// floats, zeroed once (its last float is the read's grid barrier counter). One launch that needs every SM of the card:
-// nothing else may run beside it. err: bit 4 set when its barrier timed out.
+// floats, zeroed once (its last float is the read's grid barrier counter). One launch of a block per SM (up to
+// hc_blocks()) that needs every one of them resident: nothing else may run beside it. err: bit 4 set when its barrier
+// timed out.
 size_t hc_scratch_floats(int T);
+int hc_blocks();    // the read's blocks of work; a card with fewer SMs runs them on one block per SM
+// sizes the read's grid to the current card (before its first hc_read or hc_preset_barrier) and zeroes the barrier
+// counter of scratch, the card's one hc scratch (the counter counts in generations of the grid it ran with); returns the
+// grid. cap > 0: at most cap blocks, as a card with that many SMs would run (kbench)
+int hc_prepare(float* scratch, int cap = 0);
 int hc1_rows();   // FNX_HC1: windows of up to this many rows take the read's one-barrier form (read once; throws if bad)
 void hc_read(float* R, const float* bo_prev, const float* inj_prev, const float* w_norm, const Q8S& w_down,
              const Q8S& w_up, const uint16_t* w_inj, float eps, float* mixed, float* inject, float* scratch, unsigned* err,
