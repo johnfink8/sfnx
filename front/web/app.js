@@ -252,10 +252,11 @@ function renderSlots(b, live) {
   if (b.outside) {
     // the request on the engine's own session, in the first place: no slot works while one request runs alone
     const title = `the engine's own session, with its MTP drafts on; the ${b.par} slot sessions are idle` +
-      (held ? ` and hold ${kfmt(held)} tokens` : "");
+      (held ? ` and hold ${kfmt(held)} tokens` : "") + (live.record ? "; click for the request's details" : "");
     chips.push(live.state === "reading"
-      ? readChip("Main", live.prompt_read, live.prompt_total || live.prompt_tokens, live.prefill_tok_s_mean, title)
-      : slotChip({name: "Main", state: "decoding", title,
+      ? readChip("Main", live.prompt_read, live.prompt_total || live.prompt_tokens, live.prefill_tok_s_mean, title,
+                 live.record)
+      : slotChip({name: "Main", state: "decoding", title, record: live.record,
                   sub: `${fmt(live.generated)} written${b.tokS == null ? "" : ` · ${fmt(b.tokS, 1)} t/s`}`,
                   second: `context ${kfmt((live.prompt_tokens || 0) + (live.generated || 0))}`}));
   }

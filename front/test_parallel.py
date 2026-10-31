@@ -447,6 +447,29 @@ class ParallelService(FakeEngineCase):
         active = [int(x.split()[3]) for x in self.log.read_text().splitlines() if x.startswith("BGEN")]
         self.assertTrue(all(a <= 1 for a in active), active)
 
+    def test_the_solo_request_on_the_engine_session_reports_its_record(self):
+        """The page's "Main" chip - one request alone on the engine's own session, no slot working - opens that
+        request's details like a slot chip does: /metrics names its record while it runs."""
+        self.start(2)
+        seen, stop = [], threading.Event()
+
+        def poll():
+            while not stop.is_set():
+                seen.append(self.get("/metrics")["live"])
+                time.sleep(0.01)
+
+        p = threading.Thread(target=poll, daemon=True)
+        p.start()
+        try:
+            self.chat("LONGREPLY please")          # ~60 tokens: the polls catch it decoding on its own
+        finally:
+            stop.set()
+            p.join(5)
+        solo = [m for m in seen if m.get("running") == 1 and m.get("state") == "generating"
+                and all(s["state"] == "idle" for s in m.get("slots", []))]
+        self.assertTrue(solo, "no /metrics sample caught the request decoding on its own")
+        self.assertEqual({m["record"] for m in solo}, {self.svc.request_records()[0]["id"]})
+
 
 if __name__ == "__main__":
     unittest.main()

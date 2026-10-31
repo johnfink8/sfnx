@@ -2674,6 +2674,11 @@ class Service:
                     x["tok_s_mean"], x["tok_s"] = x["tok_s"], round(self._rate_of(*mine), 1)
             # the requests in flight that are not in a slot: the one alone on the solo path, or waiting their turn
             in_slots = sum(1 for x in slots if x["state"] != "idle")
+            # the newest of those is whose figures live shows, and the page's "Main" chip (shown while no slot works)
+            # opens its record like a slot's does: without this the lone request was the only one with nothing to click
+            in_slot_ids = {x.get("request_id") for x in slots if x["state"] != "idle"}
+            outside = [st for rid, (st, _) in by_id.items() if rid not in in_slot_ids]
+            live["record"] = outside[-1].get("record") if outside else None
             live.update(parallel=par, running=running, slots=slots, outside_slots=max(0, running - in_slots),
                         waiting=int(getattr(self.engine, "waiting", 0) or 0),
                         admitting=int(getattr(self.engine, "admitting", 0) or 0))
