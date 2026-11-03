@@ -88,6 +88,7 @@ private:
     std::string path_;
     int fd_ = -1;
     bool direct_ = false;
+    std::string rot_;   // sysfs's rotational for the file's disk: "0", "1", or "" when it has none
 
     // the row cache: 8-way set-associative, CLOCK within a set
     static constexpr int WAYS = 8;

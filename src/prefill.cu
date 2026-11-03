@@ -1183,7 +1183,14 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
             prefill_draft(C, set);
         }
     const auto t_enq = std::chrono::steady_clock::now();
-    between();
+    // the next pass's rows (FNX_PLE=disk reads them, and a read can fail): its error waits until this pass has drained,
+    // so no caller that survives it (the lab's worker) goes on beside a pass still running
+    std::exception_ptr between_err;
+    try {
+        between();
+    } catch (...) {
+        between_err = std::current_exception();
+    }
     unsigned err = 0;
     // bounded: a copy-engine ring step waits on its flag without a timeout of its own
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
@@ -1200,6 +1207,7 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
         ckc(cudaMemcpy(&e, b.ring.err, 4, cudaMemcpyDeviceToHost), "err");
         err |= e;
     });
+    if (between_err) std::rethrow_exception(between_err);
     if (err) throw std::runtime_error("prefill: ring error " + std::to_string(err));
     const auto t_main = std::chrono::steady_clock::now();
     if (mtp_ && draft8)

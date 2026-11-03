@@ -51,9 +51,16 @@ std::string rotational_of(int fd) {
 
 PleRows::Mode PleRows::mode_from_env() {
     const char* s = std::getenv("FNX_PLE");
-    if (!s || !std::strcmp(s, "ram")) return Mode::RAM;
-    if (!std::strcmp(s, "disk")) return Mode::DISK;
-    throw std::runtime_error(std::string("FNX_PLE: '") + s + "', not ram or disk");
+    Mode m;
+    if (!s || !std::strcmp(s, "ram")) m = Mode::RAM;
+    else if (!std::strcmp(s, "disk")) m = Mode::DISK;
+    else throw std::runtime_error(std::string("FNX_PLE: '") + s + "', not ram or disk");
+    // the disk's settings are checked whatever the mode: one set beside FNX_PLE=ram would change nothing, silently
+    env_in("FNX_PLE_CACHE_MIB", 256, 0, 1 << 20);
+    env_in("FNX_PLE_THREADS", 32, 1, 256);
+    for (const char* v : {"FNX_PLE_CACHE_MIB", "FNX_PLE_THREADS"})
+        if (m == Mode::RAM && std::getenv(v)) throw std::runtime_error(std::string(v) + " is set, and only FNX_PLE=disk reads it");
+    return m;
 }
 
 PleRows::PleRows(const Gguf& g, const Tensor& t, Mode mode) : mode_(mode), t_(t), rb_(t.row_bytes()) {
@@ -72,10 +79,15 @@ PleRows::PleRows(const Gguf& g, const Tensor& t, Mode mode) : mode_(mode), t_(t)
         posix_fadvise(fd_, (off_t) file_off_, (off_t) t.nbytes, POSIX_FADV_RANDOM);
         std::fprintf(stderr, "ple: %s refuses O_DIRECT: rows read through the page cache\n", path_.c_str());
     }
-    // a spinning disk serves ~100-200 random reads a second, against ~30,000 a 4k-token prompt chunk needs
-    if (rotational_of(fd_) == "1")
+    // a spinning disk serves ~100-200 random reads a second, against ~30,000 a 4k-token prompt chunk needs. A file
+    // system with no block device in sysfs (NFS, overlay, ZFS, btrfs) cannot be told: describe() says so, and the probe's
+    // rate at start is the measure
+    rot_ = rotational_of(fd_);
+    if (rot_ == "1") {
+        ::close(fd_);
         throw std::runtime_error("ple: " + path_ + " is on a rotational disk, too slow for FNX_PLE=disk (a random read per row): "
                                  "move the model to an SSD or use FNX_PLE=ram");
+    }
     const uint64_t cache_mib = env_in("FNX_PLE_CACHE_MIB", 256, 0, 1 << 20);
     threads_ = (int) env_in("FNX_PLE_THREADS", 32, 1, 256);
     sets_ = (cache_mib << 20) / rb_ / WAYS;
@@ -102,7 +114,9 @@ PleRows::~PleRows() {
 
 std::string PleRows::describe() const {
     if (mode_ == Mode::RAM) return "ple: " + t_.name + " in RAM (FNX_PLE=ram)";
-    return "ple: " + t_.name + " read from " + path_ + (direct_ ? " (O_DIRECT)" : " (page cache)") + ", " + std::to_string(threads_) +
+    return "ple: " + t_.name + " read from " + path_ + (direct_ ? " (O_DIRECT" : " (page cache") +
+           (rot_ == "0" ? ", an SSD)" : rot_.empty() ? ", its disk's type unknown: no sysfs entry for the file's device)" : ")") + ", " +
+           std::to_string(threads_) +
            " threads, a row cache of " + std::to_string(sets_ * WAYS) + " rows (" + std::to_string((sets_ * WAYS * rb_) >> 20) + " MiB)";
 }
 
@@ -130,7 +144,12 @@ void PleRows::worker() {
                 if (r < 0 && errno == EINTR) continue;
                 if (r < 0) err = "ple: reading " + path_ + " at " + std::to_string(at + got) + ": " + std::strerror(errno);
                 else if (r == 0) break;   // the file's end: the rows' bytes are checked against what came
-                else got += (size_t) r;
+                else {
+                    got += (size_t) r;
+                    // O_DIRECT reads come back short only at the file's end, and asking again from an unaligned offset
+                    // is EINVAL on some file systems
+                    if (direct_ && got < want) break;
+                }
             }
             lat_ns_[i] = now_ns() - t0;
             // the rows this unit serves end within the table, which ends within the file; the bytes up to the table's end
@@ -260,6 +279,7 @@ std::string PleRows::probe(int pages) {
     std::mt19937_64 rng(0x9e3779b97f4a7c15ull);
     std::vector<uint64_t> ps;
     for (int i = 0; i < pages; ++i) ps.push_back(first + rng() % (last - first + 1));
+    ps.push_back(last);   // the table's last page, which may be the file's: its short read is checked at start, not at a request
     std::sort(ps.begin(), ps.end());
     ps.erase(std::unique(ps.begin(), ps.end()), ps.end());
     std::vector<uint64_t> lat;

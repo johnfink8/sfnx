@@ -1235,7 +1235,8 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
     tok_embd = &g.t("token_embd.weight");
 #if FNX_27B
     if (tok_embd->type != T_Q8_0) throw std::runtime_error("27b: token_embd.weight is not Q8_0 (the host's embedding reads Q8_0)");
-    if (std::getenv("FNX_PLE")) throw std::runtime_error("27b: FNX_PLE is set, and the 27B has no PLE table to place");
+    for (const char* v : {"FNX_PLE", "FNX_PLE_CACHE_MIB", "FNX_PLE_THREADS"})
+        if (std::getenv(v)) throw std::runtime_error(std::string("27b: ") + v + " is set, and the 27B has no PLE table");
     vocab = (int) tok_embd->ne[1];
     if (g.t("output.weight").ne[1] != vocab || g.t("output.weight").ne[0] != N)
         throw std::runtime_error("27b: output.weight is not [" + std::to_string(N) + "][" + std::to_string(vocab) + "] (token_embd's vocabulary)");
