@@ -47,6 +47,9 @@ public:
     // the same without advancing: a speculative window (the last token, then drafts). commit(n) keeps its first n rows
     // (1 <= n <= T): the state is cut back to after row n - 1, pos() advances by n. Every verify needs its commit.
     std::vector<int> verify(const std::vector<int>& tokens);
+    // the n-gram rows verify(tokens) will read, read ahead into the cache (FNX_NGRAM=disk: decode's next window as its
+    // tokens become known, while the draft layer runs); nothing in RAM mode or for the 27B
+    void ngram_prefetch(const std::vector<int>& tokens) const;
     void commit(int n);
     // the last window's head logits, T rows of the whole vocabulary (the cards' slices put together)
     std::vector<float> last_logits(int T) const;

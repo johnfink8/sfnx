@@ -102,6 +102,7 @@ PleRows::PleRows(const Gguf& g, const Tensor& t, Mode mode) : mode_(mode), t_(t)
 }
 
 PleRows::~PleRows() {
+    for (std::future<void>& f : pending_) f.wait();   // they read through the pool
     {
         std::lock_guard<std::mutex> l(m_);
         stop_ = true;
@@ -217,7 +218,33 @@ void PleRows::insert(uint64_t row, const uint8_t* src) {
     }
 }
 
+void PleRows::prefetch(std::vector<uint64_t> rows) {
+    if (mode_ != Mode::DISK || rows.empty()) return;
+    std::lock_guard<std::mutex> l(pending_m_);
+    pending_.push_back(std::async(std::launch::async, [this, rows = std::move(rows)] {
+        std::vector<uint8_t> scratch(rows.size() * rb_);
+        gather_now(rows.data(), rows.size(), scratch.data());
+    }));
+}
+
 void PleRows::gather(const uint64_t* rows, size_t n, uint8_t* dst) {
+    std::vector<std::future<void>> before;
+    {
+        std::lock_guard<std::mutex> l(pending_m_);
+        before.swap(pending_);
+    }
+    // every one waited for before the first failure is thrown: none outlives this call reading through the pool
+    std::exception_ptr err;
+    for (std::future<void>& f : before) try {
+            f.get();
+        } catch (...) {
+            if (!err) err = std::current_exception();
+        }
+    if (err) std::rethrow_exception(err);
+    gather_now(rows, n, dst);
+}
+
+void PleRows::gather_now(const uint64_t* rows, size_t n, uint8_t* dst) {
     std::lock_guard<std::mutex> gl(gather_m_);
     const uint64_t nrows = (uint64_t) t_.nrows();
     for (size_t i = 0; i < n; ++i)

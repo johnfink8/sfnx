@@ -734,6 +734,18 @@ void Engine::rows_upload(CardBuf& b, int T) {
     ck(cudaMemcpyAsync(b.ple_emb, h_.ple, (size_t) T * N * 4, cudaMemcpyHostToDevice, b.st), "ple");
 }
 
+void Engine::ngram_prefetch(const std::vector<int>& tokens) const {
+    if (m_.ple_rows->mode() != PleRows::Mode::DISK || tokens.empty()) return;
+    // the positions verify(tokens) embeds, read as it reads them
+    const int h0 = (int) history_.size(), T = (int) tokens.size();
+    std::vector<uint64_t> rows((size_t) T * PLE_HEADS);
+    ple_window_rows(m_.ple, pos_, T, [&](int q) -> int64_t {
+        const int t = q < h0 ? history_[(size_t) q] : tokens[(size_t) (q - h0)];
+        return t >= IMAGE_TOK ? m_.ple_image : t;
+    }, rows.data());
+    m_.ple_rows->prefetch(std::move(rows));
+}
+
 void Engine::embed_rows(int p0, int T, const std::function<int(int)>& tok_at_cell, float* emb, float* ple) const {
     static const int8_t kv4[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
     const Tensor& pt = *m_.ple_table;

@@ -8,6 +8,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <future>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -64,8 +65,12 @@ public:
 
     Mode mode() const { return mode_; }
     size_t row_bytes() const { return rb_; }
-    // the bytes of rows[0..n) to dst (n * row_bytes()); throws on a failed read. One caller at a time (a lock)
+    // the bytes of rows[0..n) to dst (n * row_bytes()); throws on a failed read. One caller at a time (a lock). It
+    // first waits for the prefetches before it, and throws the first one's failure
     void gather(const uint64_t* rows, size_t n, uint8_t* dst);
+    // DISK: the rows read into the cache on a thread of their own, for a gather to come (decode: the next window's
+    // tokens as they become known, while the draft layer runs); RAM: nothing
+    void prefetch(std::vector<uint64_t> rows);
     Stats stats() const;
     // DISK: time `pages` random reads of the table's pages, cold (O_DIRECT): "N reads/s, p50 X us, p99 Y us"
     std::string probe(int pages);
@@ -112,7 +117,10 @@ private:
     std::condition_variable go_, finished_;
     std::vector<std::thread> pool_;
 
+    void gather_now(const uint64_t* rows, size_t n, uint8_t* dst);   // under gather_m_
     std::mutex gather_m_;
+    std::mutex pending_m_;
+    std::vector<std::future<void>> pending_;   // prefetches not yet waited for
     std::atomic<uint64_t> lookups_{0}, hits_{0}, reads_{0}, read_ns_{0};
 };
 

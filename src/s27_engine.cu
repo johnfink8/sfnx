@@ -437,6 +437,9 @@ int Engine::add_lane() {
     return (int) lanes_.size() - 1;
 }
 
+// the 27B has no n-gram table to read ahead
+void Engine::ngram_prefetch(const std::vector<int>&) const {}
+
 // the 27B has no PLE rows: ple must be null
 void Engine::embed_rows(int p0, int T, const std::function<int(int)>& tok_at_cell, float* emb, float* ple) const {
     if (ple) throw std::runtime_error("27b: embed_rows takes no PLE rows");

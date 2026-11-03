@@ -541,6 +541,15 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
         ctx.insert(ctx.end(), o.begin(), o.begin() + used);
         x = o[used - 1];
         if (done) break;
+        // the next window's rows read ahead as its tokens become known (FNX_NGRAM=disk; nothing otherwise): x now, the
+        // drafts as the draft layer makes them, so verify waits only for what the last of them still needs
+        auto prefetch = [&]() {
+            std::vector<int> w{x};
+            w.insert(w.end(), drafts.begin(), drafts.end());
+            e_.ngram_prefetch(w);
+        };
+        drafts.clear();
+        prefetch();
         // the draft layer reads the kept rows either way (its cells stay current for later turns)
         std::vector<int> pen_seq;   // the penalty window before the next token: the context's last pen_last_n
         if (pen_drafts) pen_seq.assign(ctx.size() > (size_t) s.pen_last_n ? ctx.end() - s.pen_last_n : ctx.begin(), ctx.end());
@@ -555,6 +564,7 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
         qs.assign(drafts.size(), Dist{});
         if (!drafts.empty()) {   // the tokens after d1 follow from it and the context: fixed
             ++st.lookup_rounds;
+            prefetch();
             qs[0] = std::move(q1);
             continue;
         }
@@ -564,11 +574,13 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
         const int k = !adapt ? K_ : std::min(K_, chain_len() + (++mtp_chains % 4 ? 0 : 1));   // every 16th: code stuck at ~3
         mtp_round = true;
         drafts = {d1}, qs = {std::move(q1)};
+        prefetch();
         for (int j = 1; j < k; ++j) {
             if (pen_drafts) pen_seq.push_back(drafts.back());
             Dist q;
             drafts.push_back(draft_one(1, false, j == 1 ? used - 1 : 0, {drafts.back()}, p + used - 1 + j, pen_seq, q));
             qs.push_back(std::move(q));
+            if (j + 1 < k) prefetch();   // the last draft's rows: verify reads them itself, with nothing left to hide behind
         }
     }
     prompt_.clear();
