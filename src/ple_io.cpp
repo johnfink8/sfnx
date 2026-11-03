@@ -100,10 +100,18 @@ PleRows::PleRows(const Gguf& g, const Tensor& t, Mode mode) : mode_(mode), t_(t)
     lat_ns_.resize(SLAB_UNITS);
     go_ = std::make_unique<std::condition_variable[]>((size_t) threads_);
     for (int i = 0; i < threads_; ++i) pool_.emplace_back([this, i] { worker(i); });
+    pf_thread_ = std::thread([this] { prefetcher(); });
 }
 
 PleRows::~PleRows() {
-    for (std::future<void>& f : pending_) f.wait();   // they read through the pool
+    if (pf_thread_.joinable()) {   // it reads through the pool
+        {
+            std::lock_guard<std::mutex> l(pf_m_);
+            pf_stop_ = true;
+        }
+        pf_go_.notify_one();
+        pf_thread_.join();
+    }
     {
         std::lock_guard<std::mutex> l(m_);
         stop_ = true;
@@ -224,27 +232,53 @@ void PleRows::insert(uint64_t row, const uint8_t* src) {
 
 void PleRows::prefetch(std::vector<uint64_t> rows) {
     if (mode_ != Mode::DISK || rows.empty()) return;
-    std::lock_guard<std::mutex> l(pending_m_);
-    pending_.push_back(std::async(std::launch::async, [this, rows = std::move(rows)] {
-        std::vector<uint8_t> scratch(rows.size() * rb_);
-        gather_now(rows.data(), rows.size(), scratch.data());
-    }));
+    {
+        std::lock_guard<std::mutex> l(pf_m_);
+        pf_next_ = std::move(rows);
+        pf_queued_ = true;
+    }
+    pf_go_.notify_one();
+}
+
+void PleRows::prefetcher() {
+    std::vector<uint64_t> rows;
+    std::vector<uint8_t> scratch;
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> l(pf_m_);
+            pf_go_.wait(l, [&] { return pf_stop_ || pf_queued_; });
+            if (pf_stop_) return;
+            rows.swap(pf_next_);
+            pf_queued_ = false;
+            pf_busy_ = true;
+        }
+        std::exception_ptr err;
+        try {
+            scratch.resize(rows.size() * rb_);
+            gather_now(rows.data(), rows.size(), scratch.data());
+        } catch (...) {
+            err = std::current_exception();
+        }
+        std::lock_guard<std::mutex> l(pf_m_);
+        if (err && !pf_err_) pf_err_ = err;
+        pf_busy_ = false;
+        if (!pf_queued_) pf_idle_.notify_all();
+    }
 }
 
 void PleRows::gather(const uint64_t* rows, size_t n, uint8_t* dst) {
-    std::vector<std::future<void>> before;
-    {
-        std::lock_guard<std::mutex> l(pending_m_);
-        before.swap(pending_);
-    }
-    // every one waited for before the first failure is thrown: none outlives this call reading through the pool
-    std::exception_ptr err;
-    for (std::future<void>& f : before) try {
-            f.get();
-        } catch (...) {
-            if (!err) err = std::current_exception();
+    if (pf_thread_.joinable()) {
+        // a request still queued is dropped (this gather reads what it needs itself); one being read is waited for
+        std::exception_ptr err;
+        {
+            std::unique_lock<std::mutex> l(pf_m_);
+            pf_queued_ = false;
+            pf_idle_.wait(l, [&] { return !pf_busy_; });
+            err = pf_err_;
+            pf_err_ = nullptr;
         }
-    if (err) std::rethrow_exception(err);
+        if (err) std::rethrow_exception(err);
+    }
     gather_now(rows, n, dst);
 }
 

@@ -122,8 +122,15 @@ private:
 
     void gather_now(const uint64_t* rows, size_t n, uint8_t* dst);   // under gather_m_
     std::mutex gather_m_;
-    std::mutex pending_m_;
-    std::vector<std::future<void>> pending_;   // prefetches not yet waited for
+    // the prefetch thread (DISK): the newest of the queued requests (each a later one's prefix, decode's window as it
+    // grows), its failure kept for the next gather
+    void prefetcher();
+    std::mutex pf_m_;
+    std::condition_variable pf_go_, pf_idle_;
+    std::vector<uint64_t> pf_next_;
+    bool pf_queued_ = false, pf_busy_ = false, pf_stop_ = false;
+    std::exception_ptr pf_err_;
+    std::thread pf_thread_;
     std::atomic<uint64_t> lookups_{0}, hits_{0}, reads_{0}, read_ns_{0};
 };
 
