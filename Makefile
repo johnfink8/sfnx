@@ -41,7 +41,7 @@ MAKEFLAGS += --no-builtin-rules
 .SUFFIXES:
 build: bin/sfnx bin/sfnx-vision
 test-bin: bin/fnx_run bin/batch_test bin/cache_test bin/sample_test bin/gguf_test bin/topk_test bin/sfnx_input_test bin/batch_plan_test \
-          bin/stage_test bin/pf_ring_plan_test bin/rope_test bin/card_check_test
+          bin/stage_test bin/pf_ring_plan_test bin/rope_test bin/card_check_test bin/expert_residency_test
 CONFIG ?= serve/sfnx.json
 # The config is checked as the front end checks it before loading anything (front.check_config), so a config it would
 # refuse stops the install rather than a boot; what needs the model (the context against its trained length) the engine
@@ -124,6 +124,10 @@ bin/rope_test: tools/rope_test.cpp src/rope.hpp
 # the start-up card checks against real cards' numbers and sysfs text, on the CPU alone
 bin/card_check_test: tools/card_check_test.cpp src/card_check.hpp src/peer_probe.hpp src/model.hpp src/card_split.hpp src/gguf.hpp build/ncard build/model
 	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -DFNX_NCARD=$(FNX_NCARD) -DFNX_27B=$(FNX_27B) -o $@ tools/card_check_test.cpp
+
+# Residency planning needs no GPU or model data.
+bin/expert_residency_test: tools/expert_residency_test.cpp src/expert_residency.hpp
+	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -Wextra -o $@ tools/expert_residency_test.cpp
 
 # one object per source in build/ (headers tracked by nvcc's own dependency files), so a change recompiles only the
 # objects it touches; every engine program and the lab's library link the same objects (position independent).
