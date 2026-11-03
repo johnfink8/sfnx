@@ -77,4 +77,38 @@ MiB more a card for the recurrent layers' snapshots, at which point 52 and 55 no
 buffers — int8 K/V, a 64 GiB conversation cache. Lab decode at 58 GiB with lookup drafts up to 15
 (`tools/lab.sh decode`, greedy): code edit 137.8 tok/s (130.4 with lookup capped at 7), new code 111.5.
 
+## The n-gram table on disk
+
+The model's n-gram table (`per_layer_token_embd`, read at layer 1) is the largest thing on the host: 320,001,536 rows,
+28.8 GB in Q4_K_XL (IQ4_NL, 90-byte rows) and 54.4 GB in Q8_0 builds (170-byte rows, as Unsloth's UD-Q5_K_XL ships
+it). Each position reads 16 rows of it, hashed from its token and the two before. By default it is locked in RAM. On a
+box whose RAM is short, `FNX_PLE=disk` leaves it on the disk: the engine hashes a window's rows, takes what it can from
+a row cache (`FNX_PLE_CACHE_MIB`, 256 by default) and reads the rest with O_DIRECT, one 4 KiB page a row (two for a row
+that crosses one), `FNX_PLE_THREADS` reads in flight (32). The page cache would hold 4 KiB for each ~100-byte row, and
+rows land on pages at random, so the reads go around it.
+
+What it frees, with experts in RAM (every expert then has a pinned host copy, `FNX_EXPERT_RAM_GIB` or not):
+
+| Pinned host memory | Table in RAM | `FNX_PLE=disk` |
+| --- | --- | --- |
+| Q4_K_XL (77.0 GB of experts) | 99.2 GiB | 72.4 GiB |
+| UD-Q5_K_XL (98.4 GB of experts) | 142.9 GiB | 92.2 GiB |
+
+How much of a prompt the cache can serve (the engine's own hash over `ref/`): a new prompt is mostly rows it has not
+read before — 41.8% of long2's 218,576 lookups are distinct rows, 49.4% of long64's, 41.9% of long164's — so the cache
+pays across requests that repeat text, not within one.
+
+The reads on this box's NVMe (Kingston NV3, DRAM-less), `bin/ple_test` with the engine serving beside it, cold cache:
+
+| | 8 threads | 16 | 32 (default) | 64 | 128 |
+| --- | --- | --- | --- | --- | --- |
+| long64 (62,794 tokens) read 4,096 positions a call: reads/s | 48,686 | 66,037 | 76,282 | 76,283 | 82,731 |
+| the same, seconds of reads | 10.2 | 7.5 | 6.5 | 6.5 | 6.0 |
+| one position a call (decode): a call's p50 / p99 | 0.41 / 0.68 ms | 0.40 / 0.67 | 0.40 / 0.67 | 0.40 / 0.68 | 0.42 / 0.86 |
+
+The prompt path hashes and reads the next chunk's rows while the cards run the current one, so a prompt's reads hide
+behind it while they take less than the chunk's GPU time (~1.2 s for 4,096 rows at prod's rate; 6.5 s of reads against
+~27 s for long64). Decode reads before the window starts: one read's latency, ~0.4 ms on this drive, against a window
+of 13–18 ms. Every row gathered is byte for byte the mapping's (`bin/ple_test`, long2, long64, edit1).
+
 Speed and exactness against the reference: [docs/benchmarks.md](benchmarks.md), [docs/verification.md](verification.md).

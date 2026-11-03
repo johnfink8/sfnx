@@ -735,55 +735,40 @@ void Engine::rows_upload(CardBuf& b, int T) {
 }
 
 void Engine::embed_rows(int p0, int T, const std::function<int(int)>& tok_at_cell, float* emb, float* ple) const {
-    std::memset(ple, 0, (size_t) T * N * sizeof(float));
     static const int8_t kv4[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
     const Tensor& pt = *m_.ple_table;
-    const size_t prb = pt.row_bytes();
-    // the PLE n-grams read an image cell as the model's image token
-    const auto tok_at = [&](int q) -> int64_t {
+    const size_t prb = m_.ple_rows->row_bytes();
+    for (int t = 0; t < T; ++t) embed_token(tok_at_cell(p0 + t), p0 + t, emb + (size_t) t * N);
+    // every row of the window first, then their bytes in one gather: from the disk (FNX_PLE=disk) the misses are read
+    // together, by as many threads as there are. The PLE n-grams read an image cell as the model's image token
+    std::vector<uint64_t> rows((size_t) T * PLE_HEADS);
+    ple_window_rows(m_.ple, p0, T, [&](int q) -> int64_t {
         const int t = tok_at_cell(q);
         return t >= IMAGE_TOK ? m_.ple_image : t;
-    };
-    for (int t = 0; t < T; ++t) {
-        const int p = p0 + t;
-        embed_token(tok_at_cell(p), p, emb + (size_t) t * N);
-        // PLE rows: n-grams of this token and the PLE_ORDERS - 1 before it (EOS / sequence start cut the window)
-        int64_t ctx[PLE_ORDERS];
-        ctx[0] = tok_at(p);
-        bool cut = false;
-        for (int s = 1; s < PLE_ORDERS; ++s) {
-            const int q = p - s;
-            const int64_t tk = q >= 0 ? tok_at(q) : -1;
-            cut = cut || tk < 0 || tk == m_.ple_eos;
-            ctx[s] = cut ? m_.ple_eos : tk;
-        }
-        for (int n = 2; n <= PLE_ORDERS; ++n) {
-            uint64_t mixed = (uint64_t) ctx[0] * m_.ple_mult[0];
-            for (int j = 1; j < n; ++j) mixed ^= (uint64_t) ctx[j] * m_.ple_mult[j];
-            for (int gi = 0; gi < 8; ++gi) {
-                const int h = (n - 2) * 8 + gi;
-                const uint64_t r = mixed % m_.ple_vocab[h] + m_.ple_off[h];
-                const uint8_t* src = pt.data + r * prb;
-                for (int b = 0; b < PLE_DIM / 32; ++b) {
-                    float* dst = &ple[(size_t) t * N + h * PLE_DIM + b * 32];
-                    uint16_t dh;
-                    if (pt.type == T_Q8_0) {
-                        std::memcpy(&dh, src + b * 34, 2);
-                        const float d = h2f(dh);
-                        for (int j = 0; j < 32; ++j) dst[j] = d * (float) (int8_t) src[b * 34 + 2 + j];
-                        continue;
-                    }
-                    std::memcpy(&dh, src + b * 18, 2);   // IQ4_NL
+    }, rows.data());
+    std::vector<uint8_t> raw(rows.size() * prb);
+    m_.ple_rows->gather(rows.data(), rows.size(), raw.data());
+    for (int t = 0; t < T; ++t)
+        for (int h = 0; h < PLE_HEADS; ++h) {
+            const uint8_t* src = &raw[((size_t) t * PLE_HEADS + h) * prb];
+            for (int b = 0; b < PLE_DIM / 32; ++b) {
+                float* dst = &ple[(size_t) t * N + h * PLE_DIM + b * 32];
+                uint16_t dh;
+                if (pt.type == T_Q8_0) {
+                    std::memcpy(&dh, src + b * 34, 2);
                     const float d = h2f(dh);
-                    const uint8_t* qs = src + b * 18 + 2;
-                    for (int j = 0; j < 16; ++j) {
-                        dst[j] = d * kv4[qs[j] & 15];
-                        dst[j + 16] = d * kv4[qs[j] >> 4];
-                    }
+                    for (int j = 0; j < 32; ++j) dst[j] = d * (float) (int8_t) src[b * 34 + 2 + j];
+                    continue;
+                }
+                std::memcpy(&dh, src + b * 18, 2);   // IQ4_NL
+                const float d = h2f(dh);
+                const uint8_t* qs = src + b * 18 + 2;
+                for (int j = 0; j < 16; ++j) {
+                    dst[j] = d * kv4[qs[j] & 15];
+                    dst[j + 16] = d * kv4[qs[j] >> 4];
                 }
             }
         }
-    }
 }
 
 // a sequence's device state on one card, in a fixed order: (pointer, bytes) pieces

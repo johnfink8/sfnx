@@ -179,7 +179,7 @@ and the files they read: [docs/config.md](docs/config.md).
 | | |
 | --- | --- |
 | [docs/design.md](docs/design.md) | the split, the ring, decode, the prompt path, the conversation cache, pictures |
-| [docs/memory.md](docs/memory.md) | the K/V arena and experts in RAM, and what Q8_0 costs |
+| [docs/memory.md](docs/memory.md) | the K/V arena, experts in RAM, what Q8_0 costs, and the n-gram table on disk for boxes short of RAM |
 | [docs/benchmarks.md](docs/benchmarks.md) | every speed measurement, with its method |
 | [docs/verification.md](docs/verification.md) | exactness against llama.cpp, the test inventory, the lab |
 | [docs/config.md](docs/config.md) | engine settings, config files, where this API differs from Strata's |
