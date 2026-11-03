@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -82,7 +83,7 @@ private:
         uint32_t pages;  // 1, or 2 for a row that crosses into the next
     };
     void read_units(const std::vector<Unit>& units);   // into slab_, unit i at i * 2 pages; throws on failure
-    void worker();
+    void worker(int w);
     bool lookup(uint64_t row, uint8_t* dst);
     void insert(uint64_t row, const uint8_t* src);
 
@@ -114,7 +115,9 @@ private:
     bool stop_ = false;
     std::string err_;
     std::mutex m_;
-    std::condition_variable go_, finished_;
+    int active_ = 0;   // the workers of the current round: 0 .. active_ - 1
+    std::unique_ptr<std::condition_variable[]> go_;   // a worker's own
+    std::condition_variable finished_;
     std::vector<std::thread> pool_;
 
     void gather_now(const uint64_t* rows, size_t n, uint8_t* dst);   // under gather_m_

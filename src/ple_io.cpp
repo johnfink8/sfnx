@@ -98,7 +98,8 @@ PleRows::PleRows(const Gguf& g, const Tensor& t, Mode mode) : mode_(mode), t_(t)
     slab_ = (uint8_t*) std::aligned_alloc(PAGE, SLAB_UNITS * 2 * PAGE);
     if (!slab_) throw std::runtime_error("n-gram table: no memory for the read slab");
     lat_ns_.resize(SLAB_UNITS);
-    for (int i = 0; i < threads_; ++i) pool_.emplace_back([this] { worker(); });
+    go_ = std::make_unique<std::condition_variable[]>((size_t) threads_);
+    for (int i = 0; i < threads_; ++i) pool_.emplace_back([this, i] { worker(i); });
 }
 
 PleRows::~PleRows() {
@@ -107,7 +108,7 @@ PleRows::~PleRows() {
         std::lock_guard<std::mutex> l(m_);
         stop_ = true;
     }
-    go_.notify_all();
+    for (int i = 0; i < threads_; ++i) go_[i].notify_all();
     for (std::thread& th : pool_) th.join();
     std::free(slab_);
     if (fd_ >= 0) ::close(fd_);
@@ -121,13 +122,13 @@ std::string PleRows::describe() const {
            " threads, a row cache of " + std::to_string(sets_ * WAYS) + " rows (" + std::to_string((sets_ * WAYS * rb_) >> 20) + " MiB)";
 }
 
-void PleRows::worker() {
+void PleRows::worker(int w) {
     uint64_t seen = 0;
     for (;;) {
         const std::vector<Unit>* job;
         {
             std::unique_lock<std::mutex> l(m_);
-            go_.wait(l, [&] { return stop_ || gen_ != seen; });
+            go_[w].wait(l, [&] { return stop_ || (gen_ != seen && w < active_); });
             if (stop_) return;
             seen = gen_;
             job = job_;
@@ -160,10 +161,10 @@ void PleRows::worker() {
                 err = "n-gram table: reading " + path_ + " at " + std::to_string(at) + ": " + std::to_string(got) + " of " + std::to_string(need) +
                       " bytes (the file is shorter than its table)";
         }
-        // every worker checks in once a round, so none still reads the job when the next round rebuilds it
+        // every worker of the round checks in, so none still reads the job when the next round rebuilds it
         std::lock_guard<std::mutex> l(m_);
         if (!err.empty() && err_.empty()) err_ = err;
-        if (++done_ == (size_t) threads_) finished_.notify_all();
+        if (++done_ == (size_t) active_) finished_.notify_all();
     }
 }
 
@@ -176,11 +177,14 @@ void PleRows::read_units(const std::vector<Unit>& units) {
         next_ = 0;
         done_ = 0;
         err_.clear();
+        // as many workers as reads: waking all 32 for decode's handful cost prose2 ~2.5% (132.4 tok/s at 32 threads,
+        // 135.7 at 8)
+        active_ = (int) std::min<size_t>((size_t) threads_, units.size());
         ++gen_;
     }
-    go_.notify_all();
+    for (int i = 0; i < active_; ++i) go_[i].notify_one();
     std::unique_lock<std::mutex> l(m_);
-    finished_.wait(l, [&] { return done_ == (size_t) threads_; });
+    finished_.wait(l, [&] { return done_ == (size_t) active_; });
     reads_ += units.size();
     read_ns_ += now_ns() - t0;
     if (!err_.empty()) throw std::runtime_error(err_);

@@ -892,9 +892,12 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
     const int h0 = (int) history_.size();
     const auto tok_at = [&](int q) -> int { return q < h0 ? history_[q] : tokens[q - h0]; };
     const size_t nt = tokens.size(), per = (size_t) K * pf_c_;
-    auto chunks_of = [&](size_t i0, int half) {
+    // FNX_NGRAM=disk: the first pass's rows are read before anything runs to hide them (~1.6 s for 16,384 rows on this
+    // box's NVMe), so the first pass is one chunk; the passes after it are whole and their rows read behind the one before
+    const size_t first = m_.ple_rows->mode() == PleRows::Mode::DISK ? std::min(per, (size_t) pf_c_) : per;
+    auto chunks_of = [&](size_t i0, int half, size_t span) {
         std::vector<PfChunk> ch;
-        for (size_t i = i0; i < std::min(nt, i0 + per); i += pf_c_) {
+        for (size_t i = i0; i < std::min(nt, i0 + span); i += pf_c_) {
             const size_t e = std::min(nt, i + pf_c_);
             ch.push_back({std::vector<int>(tokens.begin() + i, tokens.begin() + e), e < nt ? tokens[e] : after, half * K + (int) ch.size()});
         }
@@ -907,11 +910,11 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
             i += c.tokens.size();
         }
     };
-    std::vector<PfChunk> ch = chunks_of(0, 0);
+    std::vector<PfChunk> ch = chunks_of(0, 0, first);
     embed(0, ch);
-    for (size_t i = 0, k = 0; i < nt; i += per, ++k) {
-        std::vector<PfChunk> next = chunks_of(i + per, (int) ((k + 1) & 1));
-        prefill_pass(ch, staging, [&] { embed(i + per, next); });
+    for (size_t i = 0, k = 0, span = first; i < nt; i += span, span = per, ++k) {
+        std::vector<PfChunk> next = chunks_of(i + span, (int) ((k + 1) & 1), per);
+        prefill_pass(ch, staging, [&] { embed(i + span, next); });
         size_t e = i;
         for (const PfChunk& c : ch) {
             e += c.tokens.size();
