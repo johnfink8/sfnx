@@ -82,14 +82,14 @@ buffers — int8 K/V, a 64 GiB conversation cache. Lab decode at 58 GiB with loo
 The model's n-gram table (`per_layer_token_embd`, read at layer 1) is the largest thing on the host: 320,001,536 rows,
 28.8 GB in Q4_K_XL (IQ4_NL, 90-byte rows) and 54.4 GB in Q8_0 builds (170-byte rows, as Unsloth's UD-Q5_K_XL ships
 it). Each position reads 16 rows of it, hashed from its token and the two before. By default it is locked in RAM. On a
-box whose RAM is short, `FNX_PLE=disk` leaves it on the disk: the engine hashes a window's rows, takes what it can from
-a row cache (`FNX_PLE_CACHE_MIB`, 256 by default) and reads the rest with O_DIRECT, one 4 KiB page a row (two for a row
-that crosses one), `FNX_PLE_THREADS` reads in flight (32). The page cache would hold 4 KiB for each ~100-byte row, and
+box whose RAM is short, `FNX_NGRAM=disk` leaves it on the disk: the engine hashes a window's rows, takes what it can from
+a row cache (`FNX_NGRAM_CACHE_MIB`, 256 by default) and reads the rest with O_DIRECT, one 4 KiB page a row (two for a row
+that crosses one), `FNX_NGRAM_THREADS` reads in flight (32). The page cache would hold 4 KiB for each ~100-byte row, and
 rows land on pages at random, so the reads go around it.
 
 What it frees, with experts in RAM (every expert then has a pinned host copy, `FNX_EXPERT_RAM_GIB` or not):
 
-| Pinned host memory | Table in RAM | `FNX_PLE=disk` |
+| Pinned host memory | Table in RAM | `FNX_NGRAM=disk` |
 | --- | --- | --- |
 | Q4_K_XL (77.0 GB of experts) | 99.2 GiB | 72.4 GiB |
 | UD-Q5_K_XL (98.4 GB of experts) | 142.9 GiB | 92.2 GiB |

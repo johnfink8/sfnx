@@ -1,6 +1,6 @@
 #pragma once
 // Rows of the PLE table (per_layer_token_embd: 28.8 GB in IQ4_NL, 54.4 GB in Q8_0) for the host's gather.
-// FNX_PLE=ram (the default): the mapping, locked in RAM by the loader. FNX_PLE=disk: nothing of the table in RAM but a
+// FNX_NGRAM=ram (the default): the mapping, locked in RAM by the loader. FNX_NGRAM=disk: nothing of the table in RAM but a
 // row cache; rows not in it are read with O_DIRECT from the file, one page each (two when a row crosses a page), by a
 // pool of threads doing blocking preads (queue depth = threads). A new prompt is ~45% rows it has not used before
 // (ref/long2, long64, long164: 41.8-49.4% distinct), so the cache pays across requests that repeat text, not within one.
@@ -55,7 +55,7 @@ public:
     struct Stats {
         uint64_t lookups = 0, hits = 0, reads = 0, read_ns = 0;
     };
-    // FNX_PLE, FNX_PLE_CACHE_MIB, FNX_PLE_THREADS: read here, refused when malformed
+    // FNX_NGRAM, FNX_NGRAM_CACHE_MIB, FNX_NGRAM_THREADS: read here, refused when malformed
     static Mode mode_from_env();
     PleRows(const Gguf& g, const Tensor& t, Mode mode);
     ~PleRows();

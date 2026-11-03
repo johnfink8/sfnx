@@ -122,9 +122,9 @@ The ones that change results or are worth knowing. The rest are kernel-level tun
 
 | Setting | Effect |
 | --- | --- |
-| `FNX_PLE=ram` or `disk` | `ram` (default, prod): the table locked in RAM. `disk`: left on the disk and its rows read as windows need them, for a box whose RAM is short. Refused on a rotational disk; the start-up log measures the disk's random reads |
-| `FNX_PLE_CACHE_MIB=N` | `disk`: the row cache, default 256 (2.98M rows of Q4_K_XL's 90 bytes). It pays across requests that repeat text; within one new prompt ~45% of rows are new |
-| `FNX_PLE_THREADS=N` | `disk`: reads in flight, default 32 (1 to 256): on this box's NVMe 32 reached 95% of 128's rate at half of 64's latency |
+| `FNX_NGRAM=ram` or `disk` | `ram` (default, prod): the table locked in RAM. `disk`: left on the disk and its rows read as windows need them, for a box whose RAM is short. Refused on a rotational disk; the start-up log measures the disk's random reads |
+| `FNX_NGRAM_CACHE_MIB=N` | `disk`: the row cache, default 256 (2.98M rows of Q4_K_XL's 90 bytes). It pays across requests that repeat text; within one new prompt ~45% of rows are new |
+| `FNX_NGRAM_THREADS=N` | `disk`: reads in flight, default 32 (1 to 256): on this box's NVMe 32 reached 95% of 128's rate at half of 64's latency |
 
 **K/V, drafts and batching**
 

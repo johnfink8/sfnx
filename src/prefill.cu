@@ -24,6 +24,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <future>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -927,6 +929,11 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
     for (int j = 0; j < nk; ++j) pos0[(size_t) j] = pos_ + rows, rows += (int) chunks[(size_t) j].tokens.size();
     if (pos_ + rows > max_ctx_) throw Refused("prefill: context full");
     ensure_pages(pos_ + rows);
+    // the next pass's rows on a thread of their own from here: enqueueing this pass keeps this one busy for ~70% of the
+    // pass (3.8 of 5.5 s for 16,384 rows), and FNX_NGRAM=disk's reads (~1.7 s for those rows on this box's NVMe) after it
+    // went unhidden: a cold 62,793-token read 23.1 s against 17.1 s with every row cached. It writes only the other
+    // half's buffers and reads what this pass leaves alone (the tokens, history_ until the pass ends)
+    std::future<void> next_rows = std::async(std::launch::async, between);
     const float eps = m_.eps;
     // each chunk's (position, tag) and each group's: a tag per group, so the recurrent history's parity steps per group
     for (int j = 0; j < nk; ++j) {
@@ -1183,11 +1190,11 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
             prefill_draft(C, set);
         }
     const auto t_enq = std::chrono::steady_clock::now();
-    // the next pass's rows (FNX_PLE=disk reads them, and a read can fail): its error waits until this pass has drained,
+    // the next pass's rows (FNX_NGRAM=disk reads them, and a read can fail): its error waits until this pass has drained,
     // so no caller that survives it (the lab's worker) goes on beside a pass still running
     std::exception_ptr between_err;
     try {
-        between();
+        next_rows.get();
     } catch (...) {
         between_err = std::current_exception();
     }

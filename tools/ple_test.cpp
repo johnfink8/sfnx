@@ -1,7 +1,7 @@
-// FNX_PLE=disk against the mapping, CPU only (runs beside a serving engine): the table rows of every prompt's every
+// FNX_NGRAM=disk against the mapping, CPU only (runs beside a serving engine): the table rows of every prompt's every
 // position, gathered as the prompt path gathers them (4,096 positions a call) and as decode does (one a call), must be
 // the mapping's bytes exactly. Prints the reads and their time, the row cache cold at each prompt.
-//   bin/ple_test MODEL.gguf PROMPT.bin...      FNX_PLE_THREADS, FNX_PLE_CACHE_MIB as the engine reads them
+//   bin/ple_test MODEL.gguf PROMPT.bin...      FNX_NGRAM_THREADS, FNX_NGRAM_CACHE_MIB as the engine reads them
 #include <algorithm>
 #include <chrono>
 #include <cstdio>

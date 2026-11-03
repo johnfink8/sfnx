@@ -739,7 +739,7 @@ void Engine::embed_rows(int p0, int T, const std::function<int(int)>& tok_at_cel
     const Tensor& pt = *m_.ple_table;
     const size_t prb = m_.ple_rows->row_bytes();
     for (int t = 0; t < T; ++t) embed_token(tok_at_cell(p0 + t), p0 + t, emb + (size_t) t * N);
-    // every row of the window first, then their bytes in one gather: from the disk (FNX_PLE=disk) the misses are read
+    // every row of the window first, then their bytes in one gather: from the disk (FNX_NGRAM=disk) the misses are read
     // together, by as many threads as there are. The PLE n-grams read an image cell as the model's image token
     std::vector<uint64_t> rows((size_t) T * PLE_HEADS);
     ple_window_rows(m_.ple, p0, T, [&](int q) -> int64_t {

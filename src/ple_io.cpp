@@ -50,34 +50,34 @@ std::string rotational_of(int fd) {
 }  // namespace
 
 PleRows::Mode PleRows::mode_from_env() {
-    const char* s = std::getenv("FNX_PLE");
+    const char* s = std::getenv("FNX_NGRAM");
     Mode m;
     if (!s || !std::strcmp(s, "ram")) m = Mode::RAM;
     else if (!std::strcmp(s, "disk")) m = Mode::DISK;
-    else throw std::runtime_error(std::string("FNX_PLE: '") + s + "', not ram or disk");
-    // the disk's settings are checked whatever the mode: one set beside FNX_PLE=ram would change nothing, silently
-    env_in("FNX_PLE_CACHE_MIB", 256, 0, 1 << 20);
-    env_in("FNX_PLE_THREADS", 32, 1, 256);
-    for (const char* v : {"FNX_PLE_CACHE_MIB", "FNX_PLE_THREADS"})
-        if (m == Mode::RAM && std::getenv(v)) throw std::runtime_error(std::string(v) + " is set, and only FNX_PLE=disk reads it");
+    else throw std::runtime_error(std::string("FNX_NGRAM: '") + s + "', not ram or disk");
+    // the disk's settings are checked whatever the mode: one set beside FNX_NGRAM=ram would change nothing, silently
+    env_in("FNX_NGRAM_CACHE_MIB", 256, 0, 1 << 20);
+    env_in("FNX_NGRAM_THREADS", 32, 1, 256);
+    for (const char* v : {"FNX_NGRAM_CACHE_MIB", "FNX_NGRAM_THREADS"})
+        if (m == Mode::RAM && std::getenv(v)) throw std::runtime_error(std::string(v) + " is set, and only FNX_NGRAM=disk reads it");
     return m;
 }
 
 PleRows::PleRows(const Gguf& g, const Tensor& t, Mode mode) : mode_(mode), t_(t), rb_(t.row_bytes()) {
-    if (rb_ == 0 || rb_ > PAGE) throw std::runtime_error("ple: " + t.name + "'s rows are " + std::to_string(rb_) + " bytes, not 1 to 4096");
+    if (rb_ == 0 || rb_ > PAGE) throw std::runtime_error("n-gram table: " + t.name + "'s rows are " + std::to_string(rb_) + " bytes, not 1 to 4096");
     if (mode_ == Mode::RAM) return;
-    if (t.shard < 0) throw std::runtime_error("ple: " + t.name + " is not in a file, so it cannot be read from disk");
+    if (t.shard < 0) throw std::runtime_error("n-gram table: " + t.name + " is not in a file, so it cannot be read from disk");
     path_ = g.shard_path(t.shard);
     file_off_ = t.offset;
     fd_ = ::open(path_.c_str(), O_RDONLY | O_DIRECT);
     direct_ = fd_ >= 0;
     if (fd_ < 0) {
-        if (errno != EINVAL) throw std::runtime_error("ple: cannot open " + path_ + ": " + std::strerror(errno));
+        if (errno != EINVAL) throw std::runtime_error("n-gram table: cannot open " + path_ + ": " + std::strerror(errno));
         // a file system without O_DIRECT (tmpfs): its pages are in RAM already, so the page cache costs nothing more
         fd_ = ::open(path_.c_str(), O_RDONLY);
-        if (fd_ < 0) throw std::runtime_error("ple: cannot open " + path_ + ": " + std::strerror(errno));
+        if (fd_ < 0) throw std::runtime_error("n-gram table: cannot open " + path_ + ": " + std::strerror(errno));
         posix_fadvise(fd_, (off_t) file_off_, (off_t) t.nbytes, POSIX_FADV_RANDOM);
-        std::fprintf(stderr, "ple: %s refuses O_DIRECT: rows read through the page cache\n", path_.c_str());
+        std::fprintf(stderr, "n-gram table: %s refuses O_DIRECT: rows read through the page cache\n", path_.c_str());
     }
     // a spinning disk serves ~100-200 random reads a second, against ~30,000 a 4k-token prompt chunk needs. A file
     // system with no block device in sysfs (NFS, overlay, ZFS, btrfs) cannot be told: describe() says so, and the probe's
@@ -85,18 +85,18 @@ PleRows::PleRows(const Gguf& g, const Tensor& t, Mode mode) : mode_(mode), t_(t)
     rot_ = rotational_of(fd_);
     if (rot_ == "1") {
         ::close(fd_);
-        throw std::runtime_error("ple: " + path_ + " is on a rotational disk, too slow for FNX_PLE=disk (a random read per row): "
-                                 "move the model to an SSD or use FNX_PLE=ram");
+        throw std::runtime_error("n-gram table: " + path_ + " is on a rotational disk, too slow for FNX_NGRAM=disk (a random read per row): "
+                                 "move the model to an SSD or use FNX_NGRAM=ram");
     }
-    const uint64_t cache_mib = env_in("FNX_PLE_CACHE_MIB", 256, 0, 1 << 20);
-    threads_ = (int) env_in("FNX_PLE_THREADS", 32, 1, 256);
+    const uint64_t cache_mib = env_in("FNX_NGRAM_CACHE_MIB", 256, 0, 1 << 20);
+    threads_ = (int) env_in("FNX_NGRAM_THREADS", 32, 1, 256);
     sets_ = (cache_mib << 20) / rb_ / WAYS;
     tag_.assign(sets_ * WAYS, 0);
     ref_.assign(sets_ * WAYS, 0);
     hand_.assign(sets_, 0);
     data_.resize(sets_ * WAYS * rb_);
     slab_ = (uint8_t*) std::aligned_alloc(PAGE, SLAB_UNITS * 2 * PAGE);
-    if (!slab_) throw std::runtime_error("ple: no memory for the read slab");
+    if (!slab_) throw std::runtime_error("n-gram table: no memory for the read slab");
     lat_ns_.resize(SLAB_UNITS);
     for (int i = 0; i < threads_; ++i) pool_.emplace_back([this] { worker(); });
 }
@@ -113,8 +113,8 @@ PleRows::~PleRows() {
 }
 
 std::string PleRows::describe() const {
-    if (mode_ == Mode::RAM) return "ple: " + t_.name + " in RAM (FNX_PLE=ram)";
-    return "ple: " + t_.name + " read from " + path_ + (direct_ ? " (O_DIRECT" : " (page cache") +
+    if (mode_ == Mode::RAM) return "n-gram table: " + t_.name + " locked in RAM (FNX_NGRAM=ram)";
+    return "n-gram table: " + t_.name + " read from " + path_ + (direct_ ? " (O_DIRECT" : " (page cache") +
            (rot_ == "0" ? ", an SSD)" : rot_.empty() ? ", its disk's type unknown: no sysfs entry for the file's device)" : ")") + ", " +
            std::to_string(threads_) +
            " threads, a row cache of " + std::to_string(sets_ * WAYS) + " rows (" + std::to_string((sets_ * WAYS * rb_) >> 20) + " MiB)";
@@ -142,7 +142,7 @@ void PleRows::worker() {
             while (got < want && err.empty()) {
                 const ssize_t r = ::pread(fd_, to + got, want - got, at + (off_t) got);
                 if (r < 0 && errno == EINTR) continue;
-                if (r < 0) err = "ple: reading " + path_ + " at " + std::to_string(at + got) + ": " + std::strerror(errno);
+                if (r < 0) err = "n-gram table: reading " + path_ + " at " + std::to_string(at + got) + ": " + std::strerror(errno);
                 else if (r == 0) break;   // the file's end: the rows' bytes are checked against what came
                 else {
                     got += (size_t) r;
@@ -156,7 +156,7 @@ void PleRows::worker() {
             // must all have come
             const uint64_t need = std::min<uint64_t>(want, file_off_ + t_.nbytes - u.page * PAGE);
             if (err.empty() && got < need)
-                err = "ple: reading " + path_ + " at " + std::to_string(at) + ": " + std::to_string(got) + " of " + std::to_string(need) +
+                err = "n-gram table: reading " + path_ + " at " + std::to_string(at) + ": " + std::to_string(got) + " of " + std::to_string(need) +
                       " bytes (the file is shorter than its table)";
         }
         // every worker checks in once a round, so none still reads the job when the next round rebuilds it
@@ -167,7 +167,7 @@ void PleRows::worker() {
 }
 
 void PleRows::read_units(const std::vector<Unit>& units) {
-    if (units.size() > SLAB_UNITS) throw std::runtime_error("ple: a round of more reads than the slab holds");
+    if (units.size() > SLAB_UNITS) throw std::runtime_error("n-gram table: a round of more reads than the slab holds");
     const uint64_t t0 = now_ns();
     {
         std::lock_guard<std::mutex> l(m_);
@@ -221,7 +221,7 @@ void PleRows::gather(const uint64_t* rows, size_t n, uint8_t* dst) {
     std::lock_guard<std::mutex> gl(gather_m_);
     const uint64_t nrows = (uint64_t) t_.nrows();
     for (size_t i = 0; i < n; ++i)
-        if (rows[i] >= nrows) throw std::runtime_error("ple: row " + std::to_string(rows[i]) + " past " + t_.name + "'s " + std::to_string(nrows));
+        if (rows[i] >= nrows) throw std::runtime_error("n-gram table: row " + std::to_string(rows[i]) + " past " + t_.name + "'s " + std::to_string(nrows));
     lookups_ += n;
     if (mode_ == Mode::RAM) {
         for (size_t i = 0; i < n; ++i) std::memcpy(dst + i * rb_, t_.data + rows[i] * rb_, rb_);
@@ -261,7 +261,7 @@ void PleRows::gather(const uint64_t* rows, size_t n, uint8_t* dst) {
             const uint64_t b = file_off_ + row * rb_;
             while (u + 1 < units.size() && units[u + 1].page * PAGE <= b) ++u;
             const uint8_t* src = slab_ + u * 2 * PAGE + (b - units[u].page * PAGE);
-            if (b + rb_ > (units[u].page + units[u].pages) * PAGE) throw std::runtime_error("ple: a row past its read (planner)");
+            if (b + rb_ > (units[u].page + units[u].pages) * PAGE) throw std::runtime_error("n-gram table: a row past its read (planner)");
             std::memcpy(dst + i * rb_, src, rb_);
             if (row != last) insert(row, src);
             last = row;
@@ -274,7 +274,7 @@ PleRows::Stats PleRows::stats() const {
 }
 
 std::string PleRows::probe(int pages) {
-    if (mode_ != Mode::DISK) throw std::runtime_error("ple: probe reads the disk (FNX_PLE=disk)");
+    if (mode_ != Mode::DISK) throw std::runtime_error("n-gram table: the probe reads the disk (FNX_NGRAM=disk)");
     const uint64_t first = file_off_ / PAGE, last = (file_off_ + t_.nbytes - 1) / PAGE;
     std::mt19937_64 rng(0x9e3779b97f4a7c15ull);
     std::vector<uint64_t> ps;

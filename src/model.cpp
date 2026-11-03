@@ -1235,7 +1235,7 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
     tok_embd = &g.t("token_embd.weight");
 #if FNX_27B
     if (tok_embd->type != T_Q8_0) throw std::runtime_error("27b: token_embd.weight is not Q8_0 (the host's embedding reads Q8_0)");
-    for (const char* v : {"FNX_PLE", "FNX_PLE_CACHE_MIB", "FNX_PLE_THREADS"})
+    for (const char* v : {"FNX_NGRAM", "FNX_NGRAM_CACHE_MIB", "FNX_NGRAM_THREADS"})
         if (std::getenv(v)) throw std::runtime_error(std::string("27b: ") + v + " is set, and the 27B has no PLE table");
     vocab = (int) tok_embd->ne[1];
     if (g.t("output.weight").ne[1] != vocab || g.t("output.weight").ne[0] != N)
@@ -1253,7 +1253,7 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
         throw std::runtime_error("fnx: per_layer_token_embd.weight is neither IQ4_NL nor Q8_0 (the host's PLE rows read those)");
     vocab = (int) tok_embd->ne[1];
     // the host gathers rows of these two every window: a row faulted in from the disk through the mapping costs
-    // milliseconds, so they are locked in RAM; FNX_PLE=disk leaves the table on the disk and reads its rows (PleRows)
+    // milliseconds, so they are locked in RAM; FNX_NGRAM=disk leaves the table on the disk and reads its rows (PleRows)
     {
         const PleRows::Mode mode = PleRows::mode_from_env();
         const auto t0 = std::chrono::steady_clock::now();
@@ -1270,7 +1270,7 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         ple_rows = std::make_unique<PleRows>(g, *ple_table, mode);
         std::fprintf(stderr, "fnx: %s\n", ple_rows->describe().c_str());
-        if (mode == PleRows::Mode::DISK) std::fprintf(stderr, "fnx: the table's disk: %s\n", ple_rows->probe(2048).c_str());
+        if (mode == PleRows::Mode::DISK) std::fprintf(stderr, "fnx: n-gram table: its disk, %s\n", ple_rows->probe(2048).c_str());
     }
     for (int64_t v : g.ia(p + "ple.layer_multipliers")) ple.mult.push_back((uint64_t) v);
     for (int64_t v : g.ia(p + "ple.head_offsets")) ple.off.push_back((uint64_t) v);
