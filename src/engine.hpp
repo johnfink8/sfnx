@@ -37,6 +37,10 @@ bool ring_f32();
 // Read at each call like ring_f32 (the Engine and the lab's identity record); anything else not above 1 throws
 double rope_scale();
 
+// FNX_NGRAM=disk, verify: the n-gram flag's value for "the rows will not come" (the host's read failed): the window's
+// tag with this bit flipped, never the tag nor ~tag (its value before the rows)
+constexpr unsigned NGRAM_ABORT = 0x40000000u;
+
 class Engine {
 public:
     // lanes: how many add_lane() blocks the K/V pool has room for on top of max_ctx positions
@@ -277,9 +281,6 @@ private:
     // its token rows only (embed_tokens_into, rows_upload_tokens) and layer 1 waits on the cards for ngram_rows_late,
     // which the host reads after the launch, behind layer 0
     bool ngram_late() const;
-    // the flag's value for "the rows will not come" (the host's read failed): the window's tag with this bit flipped,
-    // never the tag nor ~tag (its value before the rows)
-    static constexpr unsigned NGRAM_ABORT = 0x40000000u;
     void embed_tokens_into(int r, int k, int p0, const std::function<int(int)>& tok_at);
     void rows_upload_tokens(CardBuf& b, int T);
     void ngram_rows_late(int k, int p0, const std::function<int(int)>& tok_at, unsigned tag);

@@ -57,7 +57,7 @@ __global__ void ngram_wait_copy_k(const volatile unsigned* flag, const int* ctl,
                 ok = 1;
                 break;
             }
-            if (f == (want ^ Engine::NGRAM_ABORT)) {
+            if (f == (want ^ NGRAM_ABORT)) {
                 atomicOr(err, 64u);
                 break;
             }
