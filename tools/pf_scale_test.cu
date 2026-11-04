@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <vector>
 
 int main(int argc, char** argv) {
@@ -37,8 +38,9 @@ int main(int argc, char** argv) {
                 for (int c = 0; c < cols; ++c) weight[r * cols + c] = __float2half(value(r, c));
             ckc(cudaMemcpy(w, weight.data(), weight.size() * sizeof(__half), cudaMemcpyHostToDevice), "copy weights");
             for (const bool graph : {false, true}) {
-                for (const int magnitude : {0, 1, 2}) {
-                    const float outlier = magnitude == 0 ? 17.0f : magnitude == 1 ? 117144.703f : 3.0e30f;
+                for (const int magnitude : {0, 1, 2, 3}) {
+                    const float outlier = magnitude == 0 ? 17.0f : magnitude == 1 ? 117144.703f :
+                                          magnitude == 2 ? 3.0e30f : std::numeric_limits<float>::max();
                     x[0] = 17.0f;
                     x[cols] = outlier;
                     x[cols * 2] = -outlier;
@@ -70,7 +72,7 @@ int main(int argc, char** argv) {
                     ckc(cudaStreamSynchronize(stream), "outputs ready");
                     if (scale[0] != 1.0f || scale[3] != 1.0f || scale[1] != scale[2] || scale[9] != scale[1] ||
                         (magnitude == 0 && scale[1] != 1.0f) || (magnitude == 1 && scale[1] != 4.0f) ||
-                        (magnitude == 2 && scale[1] <= 4.0f))
+                        (magnitude >= 2 && scale[1] <= 4.0f))
                         throw std::runtime_error("unexpected per-row scale");
                     for (int t = 0; t < tokens; ++t) {
                         for (int r = 0; r < rows; ++r) {
