@@ -80,7 +80,10 @@ hold() {   # model
     [ "$cold" -gt 1 ] && echo "($cold GB of the model are not in the page cache: ~$(awk -v c="$cold" -v r="$rate" 'BEGIN {printf "%.0f", c / r}') s to read them at $rate GB/s${last:+; the last load: $last})"
     : > "$HLOG"
     echo "$1" > "$DIR/hold.model"
-    unit fnx-hold "$HLOG" -- "$(pwd)/bin/fnx_hold" "$1" "$SOCK"
+    # the holder runs no kernels, so it never reads the n-gram table: left on the disk (FNX_NGRAM=disk), each worker
+    # places it by its own FNX_NGRAM. Locked here too, Q8's 55 GB beside its NUMA-bound expert copies left card 2's
+    # node without room for them ("store: create (1024 MiB at location 5): out of memory")
+    unit fnx-hold "$HLOG" -E FNX_NGRAM=disk -- "$(pwd)/bin/fnx_hold" "$1" "$SOCK"
     wait_for fnx-hold "$HLOG" "^== holding" 6000 || return 1
     # for the next estimate: the disk rate when the disk gave nearly all of the weights, and how long this load took
     r=$(sed -n 's/.*GB from the disk at \([0-9.]*\) GB\/s.*/\1/p' "$HLOG" | tail -1)
