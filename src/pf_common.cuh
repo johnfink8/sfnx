@@ -69,6 +69,56 @@ static __global__ void k_f32_f16(const float* __restrict__ x, size_t n, __half* 
     for (size_t e = blockIdx.x * (size_t) blockDim.x + threadIdx.x; e < n; e += (size_t) gridDim.x * blockDim.x) y[e] = __float2half(x[e]);
 }
 
+// Each activation row gets a power-of-two scale before f16 conversion, so a
+// large value in one token does not unnecessarily shrink the other tokens.
+static __global__ void k_pf_f32_f16_scaled(const float* __restrict__ x, int cols, __half* __restrict__ y,
+                                           float* __restrict__ scales) {
+    __shared__ float block_max[256];
+    __shared__ float inverse;
+    float amax = 0.0f;
+    const size_t offset = (size_t) blockIdx.x * cols;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) amax = fmaxf(amax, fabsf(x[offset + c]));
+    block_max[threadIdx.x] = amax;
+    __syncthreads();
+    for (int stride = 128; stride > 0; stride /= 2) {
+        if (threadIdx.x < stride) block_max[threadIdx.x] = fmaxf(block_max[threadIdx.x], block_max[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        float scale = 1.0f;
+        if (isfinite(block_max[0])) while (block_max[0] > 32768.0f * scale) scale *= 2.0f;
+        scales[blockIdx.x] = scale;
+        inverse = 1.0f / scale;
+    }
+    __syncthreads();
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) y[offset + c] = __float2half(x[offset + c] * inverse);
+}
+
+inline void pf_f32_f16_scaled(const float* x, int cols, int count, __half* y, float* scales, cudaStream_t s) {
+    if (cols <= 0 || count <= 0) throw std::runtime_error("prefill: cannot scale an empty activation");
+    k_pf_f32_f16_scaled<<<count, 256, 0, s>>>(x, cols, y, scales);
+    ckc(cudaGetLastError(), "scale activation");
+}
+
+static __global__ void k_pf_scale_output(float* __restrict__ out, int rows, int count, int ldo,
+                                          const float* __restrict__ scales) {
+    const size_t n = (size_t) rows * count;
+    for (size_t e = blockIdx.x * (size_t) blockDim.x + threadIdx.x; e < n; e += (size_t) gridDim.x * blockDim.x) {
+        const int t = (int) (e / rows), r = (int) (e % rows);
+        out[(size_t) t * ldo + r] *= scales[t];
+    }
+}
+
+inline void pf_scaled_gemm(cublasHandle_t blas, const __half* W, int rows, int cols, const __half* X, int C,
+                           float* out, int ldo, const float* scales, cudaStream_t s) {
+    const float one = 1.0f, zero = 0.0f;
+    ckb(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, rows, C, cols, &one, W, CUDA_R_16F, cols,
+                     X, CUDA_R_16F, cols, &zero, out, CUDA_R_32F, ldo, CUBLAS_COMPUTE_32F,
+                     CUBLAS_GEMM_DEFAULT_TENSOR_OP), "scaled gemm");
+    k_pf_scale_output<<<grid_for((size_t) rows * C), 256, 0, s>>>(out, rows, C, ldo, scales);
+    ckc(cudaGetLastError(), "restore activation scale");
+}
+
 constexpr int PF_RING_STEPS = pf_ring_steps(NCARD);   // flags a set holds
 
 // out = f16(x) over n values (n even)
