@@ -580,7 +580,7 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
             Dist q;
             drafts.push_back(draft_one(1, false, j == 1 ? used - 1 : 0, {drafts.back()}, p + used - 1 + j, pen_seq, q));
             qs.push_back(std::move(q));
-            if (j + 1 < k) prefetch();   // the last draft's rows: verify reads them itself, with nothing left to hide behind
+            prefetch();   // the last draft's too: they read while verify launches and runs layer 0 (FNX_NGRAM=disk)
         }
     }
     prompt_.clear();
