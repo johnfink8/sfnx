@@ -84,6 +84,7 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
     for (const char* k : {"FNX_PF_SKIP", "FNX_PF_SKIP_CONFIRM", "FNX_PF_SCORE_MIB", "FNX_PF_WINDOWS", "FNX_PF_SCORES",
                           "FNX_KV_PAGES", "FNX_KV_RESERVE_MIB"})
         if (std::getenv(k)) throw std::runtime_error(std::string(k) + " is the 27B's: Flash-Next has nothing it sets");
+    if (!m.ple_rows) throw std::runtime_error("Engine: the model has no n-gram rows (a Load::HOLD model runs no engine)");
     if (ngram_late()) {   // as the engine is made, so a box that cannot map them refuses at start, not at a first token
         h_.ngram_late = hmapped<float>((size_t) MAXT * N);
         h_.ngram_flag = hmapped<unsigned>(1);
@@ -796,7 +797,6 @@ void Engine::rows_upload(CardBuf& b, int T) {
 // round on this box's NVMe before the window started; read behind layer 0 instead
 bool Engine::ngram_late() const { return m_.ple_rows->mode() == PleRows::Mode::DISK; }
 bool Engine::ngram_reads_ahead() const { return m_.ple_rows->reads_ahead(); }
-
 
 void Engine::embed_tokens_into(int r, int k, int p0, const std::function<int(int)>& tok_at) {
     if (!h_.ngram_late) throw std::runtime_error("embed_tokens_into: the n-gram rows' mapped buffers were never made");

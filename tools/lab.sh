@@ -80,8 +80,8 @@ hold() {   # model
     [ "$cold" -gt 1 ] && echo "($cold GB of the model are not in the page cache: ~$(awk -v c="$cold" -v r="$rate" 'BEGIN {printf "%.0f", c / r}') s to read them at $rate GB/s${last:+; the last load: $last})"
     : > "$HLOG"
     echo "$1" > "$DIR/hold.model"
-    # the holder runs no kernels, so it never reads the n-gram table: left on the disk (FNX_NGRAM=disk), each worker
-    # places it by its own FNX_NGRAM. Locked here too, Q8's 55 GB beside its NUMA-bound expert copies left card 2's
+    # the holder runs no kernels and makes no read pool, so it never reads the n-gram table: left on the disk
+    # (FNX_NGRAM=disk), each worker places it by its own FNX_NGRAM. Locked here too, Q8's 55 GB beside its NUMA-bound expert copies left card 2's
     # node without room for them ("store: create (1024 MiB at location 5): out of memory"). A caller's FNX_NGRAM wins:
     # on a rotational disk, where disk mode refuses, FNX_NGRAM=ram is the way through
     unit fnx-hold "$HLOG" -E FNX_NGRAM="${FNX_NGRAM:-disk}" -- "$(pwd)/bin/fnx_hold" "$1" "$SOCK"

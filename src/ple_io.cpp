@@ -14,7 +14,9 @@
 #include <cstring>
 #include <fstream>
 #include <random>
+#include <new>
 #include <stdexcept>
+#include <system_error>
 
 namespace fnx {
 namespace {
@@ -105,8 +107,14 @@ PleRows::PleRows(const Gguf& g, const Tensor& t, Mode mode) : mode_(mode), t_(t)
         ::close(fd_);
         throw std::runtime_error("n-gram table: no memory for the read slab");
     }
-    lat_ns_.resize(SLAB_UNITS);
-    go_ = std::make_unique<std::condition_variable[]>((size_t) threads_);
+    try {
+        lat_ns_.resize(SLAB_UNITS);
+        go_ = std::make_unique<std::condition_variable[]>((size_t) threads_);
+    } catch (const std::bad_alloc&) {
+        std::free(slab_);
+        ::close(fd_);
+        throw std::runtime_error("n-gram table: no memory for the read pool's state (" + std::to_string(threads_) + " threads)");
+    }
     // a thread that cannot start (a pids limit) ends the threads before it, so the throw is this message, not terminate
     try {
         for (int i = 0; i < threads_; ++i) pool_.emplace_back([this, i] { worker(i); });
@@ -168,7 +176,7 @@ void PleRows::worker(int w) {
             job = job_;
         }
         std::string err;
-        for (size_t i; (i = next_.fetch_add(1)) < job->size();) {
+        for (size_t i; err.empty() && (i = next_.fetch_add(1)) < job->size();) {
             const Unit& u = (*job)[i];
             uint8_t* to = slab_ + i * 2 * PAGE;
             const size_t want = u.pages * PAGE;
@@ -289,9 +297,7 @@ void PleRows::prefetcher() {
         }
         std::lock_guard<std::mutex> l(pf_m_);
         pf_busy_ = false;
-        // a request queued meanwhile keeps the waiter asleep until it is read too: only gather, on the one thread that
-        // also queues them, waits here, and it drops what is queued before it waits
-        if (!pf_queued_) pf_idle_.notify_all();
+        pf_idle_.notify_all();
     }
 }
 

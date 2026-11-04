@@ -1275,9 +1275,12 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
         }
         std::fprintf(stderr, "fnx: %s (%.1f GB) locked in RAM in %.1f s\n", names.c_str(), bytes / 1e9,
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-        ple_rows = std::make_unique<PleRows>(g, *ple_table, mode);
-        std::fprintf(stderr, "fnx: %s\n", ple_rows->describe().c_str());
-        if (mode == PleRows::Mode::DISK) std::fprintf(stderr, "fnx: n-gram table: its disk, %s\n", ple_rows->probe(2048).c_str());
+        // the lab's holder runs no engine: no read pool, no cache, no probe of the disk (each worker makes its own)
+        if (how != Load::HOLD) {
+            ple_rows = std::make_unique<PleRows>(g, *ple_table, mode);
+            std::fprintf(stderr, "fnx: %s\n", ple_rows->describe().c_str());
+            if (mode == PleRows::Mode::DISK) std::fprintf(stderr, "fnx: n-gram table: its disk, %s\n", ple_rows->probe(2048).c_str());
+        }
     }
     for (int64_t v : g.ia(p + "ple.layer_multipliers")) ple.mult.push_back((uint64_t) v);
     for (int64_t v : g.ia(p + "ple.head_offsets")) ple.off.push_back((uint64_t) v);

@@ -242,7 +242,7 @@ struct Model {
     const Tensor* tok_embd = nullptr;  // stays in the mapping: rows are gathered on the host
     const Tensor* ple_table = nullptr;
     PleHash ple;
-    std::unique_ptr<PleRows> ple_rows;   // the table's rows, from RAM or the disk (FNX_NGRAM)
+    std::unique_ptr<PleRows> ple_rows;   // the table's rows, from RAM or the disk (FNX_NGRAM); none for Load::HOLD
     int64_t ple_image = 0;   // what the PLE n-grams read for an image cell (the 27B: its image-pad token)
     float eps = 1e-6f, rope_base = 1e7f;
     int ctx_train = 0;   // the GGUF's context_length: the longest context the engine takes unscaled, and YaRN's n_ctx_orig
