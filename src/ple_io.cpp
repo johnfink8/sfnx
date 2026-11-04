@@ -110,6 +110,7 @@ PleRows::PleRows(const Gguf& g, const Tensor& t, Mode mode) : mode_(mode), t_(t)
     try {
         lat_ns_.resize(SLAB_UNITS);
         go_ = std::make_unique<std::condition_variable[]>((size_t) threads_);
+        pool_.reserve((size_t) threads_);
     } catch (const std::bad_alloc&) {
         std::free(slab_);
         ::close(fd_);
@@ -119,7 +120,7 @@ PleRows::PleRows(const Gguf& g, const Tensor& t, Mode mode) : mode_(mode), t_(t)
     try {
         for (int i = 0; i < threads_; ++i) pool_.emplace_back([this, i] { worker(i); });
         pf_thread_ = std::thread([this] { prefetcher(); });
-    } catch (const std::system_error& e) {
+    } catch (const std::exception& e) {   // std::system_error (a pids limit), or bad_alloc for a thread's state
         const size_t started = pool_.size();
         stop_threads();
         std::free(slab_);
