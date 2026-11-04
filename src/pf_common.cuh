@@ -109,14 +109,35 @@ static __global__ void k_pf_scale_output(float* __restrict__ out, int rows, int 
     }
 }
 
+// Scaling makes an outlier representable in f16 but can erase smaller values
+// in the same row. Recompute exceptional rows from the original f32 inputs.
+// The common unscaled rows keep the existing tensor-core result.
+static __global__ void k_pf_gemm_f32_exception(const __half* __restrict__ W, int rows, int cols,
+                                                const float* __restrict__ X, int ldo,
+                                                const float* __restrict__ scales, float* __restrict__ out) {
+    const int t = (int) blockIdx.x;
+    if (scales[t] <= 1.0f) return;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int r = warp; r < rows; r += 8) {
+        float sum = 0.0f;
+        for (int c = lane; c < cols; c += 32)
+            sum = fmaf(__half2float(W[(size_t) r * cols + c]), X[(size_t) t * cols + c], sum);
+        for (int offset = 16; offset > 0; offset /= 2) sum += __shfl_down_sync(0xffffffffu, sum, offset);
+        if (lane == 0) out[(size_t) t * ldo + r] = sum;
+    }
+}
+
 inline void pf_scaled_gemm(cublasHandle_t blas, const __half* W, int rows, int cols, const __half* X, int C,
-                           float* out, int ldo, const float* scales, cudaStream_t s) {
+                           const float* original, float* out, int ldo, const float* scales, cudaStream_t s) {
+    if (!original) throw std::runtime_error("prefill: scaled gemm needs original activations");
     const float one = 1.0f, zero = 0.0f;
     ckb(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, rows, C, cols, &one, W, CUDA_R_16F, cols,
                      X, CUDA_R_16F, cols, &zero, out, CUDA_R_32F, ldo, CUBLAS_COMPUTE_32F,
                      CUBLAS_GEMM_DEFAULT_TENSOR_OP), "scaled gemm");
     k_pf_scale_output<<<grid_for((size_t) rows * C), 256, 0, s>>>(out, rows, C, ldo, scales);
     ckc(cudaGetLastError(), "restore activation scale");
+    k_pf_gemm_f32_exception<<<(unsigned) C, 256, 0, s>>>(W, rows, cols, original, ldo, scales, out);
+    ckc(cudaGetLastError(), "recompute exceptional activations");
 }
 
 constexpr int PF_RING_STEPS = pf_ring_steps(NCARD);   // flags a set holds
