@@ -91,19 +91,37 @@ PleRows::PleRows(const Gguf& g, const Tensor& t, Mode mode) : mode_(mode), t_(t)
     const uint64_t cache_mib = env_in("FNX_NGRAM_CACHE_MIB", 256, 0, 1 << 20);
     threads_ = (int) env_in("FNX_NGRAM_THREADS", 32, 1, 256);
     sets_ = (cache_mib << 20) / rb_ / WAYS;
-    tag_.assign(sets_ * WAYS, 0);
-    ref_.assign(sets_ * WAYS, 0);
-    hand_.assign(sets_, 0);
-    data_.resize(sets_ * WAYS * rb_);
+    try {
+        tag_.assign(sets_ * WAYS, 0);
+        ref_.assign(sets_ * WAYS, 0);
+        hand_.assign(sets_, 0);
+        data_.resize(sets_ * WAYS * rb_);
+    } catch (const std::bad_alloc&) {
+        ::close(fd_);
+        throw std::runtime_error("FNX_NGRAM_CACHE_MIB=" + std::to_string(cache_mib) + ": no memory for a row cache that size");
+    }
     slab_ = (uint8_t*) std::aligned_alloc(PAGE, SLAB_UNITS * 2 * PAGE);
-    if (!slab_) throw std::runtime_error("n-gram table: no memory for the read slab");
+    if (!slab_) {
+        ::close(fd_);
+        throw std::runtime_error("n-gram table: no memory for the read slab");
+    }
     lat_ns_.resize(SLAB_UNITS);
     go_ = std::make_unique<std::condition_variable[]>((size_t) threads_);
-    for (int i = 0; i < threads_; ++i) pool_.emplace_back([this, i] { worker(i); });
-    pf_thread_ = std::thread([this] { prefetcher(); });
+    // a thread that cannot start (a pids limit) ends the threads before it, so the throw is this message, not terminate
+    try {
+        for (int i = 0; i < threads_; ++i) pool_.emplace_back([this, i] { worker(i); });
+        pf_thread_ = std::thread([this] { prefetcher(); });
+    } catch (const std::system_error& e) {
+        const size_t started = pool_.size();
+        stop_threads();
+        std::free(slab_);
+        ::close(fd_);
+        throw std::runtime_error("n-gram table: " + std::to_string(started) + " of " + std::to_string(threads_) +
+                                 " read threads started (FNX_NGRAM_THREADS), then: " + e.what());
+    }
 }
 
-PleRows::~PleRows() {
+void PleRows::stop_threads() {
     if (pf_thread_.joinable()) {   // it reads through the pool
         {
             std::lock_guard<std::mutex> l(pf_m_);
@@ -116,8 +134,13 @@ PleRows::~PleRows() {
         std::lock_guard<std::mutex> l(m_);
         stop_ = true;
     }
-    for (int i = 0; i < threads_; ++i) go_[i].notify_all();
+    for (size_t i = 0; i < pool_.size(); ++i) go_[i].notify_all();
     for (std::thread& th : pool_) th.join();
+    pool_.clear();
+}
+
+PleRows::~PleRows() {
+    stop_threads();
     std::free(slab_);
     if (fd_ >= 0) ::close(fd_);
 }
@@ -252,16 +275,19 @@ void PleRows::prefetcher() {
             pf_queued_ = false;
             pf_busy_ = true;
         }
-        std::exception_ptr err;
+        // a read-ahead only warms the cache, and the request it served may never be gathered (superseded, or the round
+        // ended): its failure is said, and the gather that needs the rows reads them itself and throws if the disk fails
+        // it too
         try {
             scratch.resize(rows.size() * rb_);
             gather_now(rows.data(), rows.size(), scratch.data());
-        } catch (...) {
-            err = std::current_exception();
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "n-gram table: a read-ahead failed (%s); the window's own reads decide\n", e.what());
         }
         std::lock_guard<std::mutex> l(pf_m_);
-        if (err && !pf_err_) pf_err_ = err;
         pf_busy_ = false;
+        // a request queued meanwhile keeps the waiter asleep until it is read too: only gather, on the one thread that
+        // also queues them, waits here, and it drops what is queued before it waits
         if (!pf_queued_) pf_idle_.notify_all();
     }
 }
@@ -269,15 +295,9 @@ void PleRows::prefetcher() {
 void PleRows::gather(const uint64_t* rows, size_t n, uint8_t* dst) {
     if (pf_thread_.joinable()) {
         // a request still queued is dropped (this gather reads what it needs itself); one being read is waited for
-        std::exception_ptr err;
-        {
-            std::unique_lock<std::mutex> l(pf_m_);
-            pf_queued_ = false;
-            pf_idle_.wait(l, [&] { return !pf_busy_; });
-            err = pf_err_;
-            pf_err_ = nullptr;
-        }
-        if (err) std::rethrow_exception(err);
+        std::unique_lock<std::mutex> l(pf_m_);
+        pf_queued_ = false;
+        pf_idle_.wait(l, [&] { return !pf_busy_; });
     }
     gather_now(rows, n, dst);
 }
@@ -356,7 +376,7 @@ std::string PleRows::probe(int pages) {
         read_units(units);
         lat.insert(lat.end(), lat_ns_.begin(), lat_ns_.begin() + (long) units.size());
     }
-    const double s = (now_ns() - t0) / 1e9;
+    const double s = std::max(1e-9, (now_ns() - t0) / 1e9);
     std::sort(lat.begin(), lat.end());
     char buf[160];
     std::snprintf(buf, sizeof buf, "%.0f reads/s (%zu cold pages at %d threads), p50 %.0f us, p99 %.0f us", ps.size() / s, ps.size(), threads_,

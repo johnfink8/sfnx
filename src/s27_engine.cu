@@ -460,6 +460,7 @@ void Engine::rows_upload(CardBuf& b, int T) {
 
 // the 27B has no n-gram table: verify never takes the late path
 bool Engine::ngram_late() const { return false; }
+bool Engine::ngram_reads_ahead() const { return false; }
 void Engine::embed_tokens_into(int, int, int, const std::function<int(int)>&) {
     throw std::runtime_error("27b: embed_tokens_into (it has no n-gram table)");
 }

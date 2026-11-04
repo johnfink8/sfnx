@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -67,8 +68,10 @@ public:
     Mode mode() const { return mode_; }
     size_t row_bytes() const { return rb_; }
     // the bytes of rows[0..n) to dst (n * row_bytes()); throws on a failed read. One caller at a time (a lock). It
-    // first waits for the prefetches before it, and throws the first one's failure
+    // first waits for a read-ahead in flight
     void gather(const uint64_t* rows, size_t n, uint8_t* dst);
+    // RAM: row r's bytes in the locked mapping, read in place (the gather's copy is for the disk's rows)
+    const uint8_t* ram_row(uint64_t r) const { return t_.data + r * rb_; }
     // DISK: the rows read into the cache on a thread of their own, for a gather to come (decode: the next window's
     // tokens as they become known, while the draft layer runs); RAM: nothing
     void prefetch(std::vector<uint64_t> rows);
@@ -123,13 +126,13 @@ private:
     void gather_now(const uint64_t* rows, size_t n, uint8_t* dst);   // under gather_m_
     std::mutex gather_m_;
     // the prefetch thread (DISK): the newest of the queued requests (each a later one's prefix, decode's window as it
-    // grows), its failure kept for the next gather
+    // grows); a failure is said, not kept
     void prefetcher();
+    void stop_threads();   // the prefetch thread, then the pool: the destructor's, and a constructor's that fails
     std::mutex pf_m_;
     std::condition_variable pf_go_, pf_idle_;
     std::vector<uint64_t> pf_next_;
     bool pf_queued_ = false, pf_busy_ = false, pf_stop_ = false;
-    std::exception_ptr pf_err_;
     std::thread pf_thread_;
     std::atomic<uint64_t> lookups_{0}, hits_{0}, reads_{0}, read_ns_{0};
 };

@@ -322,7 +322,8 @@ struct Ring {
     void* next_ag;
     unsigned* err;       // bit 1: a peer's value never came; bit 2: a NaN or inf (on the fp16 ring: a value past its
                          // range); bit 4: an hc read's grid barrier timed out; bit 16: a NaN or inf among the head's
-                         // logits (the window's argmax)
+                         // logits (the window's argmax); bits 32, 64: layer 1's n-gram rows timed out or the host's
+                         // read failed (FNX_NGRAM=disk, verify's ngram_wait_copy_k)
     bool f32 = false;    // fp32 words (buffers sized for them) instead of fp16 pairs
     int rows = MAXT;     // the row capacity the buffers were sized for
     // a ring for chunk-sized sums (plain fp16 words and a flag per block and hop): this card's flags and the next's

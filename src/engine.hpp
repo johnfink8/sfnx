@@ -54,6 +54,7 @@ public:
     // the n-gram rows verify(tokens) will read, read ahead into the cache (FNX_NGRAM=disk: decode's next window as its
     // tokens become known, while the draft layer runs); nothing in RAM mode or for the 27B
     void ngram_prefetch(const std::vector<int>& tokens) const;
+    bool ngram_reads_ahead() const;   // ngram_prefetch reads anything: FNX_NGRAM=disk, Flash-Next
     void commit(int n);
     // the last window's head logits, T rows of the whole vocabulary (the cards' slices put together)
     std::vector<float> last_logits(int T) const;

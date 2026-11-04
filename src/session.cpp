@@ -543,7 +543,9 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
         if (done) break;
         // the next window's rows read ahead as its tokens become known (FNX_NGRAM=disk; nothing otherwise): x now, the
         // drafts as the draft layer makes them, so verify waits only for what the last of them still needs
+        const bool ahead = e_.ngram_reads_ahead();
         auto prefetch = [&]() {
+            if (!ahead) return;
             std::vector<int> w{x};
             w.insert(w.end(), drafts.begin(), drafts.end());
             e_.ngram_prefetch(w);

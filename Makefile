@@ -170,7 +170,7 @@ bin/sfnx: build/tool_sfnx.o $(ENG_OBJ)
 	$(NVCC) $(NVFLAGS) -o $@ $^ -lcublas -lcuda -lpthread
 bin/fnx_run bin/sample_test bin/cache_test bin/lanes_test bin/batch_test: bin/%: build/tool_%.o $(ENG_OBJ)
 	@mkdir -p bin
-	$(NVCC) $(NVFLAGS) -o $@ $^ -lcublas -lcuda
+	$(NVCC) $(NVFLAGS) -o $@ $^ -lcublas -lcuda -lpthread
 
 # the lab (tools/fnx_lab.cpp): bin/fnx_lab keeps the model loaded and runs fnx_run's commands from build/libfnx_lab.so,
 # which holds the engine and is reloaded after a rebuild; both use the shared CUDA runtime, and the lab exports the

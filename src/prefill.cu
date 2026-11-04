@@ -1219,6 +1219,13 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
         ckc(cudaMemcpy(&e, b.ring.err, 4, cudaMemcpyDeviceToHost), "err");
         err |= e;
     });
+    if (between_err && err) {
+        try {
+            std::rethrow_exception(between_err);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(std::string(e.what()) + "; and in the same pass, prefill: ring error " + std::to_string(err));
+        }
+    }
     if (between_err) std::rethrow_exception(between_err);
     if (err) throw std::runtime_error("prefill: ring error " + std::to_string(err));
     const auto t_main = std::chrono::steady_clock::now();

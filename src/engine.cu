@@ -793,6 +793,7 @@ void Engine::rows_upload(CardBuf& b, int T) {
 // decode's last cold n-gram read (the last draft's rows, known only when the draft layer ends) cost prose2 0.45 ms a
 // round on this box's NVMe before the window started; read behind layer 0 instead
 bool Engine::ngram_late() const { return m_.ple_rows->mode() == PleRows::Mode::DISK; }
+bool Engine::ngram_reads_ahead() const { return m_.ple_rows->mode() == PleRows::Mode::DISK; }
 
 
 void Engine::embed_tokens_into(int r, int k, int p0, const std::function<int(int)>& tok_at) {
@@ -841,11 +842,17 @@ void Engine::ple_dequant(int p0, int T, const std::function<int(int)>& tok_at_ce
         const int t = tok_at_cell(q);
         return t >= IMAGE_TOK ? m_.ple_image : t;
     }, rows.data());
-    std::vector<uint8_t> raw(rows.size() * prb);
-    m_.ple_rows->gather(rows.data(), rows.size(), raw.data());
+    // RAM mode reads each row in place in the locked mapping; the disk's rows come gathered into raw
+    const bool ram = m_.ple_rows->mode() == PleRows::Mode::RAM;
+    std::vector<uint8_t> raw;
+    if (!ram) {
+        raw.resize(rows.size() * prb);
+        m_.ple_rows->gather(rows.data(), rows.size(), raw.data());
+    }
     for (int t = 0; t < T; ++t)
         for (int h = 0; h < PLE_HEADS; ++h) {
-            const uint8_t* src = &raw[((size_t) t * PLE_HEADS + h) * prb];
+            const size_t i = (size_t) t * PLE_HEADS + h;
+            const uint8_t* src = ram ? m_.ple_rows->ram_row(rows[i]) : &raw[i * prb];
             for (int b = 0; b < PLE_DIM / 32; ++b) {
                 float* dst = &ple[(size_t) t * N + h * PLE_DIM + b * 32];
                 uint16_t dh;
