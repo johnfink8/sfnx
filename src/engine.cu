@@ -734,6 +734,66 @@ void Engine::rows_upload(CardBuf& b, int T) {
     ck(cudaMemcpyAsync(b.ple_emb, h_.ple, (size_t) T * N * 4, cudaMemcpyHostToDevice, b.st), "ple");
 }
 
+// decode's last cold n-gram read (the last draft's rows, known only when the draft layer ends) cost prose2 0.45 ms a
+// round on this box's NVMe before the window started; read behind layer 0 instead
+bool Engine::ngram_late() const { return m_.ple_rows->mode() == PleRows::Mode::DISK; }
+
+namespace {
+// page-locked, mapped and portable: every card reads it in place, at the same address as the host's (UVA)
+template <typename T> T* hmapped(size_t n) {
+    void* p = nullptr;
+    const cudaError_t e = cudaHostAlloc(&p, n * sizeof(T), cudaHostAllocPortable | cudaHostAllocMapped);
+    if (e != cudaSuccess) {
+        cudaGetLastError();
+        throw std::runtime_error(std::string("cudaHostAlloc (mapped) of ") + std::to_string(n * sizeof(T)) + " bytes: " + cudaGetErrorString(e));
+    }
+    own_pinned(p);
+    void* dp = nullptr;
+    ck(cudaHostGetDevicePointer(&dp, p, 0), "mapped pointer");
+    if (dp != p) throw std::runtime_error("mapped host memory has another address on the cards (no UVA): FNX_NGRAM=disk needs it");
+    return (T*) p;
+}
+
+// layer 1's n-gram rows from the host once it says they are there (*flag == the window's tag, ctl[1]). Bounded: a flag
+// that never comes (the host died between the launch and the rows) ends the window with a fault, not a hang
+__global__ void ngram_wait_copy_k(const volatile unsigned* flag, const int* ctl, const volatile float* src, float* dst, int n) {
+    if (threadIdx.x == 0) {
+        const unsigned want = (unsigned) ctl[1];
+        unsigned long long t0, t;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+        while (*flag != want) {
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+            if (t - t0 > 10000000000ull) __trap();
+            __nanosleep(256);
+        }
+        __threadfence_system();
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
+}
+}  // namespace
+
+void Engine::embed_tokens_into(int r, int k, int p0, const std::function<int(int)>& tok_at) {
+    if (!h_.ngram_late) {   // before any window graph is captured with their addresses
+        h_.ngram_late = hmapped<float>((size_t) MAXT * N);
+        h_.ngram_flag = hmapped<unsigned>(1);
+    }
+    std::vector<float> emb(N);
+    for (int j = 0; j < k; ++j) {
+        embed_token(tok_at(p0 + j), p0 + j, emb.data());
+        for (int c = 0; c < HC; ++c) std::memcpy(h_.R0 + (size_t) (r + j) * D + c * N, emb.data(), N * sizeof(float));
+    }
+}
+
+void Engine::rows_upload_tokens(CardBuf& b, int T) {
+    ck(cudaMemcpyAsync(b.R, h_.R0, (size_t) T * D * 4, cudaMemcpyHostToDevice, b.st), "R0");
+}
+
+void Engine::ngram_rows_late(int k, int p0, const std::function<int(int)>& tok_at, unsigned tag) {
+    ple_dequant(p0, k, tok_at, h_.ngram_late);
+    __atomic_store_n(h_.ngram_flag, tag, __ATOMIC_RELEASE);
+}
+
 void Engine::ngram_prefetch(const std::vector<int>& tokens) const {
     if (m_.ple_rows->mode() != PleRows::Mode::DISK || tokens.empty()) return;
     // the positions verify(tokens) embeds, read as it reads them
@@ -747,10 +807,14 @@ void Engine::ngram_prefetch(const std::vector<int>& tokens) const {
 }
 
 void Engine::embed_rows(int p0, int T, const std::function<int(int)>& tok_at_cell, float* emb, float* ple) const {
+    for (int t = 0; t < T; ++t) embed_token(tok_at_cell(p0 + t), p0 + t, emb + (size_t) t * N);
+    ple_dequant(p0, T, tok_at_cell, ple);
+}
+
+void Engine::ple_dequant(int p0, int T, const std::function<int(int)>& tok_at_cell, float* ple) const {
     static const int8_t kv4[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
     const Tensor& pt = *m_.ple_table;
     const size_t prb = m_.ple_rows->row_bytes();
-    for (int t = 0; t < T; ++t) embed_token(tok_at_cell(p0 + t), p0 + t, emb + (size_t) t * N);
     // every row of the window first, then their bytes in one gather: from the disk (FNX_NGRAM=disk) the misses are read
     // together, by as many threads as there are. The PLE n-grams read an image cell as the model's image token
     std::vector<uint64_t> rows((size_t) T * PLE_HEADS);
@@ -899,6 +963,7 @@ void Engine::enqueue(int T, bool dumps) {
     auto dd = [&](const std::string& name, int layer, const float* p, int n) {
         if (dumps) dump_dev(name, layer, p, T, n);
     };
+    const bool late = ngram_late();
     for (int l = 0; l < NL; ++l) {
         const bool pending = l > 0;
         // ---- attention half
@@ -906,6 +971,10 @@ void Engine::enqueue(int T, bool dumps) {
             const LayerW& L = w.L[l];
             bool apply = pending;
             if (l == PLE_LAYER) {
+                if (late) {
+                    ngram_wait_copy_k<<<1, 1024, 0, b.st>>>(h_.ngram_flag, b.ctl, h_.ngram_late, b.ple_emb, T * N);
+                    ck(cudaGetLastError(), "ngram wait");
+                }
                 hc_write(b.R, b.bo_f, b.inj_f, T, b.st);
                 apply = false;
                 quantize_q8_1(b.ple_emb, b.xq, N, T, b.st);

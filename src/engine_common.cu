@@ -672,7 +672,10 @@ std::vector<int> Engine::verify(const std::vector<int>& tokens) {
         h_.err = halloc<unsigned>(NCARD);
     }
     const int h0 = (int) history_.size();
-    embed_into(0, T, pos_, [&](int q) -> int { return q < h0 ? history_[(size_t) q] : tokens[(size_t) (q - h0)]; }, nullptr);
+    const std::function<int(int)> tok_at = [&](int q) -> int { return q < h0 ? history_[(size_t) q] : tokens[(size_t) (q - h0)]; };
+    const bool late = ngram_late();
+    if (late) embed_tokens_into(0, T, pos_, tok_at);
+    else embed_into(0, T, pos_, tok_at, nullptr);
     const auto t1 = std::chrono::steady_clock::now();
     auto each = [&](auto&& f) {
         for (int c = 0; c < NCARD; ++c) {
@@ -686,7 +689,8 @@ std::vector<int> Engine::verify(const std::vector<int>& tokens) {
     int* bi = h_.bi;
     auto upload = [&](int, CardBuf& b, const CardW&) {
         ck(cudaEventRecord(b.ev0, b.st), "event");
-        rows_upload(b, T);
+        if (late) rows_upload_tokens(b, T);
+        else rows_upload(b, T);
         ck(cudaMemcpyAsync(b.ctl, h_.ctl, 2 * sizeof(int), cudaMemcpyHostToDevice, b.st), "ctl");
     };
     auto download = [&](int c, CardBuf& b, const CardW&) {
@@ -696,6 +700,8 @@ std::vector<int> Engine::verify(const std::vector<int>& tokens) {
         ck(cudaEventRecord(b.ev1, b.st), "event");
     };
     if (dump) {
+        // dumping waits on the cards between layers: the rows are there before anything runs
+        if (late) ngram_rows_late(T, pos_, tok_at, (unsigned) h_.ctl[1]);
         each(upload);
         dump_dev("R0", -1, cb_[0]->R, T, ROW_W);
         enqueue(T, true);
@@ -714,6 +720,7 @@ std::vector<int> Engine::verify(const std::vector<int>& tokens) {
             });
         }
         const auto l0 = std::chrono::steady_clock::now();
+        if (late) __atomic_store_n(h_.ngram_flag, ~(unsigned) h_.ctl[1], __ATOMIC_RELEASE);
         on_cards([&](int c) {
             CardBuf& b = *cb_[c];
             upload(c, b, m_.cards[c]);
@@ -721,6 +728,7 @@ std::vector<int> Engine::verify(const std::vector<int>& tokens) {
             download(c, b, m_.cards[c]);
         });
         last_launch_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - l0).count();
+        if (late) ngram_rows_late(T, pos_, tok_at, (unsigned) h_.ctl[1]);
     }
     unsigned err = 0;
     float gpu_ms = 0.f;
