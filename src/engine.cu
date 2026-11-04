@@ -24,12 +24,68 @@
 namespace fnx {
 
 
+namespace {
+// page-locked, mapped and portable: every card reads it in place, at the same address as the host's (UVA)
+template <typename T> T* hmapped(size_t n) {
+    void* p = nullptr;
+    const cudaError_t e = cudaHostAlloc(&p, n * sizeof(T), cudaHostAllocPortable | cudaHostAllocMapped);
+    if (e != cudaSuccess) {
+        cudaGetLastError();
+        throw std::runtime_error(std::string("cudaHostAlloc (mapped) of ") + std::to_string(n * sizeof(T)) + " bytes: " + cudaGetErrorString(e));
+    }
+    own_pinned(p);
+    void* dp = nullptr;
+    ck(cudaHostGetDevicePointer(&dp, p, 0), "mapped pointer");
+    if (dp != p) throw std::runtime_error("mapped host memory has another address on the cards (no UVA): FNX_NGRAM=disk needs it");
+    return (T*) p;
+}
+
+// layer 1's n-gram rows from the host once it says they are there (*flag == the window's tag, ctl[1]). The host's
+// failure (want ^ NGRAM_ABORT) and a flag that never comes in 10 s set the window's error bits (64, 32) and leave the
+// rows unread: the window runs on to its end and verify throws
+__global__ void ngram_wait_copy_k(const volatile unsigned* flag, const int* ctl, const volatile float* src, float* dst, int n,
+                                  unsigned* err) {
+    __shared__ int ok;
+    if (threadIdx.x == 0) {
+        const unsigned want = (unsigned) ctl[1];
+        unsigned long long t0, t;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+        ok = 0;
+        for (;;) {
+            const unsigned f = *flag;
+            if (f == want) {
+                ok = 1;
+                break;
+            }
+            if (f == (want ^ Engine::NGRAM_ABORT)) {
+                atomicOr(err, 64u);
+                break;
+            }
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+            if (t - t0 > 10000000000ull) {
+                atomicOr(err, 32u);
+                break;
+            }
+            __nanosleep(256);
+        }
+        __threadfence_system();
+    }
+    __syncthreads();
+    if (!ok) return;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
+}
+}  // namespace
+
 Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
     // the 27B build's settings: this Flash-Next engine has none of what they set, so one given is a mistake, not a
     // run of the default
     for (const char* k : {"FNX_PF_SKIP", "FNX_PF_SKIP_CONFIRM", "FNX_PF_SCORE_MIB", "FNX_PF_WINDOWS", "FNX_PF_SCORES",
                           "FNX_KV_PAGES", "FNX_KV_RESERVE_MIB"})
         if (std::getenv(k)) throw std::runtime_error(std::string(k) + " is the 27B's: Flash-Next has nothing it sets");
+    if (ngram_late()) {   // as the engine is made, so a box that cannot map them refuses at start, not at a first token
+        h_.ngram_late = hmapped<float>((size_t) MAXT * N);
+        h_.ngram_flag = hmapped<unsigned>(1);
+    }
     // the rotary's scaling (choose_rope, src/rope.hpp): the model's own YaRN, FNX_ROPE_SCALE / FNX_YARN_ORIG_CTX, or
     // both when they agree; set once here, before any graph capture. Positions past what the rotary covers have angles
     // the model never saw, so a context past that is refused here rather than served
@@ -738,46 +794,9 @@ void Engine::rows_upload(CardBuf& b, int T) {
 // round on this box's NVMe before the window started; read behind layer 0 instead
 bool Engine::ngram_late() const { return m_.ple_rows->mode() == PleRows::Mode::DISK; }
 
-namespace {
-// page-locked, mapped and portable: every card reads it in place, at the same address as the host's (UVA)
-template <typename T> T* hmapped(size_t n) {
-    void* p = nullptr;
-    const cudaError_t e = cudaHostAlloc(&p, n * sizeof(T), cudaHostAllocPortable | cudaHostAllocMapped);
-    if (e != cudaSuccess) {
-        cudaGetLastError();
-        throw std::runtime_error(std::string("cudaHostAlloc (mapped) of ") + std::to_string(n * sizeof(T)) + " bytes: " + cudaGetErrorString(e));
-    }
-    own_pinned(p);
-    void* dp = nullptr;
-    ck(cudaHostGetDevicePointer(&dp, p, 0), "mapped pointer");
-    if (dp != p) throw std::runtime_error("mapped host memory has another address on the cards (no UVA): FNX_NGRAM=disk needs it");
-    return (T*) p;
-}
-
-// layer 1's n-gram rows from the host once it says they are there (*flag == the window's tag, ctl[1]). Bounded: a flag
-// that never comes (the host died between the launch and the rows) ends the window with a fault, not a hang
-__global__ void ngram_wait_copy_k(const volatile unsigned* flag, const int* ctl, const volatile float* src, float* dst, int n) {
-    if (threadIdx.x == 0) {
-        const unsigned want = (unsigned) ctl[1];
-        unsigned long long t0, t;
-        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
-        while (*flag != want) {
-            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-            if (t - t0 > 10000000000ull) __trap();
-            __nanosleep(256);
-        }
-        __threadfence_system();
-    }
-    __syncthreads();
-    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
-}
-}  // namespace
 
 void Engine::embed_tokens_into(int r, int k, int p0, const std::function<int(int)>& tok_at) {
-    if (!h_.ngram_late) {   // before any window graph is captured with their addresses
-        h_.ngram_late = hmapped<float>((size_t) MAXT * N);
-        h_.ngram_flag = hmapped<unsigned>(1);
-    }
+    if (!h_.ngram_late) throw std::runtime_error("embed_tokens_into: the n-gram rows' mapped buffers were never made");
     std::vector<float> emb(N);
     for (int j = 0; j < k; ++j) {
         embed_token(tok_at(p0 + j), p0 + j, emb.data());
@@ -972,7 +991,7 @@ void Engine::enqueue(int T, bool dumps) {
             bool apply = pending;
             if (l == PLE_LAYER) {
                 if (late) {
-                    ngram_wait_copy_k<<<1, 1024, 0, b.st>>>(h_.ngram_flag, b.ctl, h_.ngram_late, b.ple_emb, T * N);
+                    ngram_wait_copy_k<<<1, 1024, 0, b.st>>>(h_.ngram_flag, b.ctl, h_.ngram_late, b.ple_emb, T * N, err_word(b));
                     ck(cudaGetLastError(), "ngram wait");
                 }
                 hc_write(b.R, b.bo_f, b.inj_f, T, b.st);

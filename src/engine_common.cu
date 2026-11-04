@@ -674,6 +674,7 @@ std::vector<int> Engine::verify(const std::vector<int>& tokens) {
     const int h0 = (int) history_.size();
     const std::function<int(int)> tok_at = [&](int q) -> int { return q < h0 ? history_[(size_t) q] : tokens[(size_t) (q - h0)]; };
     const bool late = ngram_late();
+    std::exception_ptr late_err;   // late: the launch's or the rows' failure, rethrown once the cards drain
     if (late) embed_tokens_into(0, T, pos_, tok_at);
     else embed_into(0, T, pos_, tok_at, nullptr);
     const auto t1 = std::chrono::steady_clock::now();
@@ -720,15 +721,24 @@ std::vector<int> Engine::verify(const std::vector<int>& tokens) {
             });
         }
         const auto l0 = std::chrono::steady_clock::now();
-        if (late) __atomic_store_n(h_.ngram_flag, ~(unsigned) h_.ctl[1], __ATOMIC_RELEASE);
-        on_cards([&](int c) {
-            CardBuf& b = *cb_[c];
-            upload(c, b, m_.cards[c]);
-            ck(cudaGraphLaunch(b.win_graphs[T].exec, b.st), "graph launch");
-            download(c, b, m_.cards[c]);
-        });
-        last_launch_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - l0).count();
-        if (late) ngram_rows_late(T, pos_, tok_at, (unsigned) h_.ctl[1]);
+        const unsigned tag = (unsigned) h_.ctl[1];
+        if (late) __atomic_store_n(h_.ngram_flag, ~tag, __ATOMIC_RELEASE);
+        // a failure once a card may have launched aborts the cards' wait for the rows (an error bit, they run to the
+        // window's end), so none is left spinning; the failure is rethrown after they drain
+        try {
+            on_cards([&](int c) {
+                CardBuf& b = *cb_[c];
+                upload(c, b, m_.cards[c]);
+                ck(cudaGraphLaunch(b.win_graphs[T].exec, b.st), "graph launch");
+                download(c, b, m_.cards[c]);
+            });
+            last_launch_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - l0).count();
+            if (late) ngram_rows_late(T, pos_, tok_at, tag);
+        } catch (...) {
+            if (!late) throw;
+            late_err = std::current_exception();
+            __atomic_store_n(h_.ngram_flag, tag ^ NGRAM_ABORT, __ATOMIC_RELEASE);
+        }
     }
     unsigned err = 0;
     float gpu_ms = 0.f;
@@ -740,6 +750,7 @@ std::vector<int> Engine::verify(const std::vector<int>& tokens) {
         gpu_ms = std::max(gpu_ms, ms);
         last_card_ms[c] = ms;
     });
+    if (late_err) std::rethrow_exception(late_err);
     if (const char* e = window_error(err, false)) throw std::runtime_error(std::string("window: ") + e);
     std::vector<int> out(T);
     for (int t = 0; t < T; ++t) {
