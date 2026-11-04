@@ -115,6 +115,7 @@ Its llama.cpp references (docs/verification.md, "The 27B") are made locally like
 | `lab.sh batch` | batched windows (with their drafts) give each lane its tokens alone | MISMATCH, exit 1 |
 | `bin/sample_test` | speculative sampling matches plain sampling in distribution | MISMATCH, exit 1 |
 | `bin/topk_test`, `bin/batch_plan_test`, `bin/sfnx_input_test`, `bin/pf_ring_plan_test`, `bin/rope_test`, `bin/card_check_test`, `tools/build_guards_check.sh` | the top-k ties, the batched row planner, the engine's stdin handling, the prompt path's ring steps on every supported count, YaRN's constants against ggml's, the card checks at load against real cards' numbers and sysfs, the link probe's report and failure text, the Makefile's checks of ARCH and FNX_NCARD (the last six CPU only) | non-zero exit |
+| `bin/ple_test MODEL.gguf ref/long64.bin ref/edit1.bin` | `FNX_NGRAM=disk`'s rows against the mapping's, byte for byte (CPU, beside a serving engine) | `MISMATCH`, exit 1 |
 | `serve/api_smoke.py`, `serve/image_test.py` | the API surface and pictures through the front end | `N failed` |
 | `.venv/bin/python -m pytest -q front/` | the front end (CPU only) | pytest |
 

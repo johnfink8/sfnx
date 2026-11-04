@@ -81,34 +81,64 @@ buffers — int8 K/V, a 64 GiB conversation cache. Lab decode at 58 GiB with loo
 
 The model's n-gram table (`per_layer_token_embd`, read at layer 1) is the largest thing on the host: 320,001,536 rows,
 28.8 GB in Q4_K_XL (IQ4_NL, 90-byte rows) and 54.4 GB in Q8_0 builds (170-byte rows, as Unsloth's UD-Q5_K_XL ships
-it). Each position reads 16 rows of it, hashed from its token and the two before. By default it is locked in RAM. On a
-box whose RAM is short, `FNX_NGRAM=disk` leaves it on the disk: the engine hashes a window's rows, takes what it can from
-a row cache (`FNX_NGRAM_CACHE_MIB`, 256 by default) and reads the rest with O_DIRECT, one 4 KiB page a row (two for a row
-that crosses one), `FNX_NGRAM_THREADS` reads in flight (32). The page cache would hold 4 KiB for each ~100-byte row, and
-rows land on pages at random, so the reads go around it.
+it too). Each position reads 16 rows of it, hashed from its token and the two before. By default it is locked in RAM.
+On a box whose RAM is short, `FNX_NGRAM=disk` leaves it on the disk ([docs/config.md](config.md)): the engine hashes a
+window's rows, takes what it can from a row cache (`FNX_NGRAM_CACHE_MIB`, 256 by default) and reads the rest with
+O_DIRECT, one 4 KiB page a row (two for a row that crosses one), from a pool of `FNX_NGRAM_THREADS` (32) that wakes
+as many threads as a round has reads. The page cache would hold 4 KiB for each ~100-byte row, and rows land on pages
+at random, so the reads go around it. The bytes are the same: the rows gathered are the mapping's byte for byte, and
+the logits are RAM mode's byte for byte.
 
-What it frees, with experts in RAM (every expert then has a pinned host copy, `FNX_EXPERT_RAM_GIB` or not):
+**What it frees.** With experts in RAM every expert has a pinned host copy (`FNX_EXPERT_RAM_GIB` or not), so the table
+comes on top of them. Measured, the engine process at idle after load (`serve/sfnx.json` and `serve/sfnx-q8.json` as
+they are, plus `FNX_NGRAM=disk`):
 
-| Pinned host memory | Table in RAM | `FNX_NGRAM=disk` |
+| | Locked | Resident | Of it pinned (the expert copies, the prompt path's buffers) |
+| --- | --- | --- | --- |
+| Q4_K_XL, `FNX_NGRAM=disk` | 0.63 GiB (`token_embd`) | 74.8 GiB | 72.4 GiB |
+| Q8_0, table in RAM | 51.3 GiB | 175.0 GiB | 120.4 GiB |
+| Q8_0, `FNX_NGRAM=disk` | 0.63 GiB | 122.8 GiB | 120.2 GiB |
+
+The picture encoder (0.5 GiB) and the front end (0.2 GiB) come on top, and so does the conversation cache as it fills
+(`--conversation-cache-mib`: 128 GiB in prod's config, which a box short of RAM sets lower). From the GGUFs' headers,
+UD-Q5_K_XL pins 98.4 GB of experts and locks 55.1 GB of embeddings: 142.9 GiB against a 128 GiB box, 92.2 GiB with
+the table on the disk.
+
+**How the reads hide.** A new prompt is mostly rows it has not read before (the engine's hash over `ref/`: 41.8% of
+long2's 218,576 lookups are distinct rows, 49.4% of long64's, 41.9% of long164's); a prompt that continues text read
+before finds 40–50% of its new rows in the cache. So the reads are hidden, not avoided:
+
+- *Prompts.* Each pass's rows for the next pass are read on a thread of their own from the start of the pass (the host
+  spends ~70% of a pass enqueueing it). The passes start at one chunk and double to the full four, so each hides the
+  next one's reads; only the first chunk's are read before anything runs. A ramp from 1,024 rows instead of 4,096 read
+  0.35 s faster but moved long64's logits off RAM mode's, so the ramp starts at a whole chunk.
+- *Decode.* The next window's rows are read ahead as its tokens become known: the last token as soon as the round
+  commits, each draft as the draft layer makes it. The window is launched before the last of them arrive, and layer 1
+  waits on the cards for the host's rows (a flag in mapped memory), so the last draft's read hides behind the launch
+  and layer 0. The batched windows (`step`, `verify_rows`) read synchronously before they launch.
+
+**What it costs**, on this box's NVMe (Kingston NV3, DRAM-less, ~76k random 4 KiB reads/s at 32 in flight):
+
+| Q4_K_XL, the lab (`tools/lab.sh`), three cards | RAM | `FNX_NGRAM=disk` |
 | --- | --- | --- |
-| Q4_K_XL (77.0 GB of experts) | 99.2 GiB | 72.4 GiB |
-| UD-Q5_K_XL (98.4 GB of experts) | 142.9 GiB | 92.2 GiB |
+| A cold 62,793-token read (`read 62793`, an empty row cache) | 17.05 s | 18.25 s (+7%) |
+| The same read with its rows cached | 17.05 s | 17.1 s |
+| Decode: edit1 / code1 greedy, prose2 sampled (`lab.sh decode`) | 378.8 / 203.5 / 139.4 tok/s | 373.8 / 200.4 / 138.2 (−1.3 / −1.5 / −0.9%) |
+| Batched, 6 lanes with drafts (`lab.sh batch`) | 284.0 tok/s | 285.1 |
 
-How much of a prompt the cache can serve (the engine's own hash over `ref/`): a new prompt is mostly rows it has not
-read before — 41.8% of long2's 218,576 lookups are distinct rows, 49.4% of long64's, 41.9% of long164's — so the cache
-pays across requests that repeat text, not within one.
+| Q8_0, served (`serve/sfnx-q8.json`) | RAM | `FNX_NGRAM=disk` |
+| --- | --- | --- |
+| A cold 32,045-token prompt (`serve/prompt_read.py 1 30000`) | 1,391.5 tok/s | 1,459.8 |
+| Prose sampled, two 1,024-token replies | 98.4, 90.8 tok/s | 105.9, 83.2 |
+| A greedy reply | | the same bytes |
 
-The reads on this box's NVMe (Kingston NV3, DRAM-less), `bin/ple_test` with the engine serving beside it, cold cache:
+On the way there, each change measured on prose2 with Q4 (RAM 139.4 tok/s): the synchronous read 131.7; reading the
+window's rows ahead 132.4; waking only as many read threads as reads 136.3; one read-ahead thread in place of one a
+request 136.7; the layer-1 wait with the last draft read ahead 137.6. The cold read: 23.1 s with the next pass's rows
+read after its enqueueing, 19.4 s on their own thread, 18.25 s with the ramp.
 
-| | 8 threads | 16 | 32 (default) | 64 | 128 |
-| --- | --- | --- | --- | --- | --- |
-| long64 (62,794 tokens) read 4,096 positions a call: reads/s | 48,686 | 66,037 | 76,282 | 76,283 | 82,731 |
-| the same, seconds of reads | 10.2 | 7.5 | 6.5 | 6.5 | 6.0 |
-| one position a call (decode): a call's p50 / p99 | 0.41 / 0.68 ms | 0.40 / 0.67 | 0.40 / 0.67 | 0.40 / 0.68 | 0.42 / 0.86 |
-
-The prompt path hashes and reads the next chunk's rows while the cards run the current one, so a prompt's reads hide
-behind it while they take less than the chunk's GPU time (~1.2 s for 4,096 rows at prod's rate; 6.5 s of reads against
-~27 s for long64). Decode reads before the window starts: one read's latency, ~0.4 ms on this drive, against a window
-of 13–18 ms. Every row gathered is byte for byte the mapping's (`bin/ple_test`, long2, long64, edit1).
+A spinning disk is refused at start. The start-up log measures the disk (`n-gram table: its disk, 46,000 reads/s ...,
+p50 485 us, p99 10,472 us` here; the p99 is the NV3's first reads after idle). Below ~30,000 reads/s (a full pass's ~118,000 cold pages in its ~4.3 s) the prompt reads
+stop hiding behind the cards and prompts slow down with them.
 
 Speed and exactness against the reference: [docs/benchmarks.md](benchmarks.md), [docs/verification.md](verification.md).
