@@ -1398,8 +1398,11 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
             }
         });
     for (auto& t : th) t.join();
+    // every card's: the first is often only the abort another card's failure caused ("card 0: card 1 failed")
+    std::string all_errs;
     for (int c = 0; c < NCARD; ++c)
-        if (!errs[c].empty()) throw std::runtime_error("card " + std::to_string(c) + ": " + errs[c]);
+        if (!errs[c].empty()) all_errs += (all_errs.empty() ? "" : "; ") + ("card " + std::to_string(c) + ": " + errs[c]);
+    if (!all_errs.empty()) throw std::runtime_error(all_errs);
     // the disk rate only when the disk gave nearly all of it (tools/lab.sh estimates its next cold loads from it)
     const double disk = st.disk_bytes() / 1e9, cache = st.cache_bytes() / 1e9;
     char rate[64] = "";
@@ -1484,8 +1487,11 @@ void each_card(std::vector<CardW>& cards, F f) {
             } catch (const std::exception& e) { errs[c] = e.what(); }
         });
     for (auto& t : th) t.join();
+    // every card's: the first is often only the abort another card's failure caused ("card 0: card 1 failed")
+    std::string all_errs;
     for (int c = 0; c < NCARD; ++c)
-        if (!errs[c].empty()) throw std::runtime_error("card " + std::to_string(c) + ": " + errs[c]);
+        if (!errs[c].empty()) all_errs += (all_errs.empty() ? "" : "; ") + ("card " + std::to_string(c) + ": " + errs[c]);
+    if (!all_errs.empty()) throw std::runtime_error(all_errs);
 }
 }  // namespace
 
