@@ -761,6 +761,8 @@ std::vector<int> Engine::verify(const std::vector<int>& tokens) {
                 std::rethrow_exception(late_err);
             } catch (const std::exception& e) {
                 throw std::runtime_error(std::string(e.what()) + "; and in the same window" + cards);
+            } catch (...) {
+                throw std::runtime_error("verify: the host's n-gram rows failed (not a std::exception); and in the same window" + cards);
             }
         }
         std::rethrow_exception(late_err);
