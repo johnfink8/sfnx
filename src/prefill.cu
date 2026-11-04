@@ -895,12 +895,14 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
     // FNX_NGRAM=disk: the first pass's rows are read before anything runs to hide them (~1.6 s for 16,384 rows on this
     // box's NVMe), so the passes start at one chunk and double: a pass hides the next one's reads while those take less
     // than its GPU time (~0.1 ms of reads against ~0.26 ms a row), and a one-chunk pass followed by a whole one did not
-    // (2.0 s for the one chunk's 1.06)
-    const size_t first = m_.ple_rows->mode() == PleRows::Mode::DISK ? std::min(per, (size_t) pf_c_) : per;
+    // (2.0 s for the one chunk's 1.06). The first is 1,024 rows: its reads (~0.1 s) are the only ones nothing hides
+    constexpr size_t PF_FIRST_DISK = 1024;
+    const size_t first = m_.ple_rows->mode() == PleRows::Mode::DISK ? std::min({per, (size_t) pf_c_, PF_FIRST_DISK}) : per;
     auto chunks_of = [&](size_t i0, int half, size_t span) {
         std::vector<PfChunk> ch;
-        for (size_t i = i0; i < std::min(nt, i0 + span); i += pf_c_) {
-            const size_t e = std::min(nt, i + pf_c_);
+        const size_t len = std::min((size_t) pf_c_, span);   // a span under a chunk is one chunk that short
+        for (size_t i = i0; i < std::min(nt, i0 + span); i += len) {
+            const size_t e = std::min(nt, i + len);
             ch.push_back({std::vector<int>(tokens.begin() + i, tokens.begin() + e), e < nt ? tokens[e] : after, half * K + (int) ch.size()});
         }
         return ch;
