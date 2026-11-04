@@ -111,7 +111,9 @@ before finds 40–50% of its new rows in the cache. So the reads are hidden, not
 - *Prompts.* Each pass's rows for the next pass are read on a thread of their own from the start of the pass (the host
   spends ~70% of a pass enqueueing it). The passes start at one chunk and double to the full four, so each hides the
   next one's reads; only the first chunk's are read before anything runs. A ramp from 1,024 rows instead of 4,096 read
-  0.35 s faster but moved long64's logits off RAM mode's, so the ramp starts at a whole chunk.
+  0.35 s faster but moved long64's logits off RAM mode's, so the ramp starts at a whole chunk. RAM mode (prod's) runs
+  the same thread over the mapping, with no ramp: the RAM column's 17.05 s below is with it, and its logits are main's
+  byte for byte.
 - *Decode.* The next window's rows are read ahead as its tokens become known: the last token as soon as the round
   commits, each draft as the draft layer makes it. The window is launched before the last of them arrive, and layer 1
   waits on the cards for the host's rows (a flag in mapped memory), so the last draft's read hides behind the launch
@@ -126,11 +128,13 @@ before finds 40–50% of its new rows in the cache. So the reads are hidden, not
 | Decode: edit1 / code1 greedy, prose2 sampled (`lab.sh decode`) | 378.8 / 203.5 / 139.4 tok/s | 373.8 / 200.4 / 138.2 (−1.3 / −1.5 / −0.9%) |
 | Batched, 6 lanes with drafts (`lab.sh batch`) | 284.0 tok/s | 285.1 |
 
-| Q8_0, served (`serve/sfnx-q8.json`) | RAM | `FNX_NGRAM=disk` |
-| --- | --- | --- |
-| A cold 32,045-token prompt (`serve/prompt_read.py 1 30000`) | 1,391.5 tok/s | 1,459.8 |
-| Prose sampled, two 1,024-token replies | 98.4, 90.8 tok/s | 105.9, 83.2 |
-| A greedy reply | | the same bytes |
+| Served (`serve/sfnx.json`, `serve/sfnx-q8.json`) | main | RAM | `FNX_NGRAM=disk` |
+| --- | --- | --- | --- |
+| Q4_K_XL: a cold 32,045-token prompt (`serve/prompt_read.py 1 30000`) | | 3,640 tok/s | 3,289 (−10%) |
+| Q8_0: the same prompt | 1,556 tok/s | 1,562 | 1,364 (−12%) |
+| Q8_0: prose sampled, two 1,024-token replies (unseeded) | 99.9, 103.9 tok/s | 103.1, 96.7 | 101.0, 99.6 |
+| Q4_K_XL: a 400-token greedy reply | | the same bytes as disk's | the same bytes as RAM's |
+| Q8_0: the same reply | the reference | the same bytes | the same bytes |
 
 On the way there, each change measured on prose2 with Q4 (RAM 139.4 tok/s): the synchronous read 131.7; reading the
 window's rows ahead 132.4; waking only as many read threads as reads 136.3; one read-ahead thread in place of one a

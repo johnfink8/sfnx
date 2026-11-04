@@ -59,7 +59,8 @@ one request's decode:
 
 Two cards hold a third of the experts in RAM, and every expert keeps a pinned copy there, so RAM can be the limit
 before VRAM: `FNX_NGRAM=disk` leaves the model's 28.8 GB n-gram table (54.4 GB in Q8_0 builds) on an SSD instead of
-locked in RAM, for ~1% of decode and ~7% of a cold prompt read here, the logits unchanged
+locked in RAM, for ~1% of decode and 7–12% of a cold prompt read here, the logits unchanged. Q8_0 as
+`serve/sfnx-q8.json` serves it goes from 173 GiB resident to 123
 ([docs/memory.md](docs/memory.md#the-n-gram-table-on-disk)).
 
 For **one** card, use Strata: it computes part of the experts a card cannot hold on the CPU, and was 2–3x sFNX's

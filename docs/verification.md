@@ -83,12 +83,16 @@ its logits are RAM mode's byte for byte:
   (rows that cross a page, gathers of several rounds).
 - `tools/lab.sh exact` with `FNX_NGRAM=disk` (Q4_K_XL): long64, code1, edit1 and the picture byte for byte against
   the base; `tools/lab.sh batch`: every lane its tokens alone, with and without drafts and sampled.
-- Q8_0 served (`serve/sfnx-q8.json`): a 400-token greedy reply the same bytes in both modes.
-
-Not run: Q8_0's `exact` with the table on disk. The lab's worker on Q8_0 with prod's Q8 settings hung in a sampled
-decode and in `logits` on long64, in RAM mode too (the cards spinning in a window); the same requests served by
-`serve/sfnx-q8.json` from this build and from main's ran. main's lab could not hold Q8_0 at all (its holder locked the
-table beside the NUMA-bound expert copies; the holder now leaves the table to its workers).
+- `tools/lab.sh exact` on Q8_0 with prod's Q8 settings: code1 and edit1 byte for byte in both modes (and against
+  llama.cpp's CPU reference as before), and `logits` on long64 (62k tokens) byte for byte between the modes. main's
+  lab cannot hold Q8_0 (its holder locks the table beside the NUMA-bound expert copies: out of memory on card 2's
+  node); this build's holder leaves the table to its workers.
+- Q8_0 served (`serve/sfnx-q8.json`): a 400-token greedy reply the same bytes from main's build and from this one in
+  both modes.
+- Its failure paths, with a preloaded `pread` that fails or stalls the table's O_DIRECT reads on cue (Q4_K_XL, the
+  lab): reads failing mid-decode end the window with the host's I/O error (the cards' layer-1 wait aborted, 6 s, the
+  next request served); one read stalled 12 s ends it with "did not come from the host in 10 s" (error bit 32);
+  reads failing in a prompt end the prompt with the error, and the next prompt reads.
 
 ## The 27B
 
