@@ -722,7 +722,10 @@ std::vector<int> Engine::verify(const std::vector<int>& tokens) {
         }
         const auto l0 = std::chrono::steady_clock::now();
         const unsigned tag = (unsigned) h_.ctl[1];
-        if (late) __atomic_store_n(h_.ngram_flag, ~tag, __ATOMIC_RELEASE);
+        if (late) {
+            std::fill(h_.err, h_.err + NCARD, 0u);
+            __atomic_store_n(h_.ngram_flag, ~tag, __ATOMIC_RELEASE);
+        }
         // a failure once a card may have launched aborts the cards' wait for the rows (an error bit, they run to the
         // window's end), so none is left spinning; the failure is rethrown after they drain
         try {
@@ -740,6 +743,28 @@ std::vector<int> Engine::verify(const std::vector<int>& tokens) {
             __atomic_store_n(h_.ngram_flag, tag ^ NGRAM_ABORT, __ATOMIC_RELEASE);
         }
     }
+    if (late_err) {
+        // a card whose upload failed recorded no ev1 and downloaded no error word (cleared before the launch): drain
+        // without the timings, then the host's failure with what the cards said besides the abort it caused
+        std::string cards;
+        for (int c = 0; c < NCARD; ++c) {
+            try {
+                ck(cudaSetDevice(cb_[c]->dev), "set");
+                ck(cudaStreamSynchronize(cb_[c]->st), "window sync");
+                if (const char* e = window_error(h_.err[c] & ~64u, false)) cards += "; card " + std::to_string(c) + ": " + e;
+            } catch (const std::exception& e) {
+                cards += "; card " + std::to_string(c) + ": " + e.what();
+            }
+        }
+        if (!cards.empty()) {
+            try {
+                std::rethrow_exception(late_err);
+            } catch (const std::exception& e) {
+                throw std::runtime_error(std::string(e.what()) + "; and in the same window" + cards);
+            }
+        }
+        std::rethrow_exception(late_err);
+    }
     unsigned err = 0;
     float gpu_ms = 0.f;
     each([&](int c, CardBuf& b, const CardW&) {
@@ -750,7 +775,6 @@ std::vector<int> Engine::verify(const std::vector<int>& tokens) {
         gpu_ms = std::max(gpu_ms, ms);
         last_card_ms[c] = ms;
     });
-    if (late_err) std::rethrow_exception(late_err);
     if (const char* e = window_error(err, false)) throw std::runtime_error(std::string("window: ") + e);
     std::vector<int> out(T);
     for (int t = 0; t < T; ++t) {

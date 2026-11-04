@@ -914,8 +914,9 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
     };
     std::vector<PfChunk> ch = chunks_of(0, 0, first);
     embed(0, ch);
-    for (size_t i = 0, k = 0, span = first; i < nt; i += span, span = std::min(per, 2 * span), ++k) {
-        std::vector<PfChunk> next = chunks_of(i + span, (int) ((k + 1) & 1), std::min(per, 2 * span));
+    for (size_t i = 0, k = 0, span = first, grown = 0; i < nt; i += span, span = grown, ++k) {
+        grown = std::min(per, 2 * span);
+        std::vector<PfChunk> next = chunks_of(i + span, (int) ((k + 1) & 1), grown);
         prefill_pass(ch, staging, [&] { embed(i + span, next); });
         size_t e = i;
         for (const PfChunk& c : ch) {

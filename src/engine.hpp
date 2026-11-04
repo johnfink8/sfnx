@@ -37,10 +37,6 @@ bool ring_f32();
 // Read at each call like ring_f32 (the Engine and the lab's identity record); anything else not above 1 throws
 double rope_scale();
 
-// FNX_NGRAM=disk, verify: the n-gram flag's value for "the rows will not come" (the host's read failed): the window's
-// tag with this bit flipped, never the tag nor ~tag (its value before the rows)
-constexpr unsigned NGRAM_ABORT = 0x40000000u;
-
 class Engine {
 public:
     // lanes: how many add_lane() blocks the K/V pool has room for on top of max_ctx positions
@@ -54,7 +50,7 @@ public:
     // the n-gram rows verify(tokens) will read, read ahead into the cache (FNX_NGRAM=disk: decode's next window as its
     // tokens become known, while the draft layer runs); nothing in RAM mode or for the 27B
     void ngram_prefetch(const std::vector<int>& tokens) const;
-    bool ngram_reads_ahead() const;   // ngram_prefetch reads anything: FNX_NGRAM=disk, Flash-Next
+    bool ngram_reads_ahead() const;   // ngram_prefetch reads anything: PleRows::reads_ahead, Flash-Next
     void commit(int n);
     // the last window's head logits, T rows of the whole vocabulary (the cards' slices put together)
     std::vector<float> last_logits(int T) const;
@@ -253,7 +249,8 @@ private:
         int* mtp_ctl;
         float* ple;
         float* ngram_late;     // FNX_NGRAM=disk, verify: the window's n-gram rows, mapped (the cards read them in place)
-        unsigned* ngram_flag;  // mapped: the window's tag once ngram_late holds its rows, ~tag until then
+        unsigned* ngram_flag;  // mapped: the window's tag once ngram_late holds its rows, ~tag until then. verify sets
+                               // it around its launch, the window graphs' only one: another launch site must too
         int* ctl;
         float* bv;
         int* bi;

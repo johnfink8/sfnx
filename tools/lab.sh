@@ -82,8 +82,9 @@ hold() {   # model
     echo "$1" > "$DIR/hold.model"
     # the holder runs no kernels, so it never reads the n-gram table: left on the disk (FNX_NGRAM=disk), each worker
     # places it by its own FNX_NGRAM. Locked here too, Q8's 55 GB beside its NUMA-bound expert copies left card 2's
-    # node without room for them ("store: create (1024 MiB at location 5): out of memory")
-    unit fnx-hold "$HLOG" -E FNX_NGRAM=disk -- "$(pwd)/bin/fnx_hold" "$1" "$SOCK"
+    # node without room for them ("store: create (1024 MiB at location 5): out of memory"). A caller's FNX_NGRAM wins:
+    # on a rotational disk, where disk mode refuses, FNX_NGRAM=ram is the way through
+    unit fnx-hold "$HLOG" -E FNX_NGRAM="${FNX_NGRAM:-disk}" -- "$(pwd)/bin/fnx_hold" "$1" "$SOCK"
     wait_for fnx-hold "$HLOG" "^== holding" 6000 || return 1
     # for the next estimate: the disk rate when the disk gave nearly all of the weights, and how long this load took
     r=$(sed -n 's/.*GB from the disk at \([0-9.]*\) GB\/s.*/\1/p' "$HLOG" | tail -1)

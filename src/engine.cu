@@ -41,8 +41,8 @@ template <typename T> T* hmapped(size_t n) {
 }
 
 // layer 1's n-gram rows from the host once it says they are there (*flag == the window's tag, ctl[1]). The host's
-// failure (want ^ NGRAM_ABORT) and a flag that never comes in 10 s set the window's error bits (64, 32) and leave the
-// rows unread: the window runs on to its end and verify throws
+// failure (want ^ NGRAM_ABORT) and a flag that never comes in NGRAM_WAIT_S set the window's error bits (64, 32) and
+// leave the rows unread: the window runs on to its end and verify throws
 __global__ void ngram_wait_copy_k(const volatile unsigned* flag, const int* ctl, const volatile float* src, float* dst, int n,
                                   unsigned* err) {
     __shared__ int ok;
@@ -52,7 +52,10 @@ __global__ void ngram_wait_copy_k(const volatile unsigned* flag, const int* ctl,
         asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
         ok = 0;
         for (;;) {
-            const unsigned f = *flag;
+            // acquire at system scope: the rows the host wrote before its release store are visible to this thread,
+            // and the __syncthreads below carries that to the block's other threads
+            unsigned f;
+            asm volatile("ld.acquire.sys.u32 %0, [%1];" : "=r"(f) : "l"(flag) : "memory");
             if (f == want) {
                 ok = 1;
                 break;
@@ -62,13 +65,12 @@ __global__ void ngram_wait_copy_k(const volatile unsigned* flag, const int* ctl,
                 break;
             }
             asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-            if (t - t0 > 10000000000ull) {
+            if (t - t0 > NGRAM_WAIT_S * 1000000000ull) {
                 atomicOr(err, 32u);
                 break;
             }
             __nanosleep(256);
         }
-        __threadfence_system();
     }
     __syncthreads();
     if (!ok) return;
@@ -793,7 +795,7 @@ void Engine::rows_upload(CardBuf& b, int T) {
 // decode's last cold n-gram read (the last draft's rows, known only when the draft layer ends) cost prose2 0.45 ms a
 // round on this box's NVMe before the window started; read behind layer 0 instead
 bool Engine::ngram_late() const { return m_.ple_rows->mode() == PleRows::Mode::DISK; }
-bool Engine::ngram_reads_ahead() const { return m_.ple_rows->mode() == PleRows::Mode::DISK; }
+bool Engine::ngram_reads_ahead() const { return m_.ple_rows->reads_ahead(); }
 
 
 void Engine::embed_tokens_into(int r, int k, int p0, const std::function<int(int)>& tok_at) {
@@ -815,7 +817,7 @@ void Engine::ngram_rows_late(int k, int p0, const std::function<int(int)>& tok_a
 }
 
 void Engine::ngram_prefetch(const std::vector<int>& tokens) const {
-    if (m_.ple_rows->mode() != PleRows::Mode::DISK || tokens.empty()) return;
+    if (!ngram_reads_ahead() || tokens.empty()) return;
     // the positions verify(tokens) embeds, read as it reads them
     const int h0 = (int) history_.size(), T = (int) tokens.size();
     std::vector<uint64_t> rows((size_t) T * PLE_HEADS);
@@ -835,14 +837,13 @@ void Engine::ple_dequant(int p0, int T, const std::function<int(int)>& tok_at_ce
     static const int8_t kv4[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
     const Tensor& pt = *m_.ple_table;
     const size_t prb = m_.ple_rows->row_bytes();
-    // every row of the window first, then their bytes in one gather: from the disk (FNX_NGRAM=disk) the misses are read
-    // together, by as many threads as there are. The PLE n-grams read an image cell as the model's image token
+    // one gather for the window: from the disk (FNX_NGRAM=disk) its misses are read together, by as many threads as
+    // there are. The PLE n-grams read an image cell as the model's image token
     std::vector<uint64_t> rows((size_t) T * PLE_HEADS);
     ple_window_rows(m_.ple, p0, T, [&](int q) -> int64_t {
         const int t = tok_at_cell(q);
         return t >= IMAGE_TOK ? m_.ple_image : t;
     }, rows.data());
-    // RAM mode reads each row in place in the locked mapping; the disk's rows come gathered into raw
     const bool ram = m_.ple_rows->mode() == PleRows::Mode::RAM;
     std::vector<uint8_t> raw;
     if (!ram) {

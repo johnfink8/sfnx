@@ -75,6 +75,8 @@ public:
     // DISK: the rows read into the cache on a thread of their own, for a gather to come (decode: the next window's
     // tokens as they become known, while the draft layer runs); RAM: nothing
     void prefetch(std::vector<uint64_t> rows);
+    // prefetch reads anything: DISK with a row cache to read into (FNX_NGRAM_CACHE_MIB=0 has none)
+    bool reads_ahead() const { return mode_ == Mode::DISK && sets_ > 0; }
     Stats stats() const;
     // DISK: time `pages` random reads of the table's pages, cold (O_DIRECT): "N reads/s, p50 X us, p99 Y us"
     std::string probe(int pages);

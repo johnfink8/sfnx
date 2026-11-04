@@ -312,6 +312,12 @@ struct RingMoe {
     const float* logits = nullptr;
 };
 
+// FNX_NGRAM=disk, verify: the n-gram flag's value for "the rows will not come" (the host's read failed): the window's
+// tag with this bit flipped, never the tag nor ~tag (its value before the rows). The cards give up on the rows after
+// NGRAM_WAIT_S (Ring::err bit 32; the abort is bit 64)
+constexpr unsigned NGRAM_ABORT = 0x40000000u;
+constexpr int NGRAM_WAIT_S = 10;
+
 // the sum across the cards (ring; words of two fp16 values and a tag); bufs are this card's receive buffers, peers'
 // via P2P
 struct Ring {

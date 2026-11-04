@@ -116,6 +116,9 @@ PleRows::PleRows(const Gguf& g, const Tensor& t, Mode mode) : mode_(mode), t_(t)
         stop_threads();
         std::free(slab_);
         ::close(fd_);
+        if (started == (size_t) threads_)
+            throw std::runtime_error("n-gram table: the " + std::to_string(threads_) +
+                                     " read threads started, the read-ahead thread did not: " + e.what());
         throw std::runtime_error("n-gram table: " + std::to_string(started) + " of " + std::to_string(threads_) +
                                  " read threads started (FNX_NGRAM_THREADS), then: " + e.what());
     }
@@ -254,7 +257,7 @@ void PleRows::insert(uint64_t row, const uint8_t* src) {
 }
 
 void PleRows::prefetch(std::vector<uint64_t> rows) {
-    if (mode_ != Mode::DISK || rows.empty()) return;
+    if (!reads_ahead() || rows.empty()) return;
     {
         std::lock_guard<std::mutex> l(pf_m_);
         pf_next_ = std::move(rows);
