@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <vector>
 
@@ -16,14 +17,16 @@ int main(int argc, char** argv) {
         std::vector<float> x(cols * tokens, 1.0f);
         std::vector<float> initial(ldo * tokens, -913.0f);
         std::vector<__half> weight(cols * rows);
-        float *dx = nullptr, *scales = nullptr, *a = nullptr, *b = nullptr;
-        __half *xh = nullptr, *w = nullptr;
+        float *dx = nullptr, *scales = nullptr, *a = nullptr, *b = nullptr, *plain = nullptr;
+        __half *xh = nullptr, *w = nullptr, *plain_xh = nullptr;
         ckc(cudaMalloc(&dx, x.size() * sizeof(float)), "allocate input");
         ckc(cudaMalloc(&xh, x.size() * sizeof(__half)), "allocate converted input");
+        ckc(cudaMalloc(&plain_xh, x.size() * sizeof(__half)), "allocate baseline input");
         ckc(cudaMalloc(&w, weight.size() * sizeof(__half)), "allocate weights");
         ckc(cudaMalloc(&scales, tokens * sizeof(float)), "allocate scales");
         ckc(cudaMalloc(&a, ldo * tokens * sizeof(float)), "allocate output A");
         ckc(cudaMalloc(&b, ldo * tokens * sizeof(float)), "allocate output B");
+        ckc(cudaMalloc(&plain, ldo * tokens * sizeof(float)), "allocate baseline output");
         cudaStream_t stream;
         ckc(cudaStreamCreate(&stream), "create stream");
         cublasHandle_t blas;
@@ -64,10 +67,18 @@ int main(int argc, char** argv) {
                         ckc(cudaGraphExecDestroy(executable), "destroy graph executable");
                         ckc(cudaGraphDestroy(captured), "destroy graph");
                     }
-                    std::vector<float> out_a(ldo * tokens), out_b(ldo * tokens);
+                    // The other tokens in a mixed batch must retain the ordinary
+                    // path's exact result, even if some inputs in the batch overflow.
+                    k_f32_f16<<<grid_for(x.size()), 256, 0, stream>>>(dx, x.size(), plain_xh);
+                    const float one = 1.0f, zero = 0.0f;
+                    ckb(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, rows, tokens, cols, &one, w, CUDA_R_16F, cols,
+                                     plain_xh, CUDA_R_16F, cols, &zero, plain, CUDA_R_32F, ldo,
+                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP), "baseline gemm");
+                    std::vector<float> out_a(ldo * tokens), out_b(ldo * tokens), out_plain(ldo * tokens);
                     float scale[tokens] = {};
                     ckc(cudaMemcpyAsync(out_a.data(), a, out_a.size() * sizeof(float), cudaMemcpyDeviceToHost, stream), "copy output A");
                     ckc(cudaMemcpyAsync(out_b.data(), b, out_b.size() * sizeof(float), cudaMemcpyDeviceToHost, stream), "copy output B");
+                    ckc(cudaMemcpyAsync(out_plain.data(), plain, out_plain.size() * sizeof(float), cudaMemcpyDeviceToHost, stream), "copy baseline output");
                     ckc(cudaMemcpyAsync(scale, scales, sizeof(scale), cudaMemcpyDeviceToHost, stream), "copy scales");
                     ckc(cudaStreamSynchronize(stream), "outputs ready");
                     if (scale[0] != 1.0f || scale[3] != 1.0f || scale[1] != scale[2] || scale[9] != scale[1] ||
@@ -82,6 +93,9 @@ int main(int argc, char** argv) {
                                 if (!std::isfinite(v) || std::abs(v - ref) > 0.001 * (1.0 + std::abs(ref)))
                                     throw std::runtime_error("scaled result disagrees with float reference");
                             }
+                            if (scale[t] == 1.0f &&
+                                std::memcmp(&out_a[t * ldo + r], &out_plain[t * ldo + r], sizeof(float)) != 0)
+                                throw std::runtime_error("ordinary row differs from the baseline gemm");
                         }
                         for (int r = rows; r < ldo; ++r)
                             if (out_a[t * ldo + r] != -913.0f || out_b[t * ldo + r] != -913.0f)
@@ -97,7 +111,7 @@ int main(int argc, char** argv) {
         }
         ckb(cublasDestroy(blas), "destroy handle");
         ckc(cudaStreamDestroy(stream), "destroy stream");
-        cudaFree(b); cudaFree(a); cudaFree(scales); cudaFree(w); cudaFree(xh); cudaFree(dx);
+        cudaFree(plain); cudaFree(b); cudaFree(a); cudaFree(scales); cudaFree(w); cudaFree(plain_xh); cudaFree(xh); cudaFree(dx);
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
