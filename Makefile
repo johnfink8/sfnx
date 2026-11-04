@@ -41,7 +41,7 @@ MAKEFLAGS += --no-builtin-rules
 .SUFFIXES:
 build: bin/sfnx bin/sfnx-vision
 test-bin: bin/fnx_run bin/batch_test bin/cache_test bin/sample_test bin/gguf_test bin/topk_test bin/sfnx_input_test bin/batch_plan_test \
-          bin/stage_test bin/pf_ring_plan_test bin/rope_test bin/card_check_test
+          bin/stage_test bin/pf_ring_plan_test bin/rope_test bin/card_check_test bin/ple_test
 CONFIG ?= serve/sfnx.json
 # The config is checked as the front end checks it before loading anything (front.check_config), so a config it would
 # refuse stops the install rather than a boot; what needs the model (the context against its trained length) the engine
@@ -108,6 +108,8 @@ STAMPS := build/ncard build/arch build/cuda build/model
 
 bin/gguf_test: tools/gguf_test.cpp src/gguf.cpp src/gguf.hpp src/rope_gguf.hpp build/model
 	mkdir -p bin && g++-14 -O2 -std=c++17 -DFNX_27B=$(FNX_27B) -o $@ tools/gguf_test.cpp src/gguf.cpp
+bin/ple_test: tools/ple_test.cpp tools/ref_tokens.hpp src/ple_io.cpp src/ple_io.hpp src/env.hpp src/gguf.cpp src/gguf.hpp build/model
+	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -pthread -DFNX_27B=$(FNX_27B) -o $@ tools/ple_test.cpp src/ple_io.cpp src/gguf.cpp
 bin/stage_test: tools/stage_test.cpp src/gguf.cpp src/gguf.hpp build/model
 	mkdir -p bin && g++-14 -O2 -std=c++17 -DFNX_27B=$(FNX_27B) -o $@ tools/stage_test.cpp src/gguf.cpp -lpthread
 bin/sfnx_input_test: tools/sfnx_input_test.cpp tools/sfnx_input.hpp
@@ -132,7 +134,7 @@ KPARTS := 0 1 2 3 4 5 6 7 8
 KERN_OBJ := $(foreach p,$(KPARTS),build/kernels_p$(p).o)
 # the 27B's Engine (engine.hpp's interface) is its own: s27_engine.cu and its prompt path; everything else links shared
 ENG_MODEL := $(if $(filter 1,$(FNX_27B)),s27_,)
-ENG_OBJ := build/gguf.o build/model.o build/store.o $(KERN_OBJ) build/moe_mma.o build/$(ENG_MODEL)engine.o build/engine_common.o build/peer_probe.o build/$(ENG_MODEL)prefill.o build/session.o build/batch.o
+ENG_OBJ := build/gguf.o build/model.o build/ple_io.o build/store.o $(KERN_OBJ) build/moe_mma.o build/$(ENG_MODEL)engine.o build/engine_common.o build/peer_probe.o build/$(ENG_MODEL)prefill.o build/session.o build/batch.o
 PIC := -Xcompiler -fPIC
 build/kernels_p%.o: src/kernels.cu $(STAMPS)
 	@mkdir -p build
@@ -151,7 +153,7 @@ build/tool_%.o: tools/%.cu $(STAMPS)
 	$(NVCC) $(NVFLAGS) $(PIC) -MD -MF build/tool_$*.d -c -o $@ $<
 -include $(wildcard build/*.d)
 
-bin/load_probe: build/tool_load_probe.o build/gguf.o build/model.o build/store.o
+bin/load_probe: build/tool_load_probe.o build/gguf.o build/model.o build/ple_io.o build/store.o
 	@mkdir -p bin
 	$(NVCC) $(NVFLAGS) -o $@ $^ -lcuda
 bin/s27_run: build/tool_s27_run.o $(ENG_OBJ)
@@ -168,7 +170,7 @@ bin/sfnx: build/tool_sfnx.o $(ENG_OBJ)
 	$(NVCC) $(NVFLAGS) -o $@ $^ -lcublas -lcuda -lpthread
 bin/fnx_run bin/sample_test bin/cache_test bin/lanes_test bin/batch_test: bin/%: build/tool_%.o $(ENG_OBJ)
 	@mkdir -p bin
-	$(NVCC) $(NVFLAGS) -o $@ $^ -lcublas -lcuda
+	$(NVCC) $(NVFLAGS) -o $@ $^ -lcublas -lcuda -lpthread
 
 # the lab (tools/fnx_lab.cpp): bin/fnx_lab keeps the model loaded and runs fnx_run's commands from build/libfnx_lab.so,
 # which holds the engine and is reloaded after a rebuild; both use the shared CUDA runtime, and the lab exports the
@@ -180,12 +182,12 @@ build/pic/tool_fnx_run.o: tools/fnx_run.cpp $(STAMPS)
 -include $(wildcard build/pic/*.d)
 build/libfnx_lab.so: $(LAB_OBJ)
 	$(NVCC) $(NVFLAGS) -shared -cudart shared -o $@.new $^ -lcublas -lcuda && mv -f $@.new $@
-bin/fnx_lab: build/tool_fnx_lab.o build/gguf.o build/model.o build/store.o build/libfnx_lab.so
+bin/fnx_lab: build/tool_fnx_lab.o build/gguf.o build/model.o build/ple_io.o build/store.o build/libfnx_lab.so
 	@mkdir -p bin
-	$(NVCC) $(NVFLAGS) -cudart shared -Xlinker -export-dynamic -o $@ build/tool_fnx_lab.o build/gguf.o build/model.o build/store.o -ldl -lcuda
+	$(NVCC) $(NVFLAGS) -cudart shared -Xlinker -export-dynamic -o $@ build/tool_fnx_lab.o build/gguf.o build/model.o build/ple_io.o build/store.o -ldl -lcuda
 .PHONY: lab
 # bin/fnx_hold: the lab's holder (the weights in shared memory, src/store.hpp; tools/lab.sh starts it)
-bin/fnx_hold: build/tool_fnx_hold.o build/gguf.o build/model.o build/store.o
+bin/fnx_hold: build/tool_fnx_hold.o build/gguf.o build/model.o build/ple_io.o build/store.o
 	@mkdir -p bin
 	$(NVCC) $(NVFLAGS) -cudart shared -o $@ $^ -lcuda
 lab: bin/fnx_lab bin/fnx_hold build/libfnx_lab.so
@@ -193,7 +195,7 @@ lab: bin/fnx_lab bin/fnx_hold build/libfnx_lab.so
 # (tools/lab_proto.hpp). A new hash names a new stamp file, which rebuilds both objects. A count other than 3 joins the
 # hash (a two-card worker refuses a three-card holder); three cards' hash is the sources' alone, so prod's holder
 # stamp follows only the loader's code
-LOADER_SRC := src/model.cpp src/model.hpp src/card_split.hpp src/gguf.cpp src/gguf.hpp src/store.cpp src/store.hpp tools/lab_proto.hpp
+LOADER_SRC := src/model.cpp src/model.hpp src/ple_io.cpp src/ple_io.hpp src/card_split.hpp src/gguf.cpp src/gguf.hpp src/store.cpp src/store.hpp tools/lab_proto.hpp
 $(if $(filter-out $(wildcard $(LOADER_SRC)),$(LOADER_SRC)),$(error loader sources missing: $(filter-out $(wildcard $(LOADER_SRC)),$(LOADER_SRC))))
 LOADER_REV := $(shell { cat $(LOADER_SRC); [ $(FNX_NCARD) = 3 ] || echo ncard $(FNX_NCARD); } | sha1sum | cut -c1-16)
 build/loader_rev.$(LOADER_REV):

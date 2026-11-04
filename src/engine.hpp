@@ -47,6 +47,10 @@ public:
     // the same without advancing: a speculative window (the last token, then drafts). commit(n) keeps its first n rows
     // (1 <= n <= T): the state is cut back to after row n - 1, pos() advances by n. Every verify needs its commit.
     std::vector<int> verify(const std::vector<int>& tokens);
+    // the n-gram rows verify(tokens) will read, read ahead into the cache (FNX_NGRAM=disk: decode's next window as its
+    // tokens become known, while the draft layer runs); nothing in RAM mode or for the 27B
+    void ngram_prefetch(const std::vector<int>& tokens) const;
+    bool ngram_reads_ahead() const;   // ngram_prefetch reads anything: PleRows::reads_ahead, Flash-Next
     void commit(int n);
     // the last window's head logits, T rows of the whole vocabulary (the cards' slices put together)
     std::vector<float> last_logits(int T) const;
@@ -244,6 +248,9 @@ private:
         float* mtp_emb;
         int* mtp_ctl;
         float* ple;
+        float* ngram_late;     // FNX_NGRAM=disk, verify: the window's n-gram rows, mapped (the cards read them in place)
+        unsigned* ngram_flag;  // mapped: the window's tag once ngram_late holds its rows, ~tag until then. verify sets
+                               // it around its launch, the window graphs' only one: another launch site must too
         int* ctl;
         float* bv;
         int* bi;
@@ -268,9 +275,17 @@ private:
     // window's (null for one lane's), which a model refuses rows in by that name. rows_upload: a window's T rows to b
     void embed_into(int r, int k, int p0, const std::function<int(int)>& tok_at, const char* batched);
     void rows_upload(CardBuf& b, int T);
+    // verify with the n-gram table on the disk (Flash-Next, FNX_NGRAM=disk; never the 27B): the window is launched with
+    // its token rows only (embed_tokens_into, rows_upload_tokens) and layer 1 waits on the cards for ngram_rows_late,
+    // which the host reads after the launch, behind layer 0
+    bool ngram_late() const;
+    void embed_tokens_into(int r, int k, int p0, const std::function<int(int)>& tok_at);
+    void rows_upload_tokens(CardBuf& b, int T);
+    void ngram_rows_late(int k, int p0, const std::function<int(int)>& tok_at, unsigned tag);
     // rows at positions p0 .. p0 + T - 1 (tok_at: the token at a position, for the row's and the PLE n-grams'): the
     // token embedding (one stream, rows of N) and the PLE rows (rows of N)
     void embed_rows(int p0, int T, const std::function<int(int)>& tok_at, float* emb, float* ple) const;
+    void ple_dequant(int p0, int T, const std::function<int(int)>& tok_at, float* ple) const;   // Flash-Next: embed_rows' PLE half
     void embed_token(int tok, int cell, float* out) const;   // one token's embedding (N); an image cell's row
     std::vector<int> graph_key(const std::vector<int>& lanes) const;   // a window graph's: the lanes, their tables, cache_live()
     // the expert cache can miss: experts in RAM, or an arena lending (with nothing lent every expert is in a slot and
