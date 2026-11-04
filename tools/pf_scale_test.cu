@@ -11,7 +11,7 @@ int main(int argc, char** argv) {
     try {
         const int card = argc > 1 ? std::stoi(argv[1]) : 0;
         ckc(cudaSetDevice(card), "select card");
-        constexpr int cols = 128, rows = 300, tokens = 4, ldo = 304;
+        constexpr int cols = 128, rows = 701, tokens = 12, ldo = 705;
         std::vector<float> x(cols * tokens, 1.0f);
         std::vector<float> initial(ldo * tokens, -913.0f);
         std::vector<__half> weight(cols * rows);
@@ -43,6 +43,7 @@ int main(int argc, char** argv) {
                     x[cols] = outlier;
                     x[cols * 2] = -outlier;
                     x[cols * 3] = 0.0f;
+                    x[cols * 9] = outlier;   // exercise the fallback's token loop past its first grid group
                     ckc(cudaMemcpyAsync(dx, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "copy input");
                     ckc(cudaMemcpyAsync(a, initial.data(), initial.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "clear output A");
                     ckc(cudaMemcpyAsync(b, initial.data(), initial.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "clear output B");
@@ -67,7 +68,7 @@ int main(int argc, char** argv) {
                     ckc(cudaMemcpyAsync(out_b.data(), b, out_b.size() * sizeof(float), cudaMemcpyDeviceToHost, stream), "copy output B");
                     ckc(cudaMemcpyAsync(scale, scales, sizeof(scale), cudaMemcpyDeviceToHost, stream), "copy scales");
                     ckc(cudaStreamSynchronize(stream), "outputs ready");
-                    if (scale[0] != 1.0f || scale[3] != 1.0f || scale[1] != scale[2] ||
+                    if (scale[0] != 1.0f || scale[3] != 1.0f || scale[1] != scale[2] || scale[9] != scale[1] ||
                         (magnitude == 0 && scale[1] != 1.0f) || (magnitude == 1 && scale[1] != 4.0f) ||
                         (magnitude == 2 && scale[1] <= 4.0f))
                         throw std::runtime_error("unexpected per-row scale");

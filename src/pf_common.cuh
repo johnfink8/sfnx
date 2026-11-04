@@ -112,18 +112,19 @@ static __global__ void k_pf_scale_output(float* __restrict__ out, int rows, int 
 // Scaling makes an outlier representable in f16 but can erase smaller values
 // in the same row. Recompute exceptional rows from the original f32 inputs.
 // The common unscaled rows keep the existing tensor-core result.
-static __global__ void k_pf_gemm_f32_exception(const __half* __restrict__ W, int rows, int cols,
+static __global__ void k_pf_gemm_f32_exception(const __half* __restrict__ W, int rows, int cols, int count,
                                                 const float* __restrict__ X, int ldo,
                                                 const float* __restrict__ scales, float* __restrict__ out) {
-    const int t = (int) blockIdx.x;
-    if (scales[t] <= 1.0f) return;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    for (int r = warp; r < rows; r += 8) {
-        float sum = 0.0f;
-        for (int c = lane; c < cols; c += 32)
-            sum = fmaf(__half2float(W[(size_t) r * cols + c]), X[(size_t) t * cols + c], sum);
-        for (int offset = 16; offset > 0; offset /= 2) sum += __shfl_down_sync(0xffffffffu, sum, offset);
-        if (lane == 0) out[(size_t) t * ldo + r] = sum;
+    for (int t = (int) blockIdx.y; t < count; t += (int) gridDim.y) {
+        if (scales[t] <= 1.0f) continue;
+        for (int r = (int) blockIdx.x * 8 + warp; r < rows; r += (int) gridDim.x * 8) {
+            float sum = 0.0f;
+            for (int c = lane; c < cols; c += 32)
+                sum = fmaf(__half2float(W[(size_t) r * cols + c]), X[(size_t) t * cols + c], sum);
+            for (int offset = 16; offset > 0; offset /= 2) sum += __shfl_down_sync(0xffffffffu, sum, offset);
+            if (lane == 0) out[(size_t) t * ldo + r] = sum;
+        }
     }
 }
 
@@ -136,7 +137,8 @@ inline void pf_scaled_gemm(cublasHandle_t blas, const __half* W, int rows, int c
                      CUBLAS_GEMM_DEFAULT_TENSOR_OP), "scaled gemm");
     k_pf_scale_output<<<grid_for((size_t) rows * C), 256, 0, s>>>(out, rows, C, ldo, scales);
     ckc(cudaGetLastError(), "restore activation scale");
-    k_pf_gemm_f32_exception<<<(unsigned) C, 256, 0, s>>>(W, rows, cols, original, ldo, scales, out);
+    const dim3 exceptional_grid((unsigned) std::min((rows + 7) / 8, 80), (unsigned) std::min(C, 8));
+    k_pf_gemm_f32_exception<<<exceptional_grid, 256, 0, s>>>(W, rows, cols, C, original, ldo, scales, out);
     ckc(cudaGetLastError(), "recompute exceptional activations");
 }
 
