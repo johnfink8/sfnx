@@ -5,6 +5,7 @@
 
 #include <functional>
 #include <map>
+#include <string>
 #include <vector>
 
 #include "kernels.hpp"
@@ -155,6 +156,12 @@ inline const char* window_error(unsigned err, bool draft) {
     if (err & 2u) return "a ring sum met a NaN or inf (or, on the fp16 ring, a value past its range)";
     if (err & 4u) return "an hc read's grid barrier timed out";
     if (err & 16u) return draft ? "the draft layer's logits hold a NaN or inf" : "the head's logits hold a NaN or inf";
+    if (err & 32u) {
+        static const std::string m = "layer 1's n-gram rows did not come from the host in " + std::to_string(NGRAM_WAIT_S) +
+                                     " s (FNX_NGRAM=disk)";
+        return m.c_str();
+    }
+    if (err & 64u) return "the host's n-gram rows failed after the window started (FNX_NGRAM=disk)";
     if (err) return "an error bit no message names";
     return nullptr;
 }

@@ -24,6 +24,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <future>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -890,9 +892,14 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
     const int h0 = (int) history_.size();
     const auto tok_at = [&](int q) -> int { return q < h0 ? history_[q] : tokens[q - h0]; };
     const size_t nt = tokens.size(), per = (size_t) K * pf_c_;
-    auto chunks_of = [&](size_t i0, int half) {
+    // FNX_NGRAM=disk: the first pass's rows are read before anything runs to hide them (~1.6 s for 16,384 rows on this
+    // box's NVMe), so the passes start at one chunk and double: a pass hides the next one's reads while those take less
+    // than its GPU time (~0.1 ms of reads against ~0.26 ms a row), and a one-chunk pass followed by a whole one did not
+    // (2.0 s for the one chunk's 1.06)
+    const size_t first = m_.ple_rows->mode() == PleRows::Mode::DISK ? std::min(per, (size_t) pf_c_) : per;
+    auto chunks_of = [&](size_t i0, int half, size_t span) {
         std::vector<PfChunk> ch;
-        for (size_t i = i0; i < std::min(nt, i0 + per); i += pf_c_) {
+        for (size_t i = i0; i < std::min(nt, i0 + span); i += pf_c_) {
             const size_t e = std::min(nt, i + pf_c_);
             ch.push_back({std::vector<int>(tokens.begin() + i, tokens.begin() + e), e < nt ? tokens[e] : after, half * K + (int) ch.size()});
         }
@@ -905,11 +912,12 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
             i += c.tokens.size();
         }
     };
-    std::vector<PfChunk> ch = chunks_of(0, 0);
+    std::vector<PfChunk> ch = chunks_of(0, 0, first);
     embed(0, ch);
-    for (size_t i = 0, k = 0; i < nt; i += per, ++k) {
-        std::vector<PfChunk> next = chunks_of(i + per, (int) ((k + 1) & 1));
-        prefill_pass(ch, staging, [&] { embed(i + per, next); });
+    for (size_t i = 0, k = 0, span = first, grown = 0; i < nt; i += span, span = grown, ++k) {
+        grown = std::min(per, 2 * span);
+        std::vector<PfChunk> next = chunks_of(i + span, (int) ((k + 1) & 1), grown);
+        prefill_pass(ch, staging, [&] { embed(i + span, next); });
         size_t e = i;
         for (const PfChunk& c : ch) {
             e += c.tokens.size();
@@ -927,6 +935,11 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
     for (int j = 0; j < nk; ++j) pos0[(size_t) j] = pos_ + rows, rows += (int) chunks[(size_t) j].tokens.size();
     if (pos_ + rows > max_ctx_) throw Refused("prefill: context full");
     ensure_pages(pos_ + rows);
+    // the next pass's rows on a thread of their own from here: enqueueing this pass keeps this one busy for ~70% of the
+    // pass (3.8 of 5.5 s for 16,384 rows), and FNX_NGRAM=disk's reads (~1.7 s for those rows on this box's NVMe) after it
+    // went unhidden: a cold 62,793-token read 23.1 s against 17.1 s with every row cached. It writes only the other
+    // half's buffers and reads what this pass leaves alone (the tokens, history_ until the pass ends)
+    std::future<void> next_rows = std::async(std::launch::async, between);
     const float eps = m_.eps;
     // each chunk's (position, tag) and each group's: a tag per group, so the recurrent history's parity steps per group
     for (int j = 0; j < nk; ++j) {
@@ -1183,7 +1196,14 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
             prefill_draft(C, set);
         }
     const auto t_enq = std::chrono::steady_clock::now();
-    between();
+    // the next pass's rows (FNX_NGRAM=disk reads them, and a read can fail): its error waits until this pass has drained,
+    // so no caller that survives it (the lab's worker) goes on beside a pass still running
+    std::exception_ptr between_err;
+    try {
+        next_rows.get();
+    } catch (...) {
+        between_err = std::current_exception();
+    }
     unsigned err = 0;
     // bounded: a copy-engine ring step waits on its flag without a timeout of its own
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
@@ -1200,6 +1220,14 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
         ckc(cudaMemcpy(&e, b.ring.err, 4, cudaMemcpyDeviceToHost), "err");
         err |= e;
     });
+    if (between_err && err) {
+        try {
+            std::rethrow_exception(between_err);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(std::string(e.what()) + "; and in the same pass, prefill: ring error " + std::to_string(err));
+        }
+    }
+    if (between_err) std::rethrow_exception(between_err);
     if (err) throw std::runtime_error("prefill: ring error " + std::to_string(err));
     const auto t_main = std::chrono::steady_clock::now();
     if (mtp_ && draft8)

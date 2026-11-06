@@ -24,12 +24,71 @@
 namespace fnx {
 
 
+namespace {
+// page-locked, mapped and portable: every card reads it in place, at the same address as the host's (UVA)
+template <typename T> T* hmapped(size_t n) {
+    void* p = nullptr;
+    const cudaError_t e = cudaHostAlloc(&p, n * sizeof(T), cudaHostAllocPortable | cudaHostAllocMapped);
+    if (e != cudaSuccess) {
+        cudaGetLastError();
+        throw std::runtime_error(std::string("cudaHostAlloc (mapped) of ") + std::to_string(n * sizeof(T)) + " bytes: " + cudaGetErrorString(e));
+    }
+    own_pinned(p);
+    void* dp = nullptr;
+    ck(cudaHostGetDevicePointer(&dp, p, 0), "mapped pointer");
+    if (dp != p) throw std::runtime_error("mapped host memory has another address on the cards (no UVA): FNX_NGRAM=disk needs it");
+    return (T*) p;
+}
+
+// layer 1's n-gram rows from the host once it says they are there (*flag == the window's tag, ctl[1]). The host's
+// failure (want ^ NGRAM_ABORT) and a flag that never comes in NGRAM_WAIT_S set the window's error bits (64, 32) and
+// leave the rows unread: the window runs on to its end and verify throws
+__global__ void ngram_wait_copy_k(const volatile unsigned* flag, const int* ctl, const volatile float* src, float* dst, int n,
+                                  unsigned* err) {
+    __shared__ int ok;
+    if (threadIdx.x == 0) {
+        const unsigned want = (unsigned) ctl[1];
+        unsigned long long t0, t;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+        ok = 0;
+        for (;;) {
+            // acquire at system scope: the rows the host wrote before its release store are visible to this thread,
+            // and the __syncthreads below carries that to the block's other threads
+            unsigned f;
+            asm volatile("ld.acquire.sys.u32 %0, [%1];" : "=r"(f) : "l"(flag) : "memory");
+            if (f == want) {
+                ok = 1;
+                break;
+            }
+            if (f == (want ^ NGRAM_ABORT)) {
+                atomicOr(err, 64u);
+                break;
+            }
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+            if (t - t0 > NGRAM_WAIT_S * 1000000000ull) {
+                atomicOr(err, 32u);
+                break;
+            }
+            __nanosleep(256);
+        }
+    }
+    __syncthreads();
+    if (!ok) return;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
+}
+}  // namespace
+
 Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
     // the 27B build's settings: this Flash-Next engine has none of what they set, so one given is a mistake, not a
     // run of the default
     for (const char* k : {"FNX_PF_SKIP", "FNX_PF_SKIP_CONFIRM", "FNX_PF_SCORE_MIB", "FNX_PF_WINDOWS", "FNX_PF_SCORES",
                           "FNX_KV_PAGES", "FNX_KV_RESERVE_MIB"})
         if (std::getenv(k)) throw std::runtime_error(std::string(k) + " is the 27B's: Flash-Next has nothing it sets");
+    if (!m.ple_rows) throw std::runtime_error("Engine: the model has no n-gram rows (a Load::HOLD model runs no engine)");
+    if (ngram_late()) {   // as the engine is made, so a box that cannot map them refuses at start, not at a first token
+        h_.ngram_late = hmapped<float>((size_t) MAXT * N);
+        h_.ngram_flag = hmapped<unsigned>(1);
+    }
     // the rotary's scaling (choose_rope, src/rope.hpp): the model's own YaRN, FNX_ROPE_SCALE / FNX_YARN_ORIG_CTX, or
     // both when they agree; set once here, before any graph capture. Positions past what the rotary covers have angles
     // the model never saw, so a context past that is refused here rather than served
@@ -734,56 +793,85 @@ void Engine::rows_upload(CardBuf& b, int T) {
     ck(cudaMemcpyAsync(b.ple_emb, h_.ple, (size_t) T * N * 4, cudaMemcpyHostToDevice, b.st), "ple");
 }
 
+// decode's last cold n-gram read (the last draft's rows, known only when the draft layer ends) cost prose2 0.45 ms a
+// round on this box's NVMe before the window started; read behind layer 0 instead
+bool Engine::ngram_late() const { return m_.ple_rows->mode() == PleRows::Mode::DISK; }
+bool Engine::ngram_reads_ahead() const { return m_.ple_rows->reads_ahead(); }
+
+void Engine::embed_tokens_into(int r, int k, int p0, const std::function<int(int)>& tok_at) {
+    if (!h_.ngram_late) throw std::runtime_error("embed_tokens_into: the n-gram rows' mapped buffers were never made");
+    std::vector<float> emb(N);
+    for (int j = 0; j < k; ++j) {
+        embed_token(tok_at(p0 + j), p0 + j, emb.data());
+        for (int c = 0; c < HC; ++c) std::memcpy(h_.R0 + (size_t) (r + j) * D + c * N, emb.data(), N * sizeof(float));
+    }
+}
+
+void Engine::rows_upload_tokens(CardBuf& b, int T) {
+    ck(cudaMemcpyAsync(b.R, h_.R0, (size_t) T * D * 4, cudaMemcpyHostToDevice, b.st), "R0");
+}
+
+void Engine::ngram_rows_late(int k, int p0, const std::function<int(int)>& tok_at, unsigned tag) {
+    ple_dequant(p0, k, tok_at, h_.ngram_late);
+    __atomic_store_n(h_.ngram_flag, tag, __ATOMIC_RELEASE);
+}
+
+void Engine::ngram_prefetch(const std::vector<int>& tokens) const {
+    if (!ngram_reads_ahead() || tokens.empty()) return;
+    // the positions verify(tokens) embeds, read as it reads them
+    const int h0 = (int) history_.size(), T = (int) tokens.size();
+    std::vector<uint64_t> rows((size_t) T * PLE_HEADS);
+    ple_window_rows(m_.ple, pos_, T, [&](int q) -> int64_t {
+        const int t = q < h0 ? history_[(size_t) q] : tokens[(size_t) (q - h0)];
+        return t >= IMAGE_TOK ? m_.ple_image : t;
+    }, rows.data());
+    m_.ple_rows->prefetch(std::move(rows));
+}
+
 void Engine::embed_rows(int p0, int T, const std::function<int(int)>& tok_at_cell, float* emb, float* ple) const {
-    std::memset(ple, 0, (size_t) T * N * sizeof(float));
+    for (int t = 0; t < T; ++t) embed_token(tok_at_cell(p0 + t), p0 + t, emb + (size_t) t * N);
+    ple_dequant(p0, T, tok_at_cell, ple);
+}
+
+void Engine::ple_dequant(int p0, int T, const std::function<int(int)>& tok_at_cell, float* ple) const {
     static const int8_t kv4[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
     const Tensor& pt = *m_.ple_table;
-    const size_t prb = pt.row_bytes();
-    // the PLE n-grams read an image cell as the model's image token
-    const auto tok_at = [&](int q) -> int64_t {
+    const size_t prb = m_.ple_rows->row_bytes();
+    // one gather for the window: from the disk (FNX_NGRAM=disk) its misses are read together, by as many threads as
+    // there are. The PLE n-grams read an image cell as the model's image token
+    std::vector<uint64_t> rows((size_t) T * PLE_HEADS);
+    ple_window_rows(m_.ple, p0, T, [&](int q) -> int64_t {
         const int t = tok_at_cell(q);
         return t >= IMAGE_TOK ? m_.ple_image : t;
-    };
-    for (int t = 0; t < T; ++t) {
-        const int p = p0 + t;
-        embed_token(tok_at_cell(p), p, emb + (size_t) t * N);
-        // PLE rows: n-grams of this token and the PLE_ORDERS - 1 before it (EOS / sequence start cut the window)
-        int64_t ctx[PLE_ORDERS];
-        ctx[0] = tok_at(p);
-        bool cut = false;
-        for (int s = 1; s < PLE_ORDERS; ++s) {
-            const int q = p - s;
-            const int64_t tk = q >= 0 ? tok_at(q) : -1;
-            cut = cut || tk < 0 || tk == m_.ple_eos;
-            ctx[s] = cut ? m_.ple_eos : tk;
-        }
-        for (int n = 2; n <= PLE_ORDERS; ++n) {
-            uint64_t mixed = (uint64_t) ctx[0] * m_.ple_mult[0];
-            for (int j = 1; j < n; ++j) mixed ^= (uint64_t) ctx[j] * m_.ple_mult[j];
-            for (int gi = 0; gi < 8; ++gi) {
-                const int h = (n - 2) * 8 + gi;
-                const uint64_t r = mixed % m_.ple_vocab[h] + m_.ple_off[h];
-                const uint8_t* src = pt.data + r * prb;
-                for (int b = 0; b < PLE_DIM / 32; ++b) {
-                    float* dst = &ple[(size_t) t * N + h * PLE_DIM + b * 32];
-                    uint16_t dh;
-                    if (pt.type == T_Q8_0) {
-                        std::memcpy(&dh, src + b * 34, 2);
-                        const float d = h2f(dh);
-                        for (int j = 0; j < 32; ++j) dst[j] = d * (float) (int8_t) src[b * 34 + 2 + j];
-                        continue;
-                    }
-                    std::memcpy(&dh, src + b * 18, 2);   // IQ4_NL
+    }, rows.data());
+    const bool ram = m_.ple_rows->mode() == PleRows::Mode::RAM;
+    std::vector<uint8_t> raw;
+    if (!ram) {
+        raw.resize(rows.size() * prb);
+        m_.ple_rows->gather(rows.data(), rows.size(), raw.data());
+    }
+    for (int t = 0; t < T; ++t)
+        for (int h = 0; h < PLE_HEADS; ++h) {
+            const size_t i = (size_t) t * PLE_HEADS + h;
+            const uint8_t* src = ram ? m_.ple_rows->ram_row(rows[i]) : &raw[i * prb];
+            for (int b = 0; b < PLE_DIM / 32; ++b) {
+                float* dst = &ple[(size_t) t * N + h * PLE_DIM + b * 32];
+                uint16_t dh;
+                if (pt.type == T_Q8_0) {
+                    std::memcpy(&dh, src + b * 34, 2);
                     const float d = h2f(dh);
-                    const uint8_t* qs = src + b * 18 + 2;
-                    for (int j = 0; j < 16; ++j) {
-                        dst[j] = d * kv4[qs[j] & 15];
-                        dst[j + 16] = d * kv4[qs[j] >> 4];
-                    }
+                    for (int j = 0; j < 32; ++j) dst[j] = d * (float) (int8_t) src[b * 34 + 2 + j];
+                    continue;
+                }
+                std::memcpy(&dh, src + b * 18, 2);   // IQ4_NL
+                const float d = h2f(dh);
+                const uint8_t* qs = src + b * 18 + 2;
+                for (int j = 0; j < 16; ++j) {
+                    dst[j] = d * kv4[qs[j] & 15];
+                    dst[j + 16] = d * kv4[qs[j] >> 4];
                 }
             }
         }
-    }
 }
 
 // a sequence's device state on one card, in a fixed order: (pointer, bytes) pieces
@@ -902,6 +990,7 @@ void Engine::enqueue(int T, bool dumps) {
     auto dd = [&](const std::string& name, int layer, const float* p, int n) {
         if (dumps) dump_dev(name, layer, p, T, n);
     };
+    const bool late = ngram_late();
     for (int l = 0; l < NL; ++l) {
         const bool pending = l > 0;
         // ---- attention half
@@ -909,6 +998,10 @@ void Engine::enqueue(int T, bool dumps) {
             const LayerW& L = w.L[l];
             bool apply = pending;
             if (l == PLE_LAYER) {
+                if (late) {
+                    ngram_wait_copy_k<<<1, 1024, 0, b.st>>>(h_.ngram_flag, b.ctl, h_.ngram_late, b.ple_emb, T * N, err_word(b));
+                    ck(cudaGetLastError(), "ngram wait");
+                }
                 hc_write(b.R, b.bo_f, b.inj_f, T, b.st);
                 apply = false;
                 quantize_q8_1(b.ple_emb, b.xq, N, T, b.st);

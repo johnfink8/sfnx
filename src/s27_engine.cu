@@ -437,6 +437,9 @@ int Engine::add_lane() {
     return (int) lanes_.size() - 1;
 }
 
+// the 27B has no n-gram table to read ahead
+void Engine::ngram_prefetch(const std::vector<int>&) const {}
+
 // the 27B has no PLE rows: ple must be null
 void Engine::embed_rows(int p0, int T, const std::function<int(int)>& tok_at_cell, float* emb, float* ple) const {
     if (ple) throw std::runtime_error("27b: embed_rows takes no PLE rows");
@@ -453,6 +456,17 @@ void Engine::embed_into(int r, int k, int p0, const std::function<int(int)>& tok
 
 void Engine::rows_upload(CardBuf& b, int T) {
     ck(cudaMemcpyAsync(b.R, h_.R0, (size_t) T * N * 4, cudaMemcpyHostToDevice, b.st), "R0");
+}
+
+// the 27B has no n-gram table: verify never takes the late path
+bool Engine::ngram_late() const { return false; }
+bool Engine::ngram_reads_ahead() const { return false; }
+void Engine::embed_tokens_into(int, int, int, const std::function<int(int)>&) {
+    throw std::runtime_error("27b: embed_tokens_into (it has no n-gram table)");
+}
+void Engine::rows_upload_tokens(CardBuf&, int) { throw std::runtime_error("27b: rows_upload_tokens (it has no n-gram table)"); }
+void Engine::ngram_rows_late(int, int, const std::function<int(int)>&, unsigned) {
+    throw std::runtime_error("27b: ngram_rows_late (it has no n-gram table)");
 }
 
 // a sequence's device state on one card, in a fixed order: (pointer, bytes) pieces

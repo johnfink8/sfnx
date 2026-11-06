@@ -672,7 +672,11 @@ std::vector<int> Engine::verify(const std::vector<int>& tokens) {
         h_.err = halloc<unsigned>(NCARD);
     }
     const int h0 = (int) history_.size();
-    embed_into(0, T, pos_, [&](int q) -> int { return q < h0 ? history_[(size_t) q] : tokens[(size_t) (q - h0)]; }, nullptr);
+    const std::function<int(int)> tok_at = [&](int q) -> int { return q < h0 ? history_[(size_t) q] : tokens[(size_t) (q - h0)]; };
+    const bool late = ngram_late();
+    std::exception_ptr late_err;   // late: the launch's or the rows' failure, rethrown once the cards drain
+    if (late) embed_tokens_into(0, T, pos_, tok_at);
+    else embed_into(0, T, pos_, tok_at, nullptr);
     const auto t1 = std::chrono::steady_clock::now();
     auto each = [&](auto&& f) {
         for (int c = 0; c < NCARD; ++c) {
@@ -686,7 +690,8 @@ std::vector<int> Engine::verify(const std::vector<int>& tokens) {
     int* bi = h_.bi;
     auto upload = [&](int, CardBuf& b, const CardW&) {
         ck(cudaEventRecord(b.ev0, b.st), "event");
-        rows_upload(b, T);
+        if (late) rows_upload_tokens(b, T);
+        else rows_upload(b, T);
         ck(cudaMemcpyAsync(b.ctl, h_.ctl, 2 * sizeof(int), cudaMemcpyHostToDevice, b.st), "ctl");
     };
     auto download = [&](int c, CardBuf& b, const CardW&) {
@@ -696,6 +701,8 @@ std::vector<int> Engine::verify(const std::vector<int>& tokens) {
         ck(cudaEventRecord(b.ev1, b.st), "event");
     };
     if (dump) {
+        // dumping waits on the cards between layers: the rows are there before anything runs
+        if (late) ngram_rows_late(T, pos_, tok_at, (unsigned) h_.ctl[1]);
         each(upload);
         dump_dev("R0", -1, cb_[0]->R, T, ROW_W);
         enqueue(T, true);
@@ -714,13 +721,51 @@ std::vector<int> Engine::verify(const std::vector<int>& tokens) {
             });
         }
         const auto l0 = std::chrono::steady_clock::now();
-        on_cards([&](int c) {
-            CardBuf& b = *cb_[c];
-            upload(c, b, m_.cards[c]);
-            ck(cudaGraphLaunch(b.win_graphs[T].exec, b.st), "graph launch");
-            download(c, b, m_.cards[c]);
-        });
-        last_launch_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - l0).count();
+        const unsigned tag = (unsigned) h_.ctl[1];
+        if (late) {
+            std::fill(h_.err, h_.err + NCARD, 0u);
+            __atomic_store_n(h_.ngram_flag, ~tag, __ATOMIC_RELEASE);
+        }
+        // a failure once a card may have launched aborts the cards' wait for the rows (an error bit, they run to the
+        // window's end), so none is left spinning; the failure is rethrown after they drain
+        try {
+            on_cards([&](int c) {
+                CardBuf& b = *cb_[c];
+                upload(c, b, m_.cards[c]);
+                ck(cudaGraphLaunch(b.win_graphs[T].exec, b.st), "graph launch");
+                download(c, b, m_.cards[c]);
+            });
+            last_launch_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - l0).count();
+            if (late) ngram_rows_late(T, pos_, tok_at, tag);
+        } catch (...) {
+            if (!late) throw;
+            late_err = std::current_exception();
+            __atomic_store_n(h_.ngram_flag, tag ^ NGRAM_ABORT, __ATOMIC_RELEASE);
+        }
+    }
+    if (late_err) {
+        // a card whose upload failed recorded no ev1 and downloaded no error word (cleared before the launch): drain
+        // without the timings, then the host's failure with what the cards said besides the abort it caused
+        std::string cards;
+        for (int c = 0; c < NCARD; ++c) {
+            try {
+                ck(cudaSetDevice(cb_[c]->dev), "set");
+                ck(cudaStreamSynchronize(cb_[c]->st), "window sync");
+                if (const char* e = window_error(h_.err[c] & ~64u, false)) cards += "; card " + std::to_string(c) + ": " + e;
+            } catch (const std::exception& e) {
+                cards += "; card " + std::to_string(c) + ": " + e.what();
+            }
+        }
+        if (!cards.empty()) {
+            try {
+                std::rethrow_exception(late_err);
+            } catch (const std::exception& e) {
+                throw std::runtime_error(std::string(e.what()) + "; and in the same window" + cards);
+            } catch (...) {
+                throw std::runtime_error("verify: the host's n-gram rows failed (not a std::exception); and in the same window" + cards);
+            }
+        }
+        std::rethrow_exception(late_err);
     }
     unsigned err = 0;
     float gpu_ms = 0.f;

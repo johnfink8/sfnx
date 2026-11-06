@@ -73,6 +73,27 @@ On the current build at 49 GiB in RAM (the lab's `logits` against the same CPU t
 code edit 100.00% / 2.79e-6 / 2.1e-5. Both inside the Q4 bar above — llama.cpp's CPU backend against its CUDA one,
 4.85e-4 and 4.12e-6 — as sFNX's Q4 path is.
 
+## The n-gram table on disk
+
+`FNX_NGRAM=disk` ([docs/memory.md](memory.md#the-n-gram-table-on-disk)) reads the same bytes the mapping holds, so
+its logits are RAM mode's byte for byte:
+
+- Every row gathered from the disk against the mapping's (`bin/ple_test`, CPU, beside a serving engine): long2,
+  long64 and edit1 in 4,096-position calls and one-position calls, Q4_K_XL's 90-byte rows and Q8_0's 170-byte ones
+  (rows that cross a page, gathers of several rounds).
+- `tools/lab.sh exact` with `FNX_NGRAM=disk` (Q4_K_XL): long64, code1, edit1 and the picture byte for byte against
+  the base; `tools/lab.sh batch`: every lane its tokens alone, with and without drafts and sampled.
+- `tools/lab.sh exact` on Q8_0 with prod's Q8 settings: code1 and edit1 byte for byte in both modes (and against
+  llama.cpp's CPU reference as before), and `logits` on long64 (62k tokens) byte for byte between the modes. main's
+  lab cannot hold Q8_0 (its holder locks the table beside the NUMA-bound expert copies: out of memory on card 2's
+  node); this build's holder leaves the table to its workers.
+- Q8_0 served (`serve/sfnx-q8.json`): a 400-token greedy reply the same bytes from main's build and from this one in
+  both modes.
+- Its failure paths, with a preloaded `pread` that fails or stalls the table's O_DIRECT reads on cue (Q4_K_XL, the
+  lab): reads failing mid-decode end the window with the host's I/O error (the cards' layer-1 wait aborted, 6 s, the
+  next request served); one read stalled 12 s ends it with "did not come from the host in 10 s" (error bit 32);
+  reads failing in a prompt end the prompt with the error, and the next prompt reads.
+
 ## The 27B
 
 Qwen3.8-27B Q8_0 (`make FNX_MODEL=27b`, [docs/config.md](config.md#model)). Its bar is its own: the widest gap
@@ -324,6 +345,7 @@ card of another arch than the build's (`src/card_check.hpp`).
 | The card checks at load: a card's compute capability against the build's arch; PCI addresses; BAR1 from a V100's and an RTX 3090's sysfs text and one made from the 3090's at full ReBAR; the text it refuses, signs and over-wide fields included; which cards pass; the link probe's report (a pair left out refused), slow pairs warned and lost words named (CPU) | `bin/card_check_test` |
 | The link probe on the cards (`src/peer_probe.cu`): its watcher's self-check and the healthy path run at every start, prod's included (the rates measured: [docs/config.md](config.md#boot-requirement)); its failure paths need a broken link and have run nowhere, checked by review only | engine start-up |
 | The Makefile's checks of `ARCH` and `FNX_NCARD`: every bad value refused with its message before a stamp is written, a value padded with spaces the same setting (CPU) | `tools/build_guards_check.sh` |
+| The n-gram table read from the disk against the mapping, byte for byte, with its reads' rate (CPU; needs the model) | `bin/ple_test MODEL.gguf ref/long64.bin ref/edit1.bin` |
 | The top-k ties | `bin/topk_test` |
 | The engine's stdin handling | `bin/sfnx_input_test` |
 | The conversation cache where prompts share much: two conversations alternating on a lane, a system prompt changed near its end | `tools/lab.sh cmd cache2` |
