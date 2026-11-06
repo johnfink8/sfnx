@@ -1079,6 +1079,13 @@ void load_mtp_card(const Model& m, const MtpFiles& f, const CardW& c, const std:
         if (!d->s.q) throw std::runtime_error("mtp: a projection is not Q8_0");
 }
 
+// every card's error, joined: the first is often only the abort another card's failure caused ("card 0: card 1 failed")
+void throw_card_errors(const std::vector<std::string>& errs) {
+    std::string all;
+    for (size_t c = 0; c < errs.size(); ++c)
+        if (!errs[c].empty()) all += (all.empty() ? "" : "; ") + ("card " + std::to_string(c) + ": " + errs[c]);
+    if (!all.empty()) throw std::runtime_error(all);
+}
 }  // namespace
 
 #if FNX_27B
@@ -1235,6 +1242,8 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
     tok_embd = &g.t("token_embd.weight");
 #if FNX_27B
     if (tok_embd->type != T_Q8_0) throw std::runtime_error("27b: token_embd.weight is not Q8_0 (the host's embedding reads Q8_0)");
+    for (const char* v : {"FNX_NGRAM", "FNX_NGRAM_CACHE_MIB", "FNX_NGRAM_THREADS"})
+        if (std::getenv(v)) throw std::runtime_error(std::string("27b: ") + v + " is set, and the 27B has no PLE table");
     vocab = (int) tok_embd->ne[1];
     if (g.t("output.weight").ne[1] != vocab || g.t("output.weight").ne[0] != N)
         throw std::runtime_error("27b: output.weight is not [" + std::to_string(N) + "][" + std::to_string(vocab) + "] (token_embd's vocabulary)");
@@ -1250,27 +1259,43 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
     if (ple_table->type != T_IQ4_NL && ple_table->type != T_Q8_0)
         throw std::runtime_error("fnx: per_layer_token_embd.weight is neither IQ4_NL nor Q8_0 (the host's PLE rows read those)");
     vocab = (int) tok_embd->ne[1];
-    // the host gathers rows of these two every window: a row read from the disk costs milliseconds, so keep them in RAM
+    // the host gathers rows of these two every window: a row faulted in from the disk through the mapping costs
+    // milliseconds, so they are locked in RAM; FNX_NGRAM=disk leaves the table on the disk and reads its rows (PleRows)
     {
+        const PleRows::Mode mode = PleRows::mode_from_env();
         const auto t0 = std::chrono::steady_clock::now();
-        for (const Tensor* t : {tok_embd, ple_table}) lock_in_ram(*t);
-        std::fprintf(stderr, "fnx: %s and %s (%.1f GB) locked in RAM in %.1f s\n", tok_embd->name.c_str(), ple_table->name.c_str(),
-                     (tok_embd->nbytes + ple_table->nbytes) / 1e9, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        std::vector<const Tensor*> lock{tok_embd};
+        if (mode == PleRows::Mode::RAM) lock.push_back(ple_table);
+        size_t bytes = 0;
+        std::string names;
+        for (const Tensor* t : lock) {
+            lock_in_ram(*t);
+            bytes += t->nbytes;
+            names += (names.empty() ? "" : " and ") + t->name;
+        }
+        std::fprintf(stderr, "fnx: %s (%.1f GB) locked in RAM in %.1f s\n", names.c_str(), bytes / 1e9,
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        // the lab's holder runs no engine: no read pool, no cache, no probe of the disk (each worker makes its own)
+        if (how != Load::HOLD) {
+            ple_rows = std::make_unique<PleRows>(g, *ple_table, mode);
+            std::fprintf(stderr, "fnx: %s\n", ple_rows->describe().c_str());
+            if (mode == PleRows::Mode::DISK) std::fprintf(stderr, "fnx: n-gram table: its disk, %s\n", ple_rows->probe(2048).c_str());
+        }
     }
-    for (int64_t v : g.ia(p + "ple.layer_multipliers")) ple_mult.push_back((uint64_t) v);
-    for (int64_t v : g.ia(p + "ple.head_offsets")) ple_off.push_back((uint64_t) v);
-    for (int64_t v : g.ia(p + "ple.head_vocab_sizes")) ple_vocab.push_back((uint64_t) v);
-    // the gather reads ple_mult[0..PLE_ORDERS) and a head h at mixed % ple_vocab[h] + ple_off[h]: the arrays must be that
+    for (int64_t v : g.ia(p + "ple.layer_multipliers")) ple.mult.push_back((uint64_t) v);
+    for (int64_t v : g.ia(p + "ple.head_offsets")) ple.off.push_back((uint64_t) v);
+    for (int64_t v : g.ia(p + "ple.head_vocab_sizes")) ple.vocab.push_back((uint64_t) v);
+    // the gather reads ple.mult[0..PLE_ORDERS) and a head h at mixed % ple.vocab[h] + ple.off[h]: the arrays must be that
     // long and every head's range must stay inside the table, or the gather reads rows (or zero-modulo) the metadata invented
-    if (ple_mult.size() != PLE_ORDERS || ple_off.size() != PLE_HEADS || ple_vocab.size() != PLE_HEADS)
-        throw std::runtime_error("fnx: the PLE metadata holds " + std::to_string(ple_mult.size()) + " multipliers and " +
-                                 std::to_string(ple_off.size()) + " offsets and " + std::to_string(ple_vocab.size()) +
+    if (ple.mult.size() != PLE_ORDERS || ple.off.size() != PLE_HEADS || ple.vocab.size() != PLE_HEADS)
+        throw std::runtime_error("fnx: the PLE metadata holds " + std::to_string(ple.mult.size()) + " multipliers and " +
+                                 std::to_string(ple.off.size()) + " offsets and " + std::to_string(ple.vocab.size()) +
                                  " vocab sizes, want " + std::to_string(PLE_ORDERS) + " and " + std::to_string(PLE_HEADS) + " and " +
                                  std::to_string(PLE_HEADS));
     {
         // a zero multiplier drops its n-gram from the hash silently: the gather still runs, on fewer orders than the model trained with
         for (int j = 0; j < PLE_ORDERS; ++j)
-            if (!ple_mult[j]) throw std::runtime_error("fnx: PLE multiplier " + std::to_string(j) + " is 0, which drops that n-gram from the hash");
+            if (!ple.mult[j]) throw std::runtime_error("fnx: PLE multiplier " + std::to_string(j) + " is 0, which drops that n-gram from the hash");
         static_assert(PLE_HEADS * PLE_DIM == N, "the gather tiles PLE_HEADS rows of PLE_DIM into one embedding row");
         if (ple_table->ne[0] != PLE_DIM)
             throw std::runtime_error("fnx: " + ple_table->name + " is " + std::to_string(ple_table->ne[0]) + " a row, not the " +
@@ -1279,13 +1304,13 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
         for (int h = 0; h < PLE_HEADS; ++h) {
             // head h gathers rows [off, off+vocab): bound each side on its own so a negative offset (which wraps huge)
             // trips the check instead of slipping past a summed top
-            if (!ple_vocab[h]) throw std::runtime_error("fnx: PLE head " + std::to_string(h) + " has an empty vocabulary");
-            if (ple_off[h] >= rows || ple_vocab[h] > rows - ple_off[h])
-                throw std::runtime_error("fnx: PLE head " + std::to_string(h) + " gathers from row " + std::to_string((int64_t) ple_off[h]) +
-                                         " for " + std::to_string(ple_vocab[h]) + ", past " + ple_table->name + "'s " + std::to_string(rows));
+            if (!ple.vocab[h]) throw std::runtime_error("fnx: PLE head " + std::to_string(h) + " has an empty vocabulary");
+            if (ple.off[h] >= rows || ple.vocab[h] > rows - ple.off[h])
+                throw std::runtime_error("fnx: PLE head " + std::to_string(h) + " gathers from row " + std::to_string((int64_t) ple.off[h]) +
+                                         " for " + std::to_string(ple.vocab[h]) + ", past " + ple_table->name + "'s " + std::to_string(rows));
         }
     }
-    ple_eos = g.i(p + "ple.eos_token_id");
+    ple.eos = g.i(p + "ple.eos_token_id");
     ple_image = g.i(p + "ple.image_token_id");
 #endif
     cards.resize(NCARD);
@@ -1383,8 +1408,7 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
             }
         });
     for (auto& t : th) t.join();
-    for (int c = 0; c < NCARD; ++c)
-        if (!errs[c].empty()) throw std::runtime_error("card " + std::to_string(c) + ": " + errs[c]);
+    throw_card_errors(errs);
     // the disk rate only when the disk gave nearly all of it (tools/lab.sh estimates its next cold loads from it)
     const double disk = st.disk_bytes() / 1e9, cache = st.cache_bytes() / 1e9;
     char rate[64] = "";
@@ -1469,8 +1493,7 @@ void each_card(std::vector<CardW>& cards, F f) {
             } catch (const std::exception& e) { errs[c] = e.what(); }
         });
     for (auto& t : th) t.join();
-    for (int c = 0; c < NCARD; ++c)
-        if (!errs[c].empty()) throw std::runtime_error("card " + std::to_string(c) + ": " + errs[c]);
+    throw_card_errors(errs);
 }
 }  // namespace
 

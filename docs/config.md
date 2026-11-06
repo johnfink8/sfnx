@@ -118,6 +118,14 @@ The ones that change results or are worth knowing. The rest are kernel-level tun
 | `FNX_EXPERT_PROFILE=FILE` | the routing profile ranking expert coldness (`data/expert-routes.bin`) |
 | `FNX_ROUTE_COUNT=1`, `FNX_ROUTE_FILE=FILE` | tally routing to write a profile: decode and prompt picks weighted equally per byte |
 
+**The n-gram table** (`per_layer_token_embd`: 28.8 GB in Q4_K_XL, 54.4 GB in Q8_0 builds; [docs/memory.md](memory.md#the-n-gram-table-on-disk))
+
+| Setting | Effect |
+| --- | --- |
+| `FNX_NGRAM=ram` or `disk` | `ram` (default, prod): the table locked in RAM. `disk`: left on the disk and its rows read as windows need them, for a box whose RAM is short: 26.8 GiB less locked with Q4_K_XL, 50.7 with Q8_0, for ~1% of decode and ~7% of a cold prompt read on this box's NVMe, the logits byte for byte RAM mode's ([docs/memory.md](memory.md#the-n-gram-table-on-disk)). Refused on a rotational disk; the start-up log measures the disk's random reads |
+| `FNX_NGRAM_CACHE_MIB=N` | `disk`: the row cache, default 256 (2.98M rows of Q4_K_XL's 90 bytes, 1.58M of Q8_0's 170). 0 turns it off, and decode's read-ahead with it (the read-ahead reads into the cache). A new prompt's rows are ~45% new to it; text that continues earlier text finds 40–50% of its new rows there |
+| `FNX_NGRAM_THREADS=N` | `disk`: reads in flight, default 32 (1 to 256). On this box's NVMe a prompt's reads reached 76k/s at 32 against 66k at 16 and 83k at 128; a decode round wakes only as many as it has reads (waking all 32 for its handful cost prose ~2.5%) |
+
 **K/V, drafts and batching**
 
 | Setting | Effect |

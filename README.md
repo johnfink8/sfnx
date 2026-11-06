@@ -57,6 +57,12 @@ one request's decode:
 | Prose, prod's sampling | 109–119 tok/s | 90–94 | 65–68 |
 | 114k-token prompt, cold read | 42.1 s | 42.7 s | 53.7 s |
 
+Two cards hold a third of the experts in RAM, and every expert keeps a pinned copy there, so RAM can be the limit
+before VRAM: `FNX_NGRAM=disk` leaves the model's 28.8 GB n-gram table (54.4 GB in Q8_0 builds) on an SSD instead of
+locked in RAM, for ~1% of decode and 7–12% of a cold prompt read here, the logits unchanged. Q8_0 as
+`serve/sfnx-q8.json` serves it goes from 173 GiB resident to 123
+([docs/memory.md](docs/memory.md#the-n-gram-table-on-disk)).
+
 For **one** card, use Strata: it computes part of the experts a card cannot hold on the CPU, and was 2–3x sFNX's
 decode and 4–5x its prompt reading there. Both, with the method: [docs/benchmarks.md](docs/benchmarks.md#two-cards-and-one-card).
 
@@ -179,7 +185,7 @@ and the files they read: [docs/config.md](docs/config.md).
 | | |
 | --- | --- |
 | [docs/design.md](docs/design.md) | the split, the ring, decode, the prompt path, the conversation cache, pictures |
-| [docs/memory.md](docs/memory.md) | the K/V arena and experts in RAM, and what Q8_0 costs |
+| [docs/memory.md](docs/memory.md) | the K/V arena, experts in RAM, what Q8_0 costs, and the n-gram table on disk for boxes short of RAM |
 | [docs/benchmarks.md](docs/benchmarks.md) | every speed measurement, with its method |
 | [docs/verification.md](docs/verification.md) | exactness against llama.cpp, the test inventory, the lab |
 | [docs/config.md](docs/config.md) | engine settings, config files, where this API differs from Strata's |

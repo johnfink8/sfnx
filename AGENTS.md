@@ -86,7 +86,8 @@ The service holds nearly all VRAM. **While it serves, nothing else may open a CU
 `tools/lab.sh`, no `kbench` or `ncu`. Compiling, reading `/metrics` and logs, and CPU tests are fine. Stop the service
 for GPU work and start it again when the work is done.
 
-The lab (`tools/lab.sh`, usage at its top) holds the model once (`fnx_hold`) and runs `fnx_run`'s commands in a
+The lab (`tools/lab.sh`, usage at its top) holds the model once (`fnx_hold`, which leaves the n-gram table on the disk
+for its workers to place by their own `FNX_NGRAM`, so a model on a spinning disk is refused at the holder) and runs `fnx_run`'s commands in a
 worker, so a code change costs a library rebuild and `cmd reload`, not a model load. `set VAR=value` / `unset VAR`
 change engine settings and are kept for replacement workers. `lab.sh cmd` (and so `exact`, `batch`, `decode`, `trace`)
 exits with the worker's result code. The lab shows the build as many cards as it was made for (`build/ncard`). For
@@ -115,6 +116,7 @@ Its llama.cpp references (docs/verification.md, "The 27B") are made locally like
 | `lab.sh batch` | batched windows (with their drafts) give each lane its tokens alone | MISMATCH, exit 1 |
 | `bin/sample_test` | speculative sampling matches plain sampling in distribution | MISMATCH, exit 1 |
 | `bin/topk_test`, `bin/batch_plan_test`, `bin/sfnx_input_test`, `bin/pf_ring_plan_test`, `bin/rope_test`, `bin/card_check_test`, `tools/build_guards_check.sh` | the top-k ties, the batched row planner, the engine's stdin handling, the prompt path's ring steps on every supported count, YaRN's constants against ggml's, the card checks at load against real cards' numbers and sysfs, the link probe's report and failure text, the Makefile's checks of ARCH and FNX_NCARD (the last six CPU only) | non-zero exit |
+| `bin/ple_test MODEL.gguf ref/long64.bin ref/edit1.bin` | `FNX_NGRAM=disk`'s rows against the mapping's, byte for byte (CPU, beside a serving engine) | `MISMATCH`, exit 1 |
 | `serve/api_smoke.py`, `serve/image_test.py` | the API surface and pictures through the front end | `N failed` |
 | `.venv/bin/python -m pytest -q front/` | the front end (CPU only) | pytest |
 
