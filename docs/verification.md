@@ -341,6 +341,7 @@ card of another arch than the build's (`src/card_check.hpp`).
 | Batched drafts' sampler against plain sampling, in distribution (3 lanes, open1, 600 seeds: every p ≥ 0.34) | `SAMPLE_TEST_LANES=3 bin/sample_test` |
 | The batched-draft row plan against a brute force over every split | `bin/batch_plan_test` |
 | The prompt path's ring steps: two and three cards' sequences, and consecutive sums over both buffer sets on every supported count (CPU) | `bin/pf_ring_plan_test` |
+| Dense prompt activation scaling and exceptional-row recomputation against a float reference, including a large value at zero weight, reused activations, distinct output rows, and CUDA graph capture (one idle GPU) | `bin/pf_scale_test 0` |
 | YaRN's band, per-pair angles and magnitude against ggml's formulas, and the settings it refuses | `bin/rope_test` |
 | The card checks at load: a card's compute capability against the build's arch; PCI addresses; BAR1 from a V100's and an RTX 3090's sysfs text and one made from the 3090's at full ReBAR; the text it refuses, signs and over-wide fields included; which cards pass; the link probe's report (a pair left out refused), slow pairs warned and lost words named (CPU) | `bin/card_check_test` |
 | The link probe on the cards (`src/peer_probe.cu`): its watcher's self-check and the healthy path run at every start, prod's included (the rates measured: [docs/config.md](config.md#boot-requirement)); its failure paths need a broken link and have run nowhere, checked by review only | engine start-up |
