@@ -262,6 +262,16 @@ class EngineDied(RuntimeError):
     """The engine process ended in the middle of a request (issue #27: on Linux, the out-of-memory killer)."""
 
 
+class SlotLost(RuntimeError):
+    """The engine gave this request's batch slot to another request while this one still read it: the two would share
+    its tokens, so this one ends with an error instead."""
+
+
+# put on a slot's queue when the engine admits a new request to that slot (BADM <slot> 1): whoever still reads the old
+# queue was its last occupant and is not to read on
+SLOT_GONE = object()
+
+
 class EngineStarting(RuntimeError):
     """The engine is (re)starting and has not said READY yet (#344): no context size to plan a request with - a 503,
     not a 400 about the prompt."""
@@ -729,6 +739,14 @@ class StrataEngine:
                     continue
                 except (IndexError, ValueError):
                     pass
+            if line.startswith("BADM ") and slot_q:
+                # the slot goes on decoding for a newly admitted request: the lines before this one were its last
+                # occupant's, the ones after are the new request's, which gets a queue of its own (read by it alone)
+                f = line.split()
+                if len(f) >= 3 and f[2] == "1" and f[1].isdigit() and int(f[1]) < len(slot_q):
+                    b = int(f[1])
+                    old, slot_q[b] = slot_q[b], queue.Queue()
+                    old.put(SLOT_GONE)
             lines.put(line)
         if self.proc is proc:                           # a killed engine's pump must not mark its successor dead
             self.ended = True                           # its output closed: it is gone, even before the OS says so
@@ -1031,38 +1049,43 @@ class StrataEngine:
         self.last = {**self.last, "finish": done.finish, "decode_ms": done.ms, "generated": done.produced,
                      "drafts_accepted": done.drafts_accepted, "drafts_offered": done.drafts_offered, "rounds": done.rounds}
 
-    def _bdone_after_eos(self, slot: int, wait_s: float = 2.0):
+    def _bdone_after_eos(self, slot: int, q: queue.Queue, wait_s: float = 2.0):
         """#1869: a request in a slot whose consumer left at the stop token has its BDONE right behind it (the engine prints it
-        in the same window).  Read it here, so the request's figures are the slot leg's (the background wait would eat it,
-        and the request kept the admission's single token).  None when it does not come in `wait_s`: then the background
-        wait takes over."""
-        if slot >= len(self.slot_q):
-            return None
+        in the same window).  Read it here (from `q`, the queue the request was admitted with), so the request's figures
+        are the slot leg's (the background wait would eat it, and the request kept the admission's single token).  None
+        when it does not come in `wait_s`: then the background wait takes over."""
         end = time.monotonic() + wait_s
         while time.monotonic() < end:
             try:
-                line = self.slot_q[slot].get(timeout=max(0.05, end - time.monotonic()))
+                line = q.get(timeout=max(0.05, end - time.monotonic()))
             except queue.Empty:
                 return None
+            if line is SLOT_GONE:
+                raise SlotLost(f"slot {slot} went to another request before this one's BDONE")
             if line is None:
                 return None
             if line.startswith("BDONE "):
                 return line
         return None
 
-    def _release_slot_when_done(self, slot: int, stream: list[int] | None = None):
+    def _release_slot_when_done(self, slot: int, q: queue.Queue, stream: list[int] | None = None):
         """A slot whose consumer left (a stop token, a stop string, a disconnect): BSTOP it and free it once the engine
-        says BDONE (in the background).  `stream`: the prompt and every token of it so far - with the tokens still to
-        come before BDONE, all but the last are what the slot holds then (the next turn of its conversation)."""
+        says BDONE on `q` (the queue the request was admitted with; in the background).  `stream`: the prompt and every
+        token of it so far - with the tokens still to come before BDONE, all but the last are what the slot holds then
+        (the next turn of its conversation).  The slot's claim moves to the background wait here, under the lock and
+        before the wait starts: once that wait frees the slot, another request may claim it, and nothing of this one's
+        may touch that claim after."""
         if slot >= len(self.slot_q):                    # the engine restarted with fewer slots: this one is gone
             return
         try:
             self._send(f"BSTOP {slot}")
         except EngineDied:
             pass
-        q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # this process's: restart() replaces them
+        busy, held = self.slot_busy, self.slot_held     # this process's: restart() replaces them
         releasing = self.slot_releasing
-        releasing.add(slot)
+        with self.slot_cv:
+            releasing.add(slot)
+            self.slot_claims.discard(slot)
 
         def wait():
             end = time.monotonic() + 600.0
@@ -1072,6 +1095,13 @@ class StrataEngine:
                     line = q.get(timeout=5.0)
                 except queue.Empty:
                     continue
+                if line is SLOT_GONE:                   # admitted to by another request: the slot is not ours to free
+                    print(f"[sfnx] parallel: slot {slot} went to another request before the BDONE its last one was "
+                          "waiting for; that request's state is not kept", flush=True)
+                    with self.slot_cv:
+                        releasing.discard(slot)
+                        self.slot_cv.notify_all()
+                    return
                 if line is None:
                     tail = []
                     break
@@ -1224,6 +1254,7 @@ class StrataEngine:
         holding, born = True, self.gen                  # (the engine it now has the control lines of)
         btrace("ctl acquired")
         slot, gen0, reserved = None, None, None
+        sq = None         # the queue of the slot it was admitted to (BADM <slot> 1): its lines alone
         phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
         stop_sent = False
         yields, solo_again, refused = 0, 0, 0
@@ -1346,8 +1377,6 @@ class StrataEngine:
                         if not ok:
                             return
                         holding, born = True, self.gen                  # (the engine it now has the control lines of)
-                    while not self.slot_q[slot].empty():
-                        self.slot_q[slot].get_nowait()
                     head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
                     live = {"slot": slot, "request_id": getattr(cancel, "_strata_request_id", None),
                             "state": "reading", "prompt_tokens": len(prompt), "prompt_read": 0, "generated": 0,
@@ -1403,6 +1432,8 @@ class StrataEngine:
                         slot = None
                         continue
                     cont = bool(self._ctl_result and self._ctl_result[1])
+                    if cont:
+                        sq = self.slot_q[slot]          # the pump gave the slot this queue before passing the BADM on
                     phase = "slot" if cont else "none"
                     while pending:
                         t = pending.pop(0)
@@ -1422,13 +1453,16 @@ class StrataEngine:
                 going_solo = False
                 while True:
                     try:
-                        line = self.slot_q[slot].get(timeout=10.0)
+                        line = sq.get(timeout=10.0)
                     except queue.Empty:
                         if cancel.is_set() and not stop_sent:
                             self._send(f"BSTOP {slot}")
                             stop_sent = True
                         yield None
                         continue
+                    if line is SLOT_GONE:
+                        phase = "lost"                      # the slot is the other request's now: left as it is
+                        raise SlotLost(f"batch slot {slot} was given to another request while this one decoded in it")
                     if line is None:
                         phase = "none"
                         raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
@@ -1485,18 +1519,21 @@ class StrataEngine:
                 elif phase == "admit":
                     line = self._drain_control("BADM", born=born)
                     if line and line.startswith("BADM ") and line.split()[2:3] == ["1"]:
-                        phase = "slot"
+                        phase, sq = "slot", self.slot_q[slot]    # (the pump's queue for it, as above)
             except EngineDied:
                 pass
             bdone_in = False
             if phase == "slot" and slot is not None and out and out[-1] in EOS_IDS and self.gen == born:
                 try:
-                    bd = self._bdone_after_eos(slot)        # (#1869) the slot's figures, not the admission's
+                    bd = self._bdone_after_eos(slot, sq)    # (#1869) the slot's figures, not the admission's
                     if bd is not None:
                         self._apply_bdone(self._parse_bdone(bd))
                         bdone_in = True
                 except EngineDied:
                     pass                                    # the engine is marked ended; the slot release below still runs
+                except SlotLost as e:
+                    print(f"[sfnx] parallel: {e}", flush=True)
+                    phase = "lost"
             if reused0 is not None and isinstance(self.last, dict):
                 self.last = {**self.last, "reused": reused0}
             if carry and isinstance(self.last, dict):
@@ -1506,12 +1543,15 @@ class StrataEngine:
             if admit_wait:
                 with self.slot_cv:
                     self.admitting = max(0, self.admitting - 1)
-            if reserved is not None:
+            # a restart since this request's engine was started replaced the slots' state with the new engine's, whose
+            # slots other requests hold now: what this one held went with its engine, so it frees, stops and sends nothing
+            same_engine = self.gen == born
+            if reserved is not None and same_engine:
                 with self.slot_cv:
                     self.slot_busy[reserved] = False
                     self.slot_claims.discard(reserved)
                     self.slot_cv.notify_all()
-            if slot is not None:
+            if slot is not None and phase != "lost" and same_engine:
                 self.slot_live[slot] = None
                 self.slot_used[slot] = time.time()
                 if phase == "slot" and bdone_in:
@@ -1524,8 +1564,7 @@ class StrataEngine:
                 elif phase == "slot":
                     self.slot_held[slot] = []
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                    self._release_slot_when_done(slot, stream)    # freed at its BDONE
-                    self.slot_claims.discard(slot)                # (the BDONE wait owns it now)
+                    self._release_slot_when_done(slot, sq, stream)    # freed at its BDONE (the claim goes to that wait)
                 else:
                     with self.slot_cv:
                         self.slot_busy[slot] = False
@@ -3187,6 +3226,10 @@ class Service:
                             finish = "error"
                             self._say_died(e)
                             raise
+                        except SlotLost as e:               # the engine is fine; this request's slot is not its own
+                            finish = "error"
+                            print(f"[sfnx] parallel: {e}; the request ends with an error", flush=True)
+                            raise
                         except ValueError as e:             # the engine's ERR line (it may have ended after it)
                             finish = "error"
                             print(f"[sfnx] the engine reported an error: {e}", flush=True)
@@ -4125,6 +4168,10 @@ def make_handler(svc: Service):
                 self._json(400, responses_error_body(body["error"]["message"]) if path == "/v1/responses" else body)
             except EngineDied as e:                          # before the answer started (not streamed)
                 self._json(503, {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
+            except SlotLost as e:                            # (not streamed) the reply would hold another one's tokens
+                err = {"type": "server_error", "message": str(e)}
+                self._note(error=err)
+                self._json(500, responses_error_body(err["message"]) if path == "/v1/responses" else {"error": err})
             except EngineStuck as e:                         # an unload or restart that could not end the engine
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
 
@@ -4308,6 +4355,10 @@ def make_handler(svc: Service):
                 err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+            except SlotLost as e:
+                err = {"error": {"type": "server_error", "message": str(e)}}
+                self._note(error=err["error"])
+                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except StructuredOutputError as e:
                 err = {"error": {"type": "structured_output_failed", "code": "structured_output_failed", "message": str(e)}}
                 self._note(error=err["error"])
@@ -4357,6 +4408,9 @@ def make_handler(svc: Service):
                 except EngineDied as e:
                     return self._json(503, responses_error_body(f"{e}; the next request restarts it", "server_error",
                                                                 code="server_error"))
+                except SlotLost as e:
+                    self._note(error={"type": "server_error", "message": str(e)})
+                    return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
                 except ValueError as e:                      # the engine's ERR line
                     return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
                 return self._json(200, result)
@@ -4387,6 +4441,8 @@ def make_handler(svc: Service):
                 items.close()
             except EngineDied as e:                          # mid-stream: response.failed, then the stream ends
                 self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
+            except SlotLost as e:
+                self._responses_failed(asm, str(e), "server_error", send)
             except StructuredOutputError as e:
                 self._responses_failed(asm, str(e), "structured_output_failed", send)
             except ValueError as e:                          # the engine's ERR after the stream started
@@ -4497,6 +4553,10 @@ def make_handler(svc: Service):
                 events.close()
             except EngineDied as e:                          # mid-stream: Anthropic's error event
                 err = {"type": "error", "error": {"type": "api_error", "message": f"{e}; the next request restarts it"}}
+                self._note(error=err["error"])
+                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+            except SlotLost as e:
+                err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
                 self._note(error=err["error"])
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started

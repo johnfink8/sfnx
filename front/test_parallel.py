@@ -46,7 +46,12 @@ LONG = list(b"LONGREPLY")
 def continued(ids):        # (the whole reply, how much of it the prompt already ends with: a request continued)
     ids = [int(x) for x in ids]
     long_one = any(ids[i:i + len(LONG)] == LONG for i in range(len(ids)))
-    R = list(b"ok, " + b"la " * 15 + b"done." if long_one else b"ok, done.") + [257]
+    tag = bytes(x & 255 for x in ids).find(b"TAG=")             # a reply of its own: "<c>00 <c>01 ... <c>39 "
+    if tag >= 0:
+        c = chr(ids[tag + 4])
+        R = list("".join(f"{c}{i:02d} " for i in range(40)).encode()) + [257]
+    else:
+        R = list(b"ok, " + b"la " * 15 + b"done." if long_one else b"ok, done.") + [257]
     return R, max(k for k in range(len(R)) if k == 0 or ids[-k:] == R[:k])
 def reply(ids):            # the rest of the reply after what the prompt already ends with
     R, k = continued(ids)

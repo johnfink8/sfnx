@@ -2,6 +2,7 @@
 
 The same fake engine and helpers as front/test_parallel.py (FakeEngineCase); split out because the whole file took
 about two minutes in one piece."""
+import json
 import sys
 import threading
 import time
@@ -142,6 +143,143 @@ class ParallelServiceYield(tp.FakeEngineCase):
         self.assertFalse(any(self.engine.slot_busy))
         with self.svc.status_lock:
             self.assertEqual(len(self.svc.history), 2)
+
+    def test_a_slot_given_back_early_keeps_the_claim_of_the_request_that_took_it_next(self):
+        """A request whose consumer left mid-reply hands its slot to the background BDONE wait.  When that BDONE is
+        already there, the wait frees the slot at once and a waiting request takes it; the request leaving must not
+        then drop the new owner's claim.  On prod it did: the slot looked ownerless, the orphan check freed it while it
+        decoded, and the requests sent to it after drained its queue and got refused, until a reader was left behind
+        on the slot that split every later reply in it with the next."""
+        import front.server as server
+        self.start(2)
+        e = self.engine
+        with e.slot_cv:                                 # slot 1 is someone else's: this request goes to slot 0 (BGEN)
+            e.slot_busy[1] = True
+            e.slot_claims.add(1)
+        g = e.generate_batched(list(b"LONGREPLY please"), 60, {}, threading.Event())
+        got = []
+        for t in g:
+            if t is not None:
+                got.append(t)
+            if len(got) == 3:
+                break
+        self.assertEqual(e.slot_live[0]["state"], "decoding")
+
+        class Inline:                                   # the BDONE wait, run at once ...
+            def __init__(self, target, daemon=None):
+                self.target = target
+
+            def start(self):
+                self.target()
+                with e.slot_cv:                         # ... and the request that took the freed slot, as pick_slot does
+                    self.taken = not e.slot_busy[0]
+                    e.slot_busy[0] = True
+                    e.slot_claims.add(0)
+                Inline.ran = self
+        with mock.patch.object(server.threading, "Thread", Inline):
+            g.close()                                   # the consumer leaves: BSTOP, freed at its BDONE
+        self.assertTrue(Inline.ran.taken, "the BDONE wait did not free the slot")
+        self.assertIn(0, e.slot_claims, "the request leaving slot 0 dropped the claim of the one that took it next")
+
+    def _decoding_in_slot_0(self, start):
+        """`start()` sends a request; it decodes in slot 0 (slot 1 is held for someone else).  -> its slot's queue."""
+        e = self.engine
+        with e.slot_cv:
+            e.slot_busy[1] = True
+            e.slot_claims.add(1)
+        th = threading.Thread(target=start, daemon=True)
+        th.start()
+        deadline = time.time() + 10
+        while not (e.slot_live[0] and e.slot_live[0]["state"] == "decoding") and time.time() < deadline:
+            time.sleep(0.005)
+        self.assertEqual(e.slot_live[0]["state"], "decoding")
+        return th
+
+    def test_a_request_whose_slot_went_to_another_ends_with_an_error(self):
+        """The reply must not look whole: a 500 that says why (not a dropped connection, nor a short 200)."""
+        import front.server as server
+        self.start(2)
+        out = {}
+
+        def go():
+            try:
+                out["r"] = self.chat("LONGREPLY please", max_tokens=200)
+            except urllib.error.HTTPError as err:
+                out["r"] = (err.code, json.loads(err.read().decode()))
+        th = self._decoding_in_slot_0(go)
+        self.engine.slot_q[0].put(server.SLOT_GONE)
+        th.join(20)
+        self.assertEqual(out["r"][0], 500, out)
+        self.assertIn("given to another request", out["r"][1]["error"]["message"])
+
+    def test_a_streamed_request_whose_slot_went_to_another_ends_with_an_error_event(self):
+        import front.server as server
+        self.start(2)
+        body = {"messages": [{"role": "user", "content": "LONGREPLY please"}], "max_tokens": 200,
+                "reasoning_effort": "none", "stream": True}
+        lines = []
+
+        def go():
+            req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                lines.extend(x.decode().strip() for x in r if x.strip())
+        th = self._decoding_in_slot_0(go)
+        self.engine.slot_q[0].put(server.SLOT_GONE)
+        th.join(20)
+        errors = [json.loads(x[6:]) for x in lines if x.startswith("data: {") and '"error"' in x]
+        self.assertEqual(len(errors), 1, lines)
+        self.assertIn("given to another request", errors[0]["error"]["message"])
+        self.assertEqual(lines[-1], "data: [DONE]")
+
+    def test_a_request_from_an_engine_since_restarted_leaves_the_new_ones_slots_alone(self):
+        """A request whose consumer leaves only after the engine was restarted: its slot is the new engine's now, held
+        by another request, whose claim and busy flag it must not touch."""
+        self.start(2)
+        e = self.engine
+        with e.slot_cv:
+            e.slot_busy[1] = True
+            e.slot_claims.add(1)
+        g = e.generate_batched(list(b"LONGREPLY please"), 60, {}, threading.Event())
+        got = 0
+        for t in g:
+            got += t is not None
+            if got == 3:
+                break
+        self.assertEqual(e.slot_live[0]["state"], "decoding")
+        e.gen += 1                                     # as a restart marks it; the new engine's slot 0 is taken
+        with e.slot_cv:
+            e.slot_claims.add(0)
+        g.close()
+        self.assertIn(0, e.slot_claims)
+        self.assertTrue(e.slot_busy[0])
+        self.assertNotIn(0, e.slot_releasing)
+
+    def test_a_reader_left_on_a_slot_takes_none_of_the_next_requests_tokens(self):
+        """A reader still on a slot's queue (a request that never saw its BDONE) must not see the lines of the requests
+        the slot goes to after it: on prod it took half of each one's tokens, and its BDONE, which left the next reader."""
+        self.start(2)
+        stolen = []
+
+        def left_behind(q):
+            while True:
+                line = q.get()
+                if not isinstance(line, str):           # the engine ended, or the slot went to another request
+                    return
+                stolen.append(line)
+        for q in list(self.engine.slot_q):
+            threading.Thread(target=left_behind, args=(q,), daemon=True).start()
+        res = {}
+
+        def go(k):
+            res[k] = self.chat(f"TAG={k} please", max_tokens=200)["choices"][0]["message"]["content"].strip()
+        a = threading.Thread(target=go, args=("a",))
+        a.start()
+        time.sleep(0.15)
+        go("b")
+        a.join(30)
+        self.assertEqual(res, {k: " ".join(f"{k}{i:02d}" for i in range(40)) for k in "ab"})
+        self.assertEqual(stolen, [])
 
     def test_next_turn_goes_back_to_its_slot(self):
         self.start(2)
