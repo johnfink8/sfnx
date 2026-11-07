@@ -1543,12 +1543,15 @@ class StrataEngine:
             if admit_wait:
                 with self.slot_cv:
                     self.admitting = max(0, self.admitting - 1)
-            if reserved is not None:
+            # a restart since this request's engine was started replaced the slots' state with the new engine's, whose
+            # slots other requests hold now: what this one held went with its engine, so it frees, stops and sends nothing
+            same_engine = self.gen == born
+            if reserved is not None and same_engine:
                 with self.slot_cv:
                     self.slot_busy[reserved] = False
                     self.slot_claims.discard(reserved)
                     self.slot_cv.notify_all()
-            if slot is not None and phase != "lost":
+            if slot is not None and phase != "lost" and same_engine:
                 self.slot_live[slot] = None
                 self.slot_used[slot] = time.time()
                 if phase == "slot" and bdone_in:
@@ -3223,6 +3226,10 @@ class Service:
                             finish = "error"
                             self._say_died(e)
                             raise
+                        except SlotLost as e:               # the engine is fine; this request's slot is not its own
+                            finish = "error"
+                            print(f"[sfnx] parallel: {e}; the request ends with an error", flush=True)
+                            raise
                         except ValueError as e:             # the engine's ERR line (it may have ended after it)
                             finish = "error"
                             print(f"[sfnx] the engine reported an error: {e}", flush=True)
@@ -4161,6 +4168,10 @@ def make_handler(svc: Service):
                 self._json(400, responses_error_body(body["error"]["message"]) if path == "/v1/responses" else body)
             except EngineDied as e:                          # before the answer started (not streamed)
                 self._json(503, {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
+            except SlotLost as e:                            # (not streamed) the reply would hold another one's tokens
+                err = {"type": "server_error", "message": str(e)}
+                self._note(error=err)
+                self._json(500, responses_error_body(err["message"]) if path == "/v1/responses" else {"error": err})
             except EngineStuck as e:                         # an unload or restart that could not end the engine
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
 
@@ -4344,6 +4355,10 @@ def make_handler(svc: Service):
                 err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+            except SlotLost as e:
+                err = {"error": {"type": "server_error", "message": str(e)}}
+                self._note(error=err["error"])
+                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except StructuredOutputError as e:
                 err = {"error": {"type": "structured_output_failed", "code": "structured_output_failed", "message": str(e)}}
                 self._note(error=err["error"])
@@ -4393,6 +4408,9 @@ def make_handler(svc: Service):
                 except EngineDied as e:
                     return self._json(503, responses_error_body(f"{e}; the next request restarts it", "server_error",
                                                                 code="server_error"))
+                except SlotLost as e:
+                    self._note(error={"type": "server_error", "message": str(e)})
+                    return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
                 except ValueError as e:                      # the engine's ERR line
                     return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
                 return self._json(200, result)
@@ -4423,6 +4441,8 @@ def make_handler(svc: Service):
                 items.close()
             except EngineDied as e:                          # mid-stream: response.failed, then the stream ends
                 self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
+            except SlotLost as e:
+                self._responses_failed(asm, str(e), "server_error", send)
             except StructuredOutputError as e:
                 self._responses_failed(asm, str(e), "structured_output_failed", send)
             except ValueError as e:                          # the engine's ERR after the stream started
@@ -4533,6 +4553,10 @@ def make_handler(svc: Service):
                 events.close()
             except EngineDied as e:                          # mid-stream: Anthropic's error event
                 err = {"type": "error", "error": {"type": "api_error", "message": f"{e}; the next request restarts it"}}
+                self._note(error=err["error"])
+                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+            except SlotLost as e:
+                err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
                 self._note(error=err["error"])
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started
