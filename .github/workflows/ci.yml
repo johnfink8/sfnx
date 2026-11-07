@@ -75,6 +75,7 @@ jobs:
       - run: bin/pf_ring_plan_test
       - run: bin/rope_test
       - run: bin/card_check_test
+      - run: bin/expert_residency_test
       - run: tools/build_guards_check.sh
 
   front:
