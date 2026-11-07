@@ -143,6 +143,69 @@ class ParallelServiceYield(tp.FakeEngineCase):
         with self.svc.status_lock:
             self.assertEqual(len(self.svc.history), 2)
 
+    def test_a_slot_given_back_early_keeps_the_claim_of_the_request_that_took_it_next(self):
+        """A request whose consumer left mid-reply hands its slot to the background BDONE wait.  When that BDONE is
+        already there, the wait frees the slot at once and a waiting request takes it; the request leaving must not
+        then drop the new owner's claim.  On prod it did: the slot looked ownerless, the orphan check freed it while it
+        decoded, and the requests sent to it after drained its queue and got refused, until a reader was left behind
+        on the slot that split every later reply in it with the next."""
+        import front.server as server
+        self.start(2)
+        e = self.engine
+        with e.slot_cv:                                 # slot 1 is someone else's: this request goes to slot 0 (BGEN)
+            e.slot_busy[1] = True
+            e.slot_claims.add(1)
+        g = e.generate_batched(list(b"LONGREPLY please"), 60, {}, threading.Event())
+        got = []
+        for t in g:
+            if t is not None:
+                got.append(t)
+            if len(got) == 3:
+                break
+        self.assertEqual(e.slot_live[0]["state"], "decoding")
+
+        class Inline:                                   # the BDONE wait, run at once ...
+            def __init__(self, target, daemon=None):
+                self.target = target
+
+            def start(self):
+                self.target()
+                with e.slot_cv:                         # ... and the request that took the freed slot, as pick_slot does
+                    self.taken = not e.slot_busy[0]
+                    e.slot_busy[0] = True
+                    e.slot_claims.add(0)
+                Inline.ran = self
+        with mock.patch.object(server.threading, "Thread", Inline):
+            g.close()                                   # the consumer leaves: BSTOP, freed at its BDONE
+        self.assertTrue(Inline.ran.taken, "the BDONE wait did not free the slot")
+        self.assertIn(0, e.slot_claims, "the request leaving slot 0 dropped the claim of the one that took it next")
+
+    def test_a_reader_left_on_a_slot_takes_none_of_the_next_requests_tokens(self):
+        """A reader still on a slot's queue (a request that never saw its BDONE) must not see the lines of the requests
+        the slot goes to after it: on prod it took half of each one's tokens, and its BDONE, which left the next reader."""
+        self.start(2)
+        stolen = []
+
+        def left_behind(q):
+            while True:
+                line = q.get()
+                if not isinstance(line, str):           # the engine ended, or the slot went to another request
+                    return
+                stolen.append(line)
+        for q in list(self.engine.slot_q):
+            threading.Thread(target=left_behind, args=(q,), daemon=True).start()
+        res = {}
+
+        def go(k):
+            res[k] = self.chat(f"TAG={k} please", max_tokens=200)["choices"][0]["message"]["content"].strip()
+        a = threading.Thread(target=go, args=("a",))
+        a.start()
+        time.sleep(0.15)
+        go("b")
+        a.join(30)
+        self.assertEqual(res, {k: " ".join(f"{k}{i:02d}" for i in range(40)) for k in "ab"})
+        self.assertEqual(stolen, [])
+
     def test_next_turn_goes_back_to_its_slot(self):
         self.start(2)
         a = "conversation A, first turn"
