@@ -142,6 +142,7 @@ The ones that change results or are worth knowing. The rest are kernel-level tun
 | `FNX_PF_PASS=N` | chunks of 1,024 rows through each layer before the next: default 4 with an expert cache, 2 without, at most 8 |
 | `FNX_PF_STAGE_MIB=N` | each of the two VRAM stages that hold a layer's experts not in a slot while the layer before computes (default 384) |
 | `FNX_PF_STAGE_ROWS=N` | reads shorter than this take the experts in place instead of staging them (default 2,048) |
+| `FNX_PF_F32_SCALE=1` | experimental, off by default: scale each f32 input row to the dense prompt GEMMs before converting it to f16; rows that require scaling are recomputed from the original inputs in f32 to avoid losing smaller values in the same row. Requires FP32 accumulation (`FNX_PF_F16ACC=0`). Covers `pf_dense` and its reused K/V activations, not every f16 conversion or tensor-core operation; performance and model logits have not yet been measured |
 
 **Sums between the cards**
 

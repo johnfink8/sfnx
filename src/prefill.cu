@@ -353,6 +353,7 @@ struct Engine::Pf {
     int* ctl;                         // [1 + chunk rows / MAXT][2]: the chunk's (position, tag), then each group's
     Ring ring;
     bool f16acc = false;
+    float* dense_scales = nullptr;    // optional per-row scales for f32-to-f16 dense inputs
     // a pass's chunks: what a chunk carries from one layer, or one half, to the next (R, ctl, bo_f, inj_f, bo_a, inj_a
     // above point at the chunk's while it runs; [0] are those)
     int pass = 1;                     // chunks per pass: FNX_PF_PASS (default 2; 4 with an ExpertCache)
@@ -385,12 +386,16 @@ struct Engine::Pf {
 
 namespace {
 // out[t * ldo + r] = W[r] . X[t] for t < C: W f16 [rows][cols], X f16 [C][cols]
-void pf_gemm(Engine::Pf& p, const __half* W, int rows, int cols, const __half* X, int C, float* out, int ldo, cudaStream_t s) {
+void pf_gemm(Engine::Pf& p, const __half* W, int rows, int cols, const __half* X, int C, float* out, int ldo, cudaStream_t s,
+             const float* scales = nullptr, const float* original = nullptr) {
     if (std::getenv("FNX_PF_GEMM_LOG")) {   // each shape once (for tools/gemm_bench.cu)
         static std::set<std::tuple<int, int, int, int>> seen;
         if (seen.insert({rows, cols, C, ldo}).second) std::fprintf(stderr, "pf_gemm: rows %d cols %d C %d ldo %d\n", rows, cols, C, ldo);
     }
-    if (p.f16acc) {
+    if (scales) {
+        if (p.f16acc) throw std::runtime_error("prefill: scaled dense GEMM requires FP32 accumulation");
+        pf_scaled_gemm(p.blas, W, rows, cols, X, C, original, out, ldo, scales, s);
+    } else if (p.f16acc) {
         // f16 accumulation and output (llama.cpp's COMPUTE_16F on a V100), then to f32
         const __half one = __float2half(1.0f), zero = __float2half(0.0f);
         __half* tmp = reinterpret_cast<__half*>(p.up32);   // up32 is free outside the hc read
@@ -404,7 +409,8 @@ void pf_gemm(Engine::Pf& p, const __half* W, int rows, int cols, const __half* X
     }
 }
 // out = W . xh for a split-layout Q8_0 matrix (dequantized to f16), xh: C rows of cols as f16 already in p.xh
-void pf_dense_xh(Engine::Pf& p, const Q8S& w, int rows, int cols, int C, float* out, int ldo, cudaStream_t s) {
+void pf_dense_xh(Engine::Pf& p, const Q8S& w, int rows, int cols, int C, float* out, int ldo, cudaStream_t s,
+                 const float* scales = nullptr, const float* original = nullptr) {
     if (!w.q) throw std::runtime_error("prefill: a dense matrix without the split Q8_0 layout");
     if (cols % 32 != 0 || (size_t) cols > PF_WH) throw std::runtime_error("prefill: a dense matrix's rows don't fit the f16 staging");
     // in slices of rows that fit the staging buffer (each slice: its rows of out)
@@ -412,13 +418,14 @@ void pf_dense_xh(Engine::Pf& p, const Q8S& w, int rows, int cols, int C, float* 
     for (int r0 = 0; r0 < rows; r0 += slice) {
         const int nr = std::min(slice, rows - r0);
         k_q8s_f16<<<grid_for((size_t) nr * cols), 256, 0, s>>>(w.q + (size_t) r0 * cols, w.d + (size_t) r0 * cols / 32, (size_t) nr * cols, p.wh);
-        pf_gemm(p, p.wh, nr, cols, p.xh, C, out + r0, ldo, s);
+        pf_gemm(p, p.wh, nr, cols, p.xh, C, out + r0, ldo, s, scales, original);
     }
 }
 // the same from x (f32, C rows of cols), converted into p.xh first
 void pf_dense(Engine::Pf& p, const Q8S& w, int rows, int cols, const float* x, int C, float* out, int ldo, cudaStream_t s) {
-    k_f32_f16<<<grid_for((size_t) C * cols), 256, 0, s>>>(x, (size_t) C * cols, p.xh);
-    pf_dense_xh(p, w, rows, cols, C, out, ldo, s);
+    if (p.dense_scales) pf_f32_f16_scaled(x, cols, C, p.xh, p.dense_scales, s);
+    else k_f32_f16<<<grid_for((size_t) C * cols), 256, 0, s>>>(x, (size_t) C * cols, p.xh);
+    pf_dense_xh(p, w, rows, cols, C, out, ldo, s, p.dense_scales, x);
 }
 // out = W . x, f32 weights [rows][cols] and activations
 void pf_sgemm(Engine::Pf& p, const float* W, int rows, int cols, const float* x, int C, float* out, int ldo) {
@@ -582,6 +589,10 @@ void Engine::prefill_alloc() {
         ckb(cublasSetStream(p->blas, b.st), "stream");
         ckb(cublasSetMathMode(p->blas, CUBLAS_TENSOR_OP_MATH), "math mode");
         p->f16acc = env_flag("FNX_PF_F16ACC");
+        if (env_flag("FNX_PF_F32_SCALE")) {
+            if (p->f16acc) throw std::runtime_error("FNX_PF_F32_SCALE requires FNX_PF_F16ACC=0");
+            p->dense_scales = palloc<float>((size_t) pf_c_ * HC);
+        }
         const int ffs = w.ff1 - w.ff0, rs_qkvz = w.conv_ch() + w.nv() * HS;
         // the borrowed block (the recurrent snapshots): the phase region, then whole-chunk scratch; the rest on its own
         Arena big{(char*) b.snap_block, b.snap_block_bytes};
@@ -1088,8 +1099,8 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                     finish_att(c, b, w, p, l);   // the previous chunk's, before qg is this chunk's
                     // mixed to f16 again (finish_att's wo used xh), then k and v from that
                     pf_dense(p, L.wq.s, NQH * 2 * HD, N, p.mixed, C, p.qg, NQH * 2 * HD, s);
-                    pf_dense_xh(p, L.wk.s, NKVH * HD, N, C, p.k, NKVH * HD, s);
-                    pf_dense_xh(p, L.wv.s, NKVH * HD, N, C, p.v, NKVH * HD, s);
+                    pf_dense_xh(p, L.wk.s, NKVH * HD, N, C, p.k, NKVH * HD, s, p.dense_scales, p.mixed);
+                    pf_dense_xh(p, L.wv.s, NKVH * HD, N, C, p.v, NKVH * HD, s, p.dense_scales, p.mixed);
                     attn_prep(p.qg, p.k, L.q_norm, L.k_norm, NQH, NKVH, p.ctl, C, eps, rope_of(b.mrope), s);
                     kv_append(p.k, p.v, b.kc[l], b.vc[l], b.pg, b.att_ring.card, C, p.ctl, s);
                     // the indexer: bf16 projections as f32 (llama.cpp's choice past 8 rows on a V100)
