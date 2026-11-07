@@ -14,7 +14,7 @@
   "--lookup",
   "15",
   "--conversation-cache-mib",
-  "131072",
+  "65536",
   "--batch",
   "6",
   "--vision"

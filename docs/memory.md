@@ -100,7 +100,7 @@ they are, plus `FNX_NGRAM=disk`):
 | Q8_0, `FNX_NGRAM=disk` | 0.63 GiB | 122.8 GiB | 120.2 GiB |
 
 The picture encoder (0.5 GiB) and the front end (0.2 GiB) come on top, and so does the conversation cache as it fills
-(`--conversation-cache-mib`: 128 GiB in prod's config, which a box short of RAM sets lower). From the GGUFs' headers,
+(`--conversation-cache-mib`: 64 GiB in prod's config, which a box short of RAM sets lower). From the GGUFs' headers,
 UD-Q5_K_XL pins 98.4 GB of experts and locks 55.1 GB of embeddings: 142.9 GiB against a 128 GiB box, 92.2 GiB with
 the table on the disk.
 
