@@ -292,7 +292,7 @@ private:
     // the windows skip the plan and copy)
     bool cache_live() const {
         const ExpertCache& ec = m_.cards[0].ec;
-        return ec.n_slots && (!arena_cap_ || !ec.arena_full || arena_w_ > arena_base_);
+        return ec.n_slots && !ec.slots_static && (!arena_cap_ || !ec.arena_full || arena_w_ > arena_base_);
     }
     void dump_dev(const std::string& name, int layer, const float* p, int T, int n);
     void enqueue(int T, bool dumps);
