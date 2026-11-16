@@ -175,6 +175,7 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
             b->cvc_scale = dalloc<float>(MAXT);
             ck(cudaMemset(b->cvc_scale, 0, MAXT * 4), "cvc scale");
         }
+        b->hcs = dalloc<float>(hc_scratch_floats(MAXT));   // the hc read's scratch: its last float is the barrier counter
         if (const int g = hc_prepare(b->hcs); g < hc_blocks())
             std::fprintf(stderr, "fnx: card %d: %d SMs: the hc read runs its %d blocks of work on %d\n", c, g, hc_blocks(), g);
         if (std::getenv("FNX_HC_BAR_WRAP")) {
