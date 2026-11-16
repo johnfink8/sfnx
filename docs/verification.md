@@ -327,6 +327,21 @@ turn: on a V100 with the grid held to 72 (`kbench`, as a 72-SM PG500-216 runs it
 1-5 rows, x1.69 at 8 and x2.00 at 16, the blocks with two shares setting the pace. The engine refuses as it loads a
 card of another arch than the build's (`src/card_check.hpp`).
 
+## Control vectors
+
+The feature is off with nothing set: with no `FNX_CVEC` the engine makes no control-vector call anywhere, and its
+logits are the logits it was. Two GPU checks say the off path stayed that way and what the on path does.
+**Neither has run yet; these are the checks to run, not results.**
+
+| Check | What it proves | How |
+| --- | --- | --- |
+| off-parity | a build with the feature compiled, `FNX_CVEC` unset, against the same build's base and against the llama.cpp teachers | `tools/lab.sh start` (no cvec), `exact base`, then `exact` on the same build: byte for byte against the base, within the bar against llama.cpp |
+| on, at the model level | the edit runs on the outputs it names and the model still holds together: logits stay finite, the bar's own KL measured with the vector at 1.0 and 1.78 (the reading is not a weight edit; a runtime direction file's agreement with one is exactly what this measures) | `lab.sh start "" "-E FNX_CVEC=<file>:1.0"`, `exact`; the same at `:1.78` |
+| on, at the behavior level | a refusal probe: the same short set of prompts that the base model refuses, answered with `cvec=0` on the request line versus absent | `lab.sh cmd` / the front end's `experimental_speed_projection` |
+
+A control vector costs one small kernel per block output: 48 blocks x (one pass over a [T][2,560] row) per window
+and per prompt chunk. Measured with `lab.sh decode` against the same build with `FNX_CVEC` unset. Not measured yet.
+
 ## The test inventory
 
 | What | How |
@@ -348,6 +363,7 @@ card of another arch than the build's (`src/card_check.hpp`).
 | The n-gram table read from the disk against the mapping, byte for byte, with its reads' rate (CPU; needs the model) | `bin/ple_test MODEL.gguf ref/long64.bin ref/edit1.bin` |
 | The top-k ties | `bin/topk_test` |
 | The engine's stdin handling | `bin/sfnx_input_test` |
+| The control vector's settings and its file checks: a direction file against the model (widths, layer indexes, unit norms, hints, a matrix named `direction.N`, a lying `layer_count`), ranges, and the settings refused naming their values; the real direction file the feature is built for loads (47 directions of 2,560, blocks 1..47) | `bin/cvec_test [DIRECTION.gguf]` (CPU) |
 | The conversation cache where prompts share much: two conversations alternating on a lane, a system prompt changed near its end | `tools/lab.sh cmd cache2` |
 | The front end's own tests | `.venv/bin/python -m pytest -q front/` (591 passed, 3 skipped without the anthropic SDK, ~4 min; against fake engines, no `bin/sfnx`) |
 
