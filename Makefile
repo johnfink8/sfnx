@@ -178,7 +178,7 @@ bin/fnx_run bin/sample_test bin/cache_test bin/lanes_test bin/batch_test: bin/%:
 # the lab (tools/fnx_lab.cpp): bin/fnx_lab keeps the model loaded and runs fnx_run's commands from build/libfnx_lab.so,
 # which holds the engine and is reloaded after a rebuild; both use the shared CUDA runtime, and the lab exports the
 # model's code (gguf, model) to the library
-LAB_OBJ := $(KERN_OBJ) build/moe_mma.o build/engine.o build/engine_common.o build/peer_probe.o build/prefill.o build/session.o build/batch.o build/pic/tool_fnx_run.o
+LAB_OBJ := $(KERN_OBJ) build/moe_mma.o build/engine.o build/engine_common.o build/peer_probe.o build/prefill.o build/session.o build/batch.o build/cvec.o build/pic/tool_fnx_run.o
 build/pic/tool_fnx_run.o: tools/fnx_run.cpp $(STAMPS)
 	@mkdir -p build/pic
 	$(NVCC) $(NVFLAGS) -Xcompiler -fPIC -DFNX_LAB_LIB -MD -MF build/pic/tool_fnx_run.d -c -o $@ $<
