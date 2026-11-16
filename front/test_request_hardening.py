@@ -222,6 +222,26 @@ class Hardening(unittest.TestCase):
         self.assertEqual(code, 400, out)
         self.assertIn("seed", json.dumps(out))
 
+    def test_control_vector_field_is_a_bool_or_a_400(self):
+        """experimental_speed_projection: a JSON bool flows through to the engine's sampling dict (unknown request
+        keys are the sampling dict); any other type is a 400 that names the field."""
+        from front.server import check_request_sampling
+        for ok in (True, False, None):
+            req = {"experimental_speed_projection": ok}
+            check_request_sampling(req)
+            self.assertEqual(req, {"experimental_speed_projection": ok})
+        for bad in ("false", 0, 1, [], {}):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "experimental_speed_projection"):
+                check_request_sampling({"experimental_speed_projection": bad})
+        chat = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 8}
+        for value in (True, False):
+            code, out = self.post("/v1/chat/completions", {**chat, "experimental_speed_projection": value})
+            self.assertEqual(code, 200, out)
+        with mock.patch("builtins.print"):
+            code, out = self.post("/v1/chat/completions", {**chat, "experimental_speed_projection": "false"})
+        self.assertEqual(code, 400, out)
+        self.assertIn("experimental_speed_projection", json.dumps(out))
+
     def test_in_type_values_and_nulls_still_answer(self):
         chat = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 8, "temperature": 0, "top_k": 0,
                 "seed": 7}

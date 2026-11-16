@@ -926,6 +926,13 @@ class StrataEngine:
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:
             keys += " ckpt=0"
+        # "experimental_speed_projection": false - this request runs without the refusal-direction control vector
+        # the engine loaded at startup (cvec=0); true asks for it by name (cvec=1).  Absent / null emits nothing:
+        # the engine's default (on when a vector was loaded, meaningless when none was).
+        if sampling.get("experimental_speed_projection") is False:
+            keys += " cvec=0"
+        if sampling.get("experimental_speed_projection") is True:
+            keys += " cvec=1"
         # #2228: the pictures' keys (hex, in prompt order): the engine matches a picture by them, not by its embeddings
         ik = sampling.get("strata_img_keys")
         if isinstance(ik, list) and ik and all(isinstance(k, str) and k and all(c in "0123456789abcdef" for c in k)
@@ -5000,7 +5007,9 @@ def check_request_sampling(req) -> None:
     greedy, top_k 0 or above TOP_K_MAX is clamped, a negative seed is unset), and an absent or null field is not checked.
     A seed past SEED_MAX, which the engine cannot take, is a 400 too; 0 is a seed like any other.  NaN and the
     infinities (JSON numbers Python accepts, or strings) are a 400: a NaN temperature was sent as greedy.  A
-    `logit_bias` is a 400: the engine has none."""
+    `logit_bias` is a 400: the engine has none.  `experimental_speed_projection` is a JSON bool or absent: a number
+    or string naming it is a 400 like the others, because a truthy value there is an answer that used the control
+    vector when the client asked not to, or the reverse."""
     if isinstance(req, dict) and req.get("logit_bias"):
         raise ValueError("logit_bias: not supported by sfnx")
     if isinstance(req, dict):      # #1819: llama.cpp's names; the OpenAI-style field wins when both are sent
@@ -5034,6 +5043,9 @@ def check_request_sampling(req) -> None:
             raise ValueError(f"{key}: a finite number, not {value!r}")
         if key == "seed" and value > SEED_MAX:
             raise ValueError(f"seed: at most {SEED_MAX}")
+    esp = (req or {}).get("experimental_speed_projection")
+    if esp is not None and not isinstance(esp, bool):
+        raise ValueError("experimental_speed_projection: a boolean")
 
 
 # The sampling each model card recommends ("Best Practices"), used when neither the request, the Chat settings nor the

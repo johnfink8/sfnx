@@ -1343,6 +1343,38 @@ class SamplingKeys(unittest.TestCase):
         for absent in ({}, {"strata_checkpoint": True}, {"strata_checkpoint": 0}, {"cache_prompt": False}):
             self.assertNotIn("ckpt=0", self.keys(**absent), absent)
 
+    def test_control_vector_key(self):
+        """experimental_speed_projection false / true runs this request without / with the refusal-direction control
+        vector (cvec=0 / cvec=1); absent, null or a non-bool emits nothing - the engine's default."""
+        self.assertIn("cvec=0", self.keys(temperature=0, experimental_speed_projection=False))
+        self.assertIn("cvec=1", self.keys(temperature=0, experimental_speed_projection=True))
+        for absent in ({}, {"experimental_speed_projection": None}, {"experimental_speed_projection": 0},
+                       {"experimental_speed_projection": 1}, {"experimental_speed_projection": "false"}):
+            self.assertFalse([k for k in self.keys(temperature=0, **absent) if k.startswith("cvec=")], absent)
+
+    def gen_line(self, sampling):
+        """The GEN line generate() writes for this sampling dict, against a bare engine (a mock process, the answer
+        queued on the pipe): the field on the wire, not only in the helper."""
+        import queue
+        engine = StrataEngine.__new__(StrataEngine)
+        engine.proc = mock.Mock()
+        engine.proc.stdin = io.StringIO()
+        engine.proc.poll.return_value = None
+        engine.lines, engine.can_stop, engine.max_context = queue.Queue(), False, 4096
+        engine.silence_s, engine.log_path = 0, None
+        engine._activity = lambda: None
+        for line in ("T 5", "DONE 1 1 1 1 length 0 0 0"):
+            engine.lines.put(line)
+        self.assertEqual(list(engine.generate([1], 10, sampling, threading.Event())), [5])
+        return engine.proc.stdin.getvalue()
+
+    def test_control_vector_reaches_the_gen_line(self):
+        self.assertIn("GEN 10 cvec=0 ", self.gen_line({"experimental_speed_projection": False}))
+        self.assertIn("GEN 10 cvec=1 ", self.gen_line({"experimental_speed_projection": True}))
+        plain = self.gen_line({})
+        self.assertIn("GEN 10 1", plain)                    # max_new, then the ids: nothing between them
+        self.assertNotIn("cvec=", plain)
+
     def test_seed(self):
         """0 is a seed like any other (it used to be dropped, so seed 0 drew a random one); no seed= is the engine's
         random draw, and so is a negative seed (llama.cpp's -1)."""
