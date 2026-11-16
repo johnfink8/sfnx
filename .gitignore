@@ -30,3 +30,11 @@ ref/ref_ub5.bin
 
 # the GGUFs: a link to the folder holding UD-Q4_K_XL/, Q8_0/ and mmproj-F16.gguf (see README, "Running it")
 models
+
+# this box's launchers and their configs (*.log above already covers serve/sfnx-q6.log)
+run-q4_k_xl_v2.sh
+run-q6_k_xl.sh
+sfnx.json
+sfnx-q6.json
+sfnx_old.json
+serve/sfnx-q6.log
