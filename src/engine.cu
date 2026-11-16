@@ -993,11 +993,7 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
 // every card's work for one window of T rows, in stream order (captured into a graph unless dumping)
 // a lane runs its rows with the vector or without it (the default is with). Windows mix lanes: each row carries its
 // lane's scale, and a row with scale 0 subtracts nothing at every boundary, bit for bit the fold it was.
-void Engine::set_cvec_lane(int i, bool on) {
-    if (i < 0 || i >= (int) lanes_.size()) throw std::runtime_error("set_cvec_lane: no lane " + std::to_string(i));
-    lanes_[(size_t) i].cvec = on;
-    if (i == cur_) cvec_cur_ = on;
-}
+
 
 // The boundary projection's read arguments (cvec.hpp): the pair a read folding block `produced`'s finished output
 // takes - that block's direction on the card, and the per-(row, stream) coefficients this window's rows need. The

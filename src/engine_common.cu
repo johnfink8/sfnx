@@ -573,6 +573,16 @@ void Engine::commit(int n) {
     pending_.clear();
 }
 
+// A lane runs its rows with the control vector or without it (the default is with): a row without it subtracts
+// nothing at every boundary and its bits stay exactly what they were. The 27B has no vector (its Engine refuses
+// FNX_CVEC), so there its lanes' settings are bookkeeping only; the definition lives here, not in either model's
+// engine file, because the sessions that use it are shared.
+void Engine::set_cvec_lane(int i, bool on) {
+    if (i < 0 || i >= (int) lanes_.size()) throw std::runtime_error("set_cvec_lane: no lane " + std::to_string(i));
+    lanes_[(size_t) i].cvec = on;
+    if (i == cur_) cvec_cur_ = on;
+}
+
 std::vector<float> Engine::last_logits(int T) const {
     const int vocab = m_.cards[NCARD - 1].v1;
     std::vector<float> out((size_t) T * vocab);
