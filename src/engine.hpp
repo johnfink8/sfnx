@@ -353,13 +353,14 @@ private:
     int cvec_ran_ = -1;      // and the same for cvec_ran: what the current lane's state was built under
     float cvc_scale_of(int lane) const { return cvec_.on() && lanes_[(size_t) lane].cvec ? (float) cvec_.spec.scale : 0.0f; }
 
-    // the control vector's edit on block `produced`'s summed attention-half output (its bo_a, the ring done on
-    // every card) and on its shared expert's rows (the shared half of part, before the ring folds the routed
-    // experts in): cvec.hpp gives why those buffers and no others. No call when no vector is loaded or this block
-    // carries no direction: the rows are exactly the rows they were.
-    void cvec_rows_at(CardBuf& b, int produced, float* x, int T);
-    // the same at the prompt path's scale: a chunk is one lane's rows (its lane's scale rides with the call)
-    void cvec_rows_chunk(CardBuf& b, int produced, float* x, int C);
+    // The boundary projection (cvec.hpp): the read that folds block `produced`'s finished output into the hidden
+    // takes the pair {its direction on this card, the window's per-(row, stream) coefficients}; cvc_coeffs computes
+    // them from the same fold the read computes, with each row's lane's scale (0: the lane runs without the vector,
+    // and those rows keep exactly their bits). Nulls when no vector is loaded or this block carries none.
+    std::pair<const float*, const float*> cvc_boundary(CardBuf& b, int produced, const float* bo, int T);
+    // the card's copy of block `produced`'s direction (null when no vector or the block carries none): the prompt
+    // path's fold kernel projects its own row, so it needs the direction and the lane's scale, no coefficients
+    const float* cvc_direction(CardBuf& b, int produced) const;
     // a window ran on a lane under setting `on`: the same setting keeps its state uniformly one setting's; another
     // makes it a mix, which no reuse can take
     static void cvec_ran_run(int& ran, bool on) {
@@ -376,7 +377,7 @@ private:
                    uint16_t* qsa_ring, uint16_t* qsa_pooled, int call);
     // produced: the block this half is the FFN output of (its summed bo_f gets that block's control vector edit);
     // -1 for the draft layer, which carries none
-    void ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW& L, float* R, const int* ctl, int produced);
+    void ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW& L, float* R, const int* ctl);
 #if FNX_27B
     // the 27B's window (s27_engine.cu): the layers and head over T rows, one sequence's or a batched window's (lanes),
     // with the recurrent core each kind runs

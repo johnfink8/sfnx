@@ -47,11 +47,21 @@ struct HcArgs {
     block_q8_1* q8;      // mixed as q8_1 too, or null
     int8_t* tq = nullptr;   // and its split twin, or null
     float* td = nullptr;
+    const float* cvd = nullptr;   // the boundary projection (src/cvec.hpp): the producing block's unit direction, and
+    const float* cvc = nullptr;   // the per-(row, stream) coefficients rprime subtracts. Nulls: the read is what it was.
 };
 
 __device__ __forceinline__ float rprime(const HcArgs& a, int t, int c, int i) {
     float r = a.R[(size_t) t * D + c * N + i];
     if (a.bo) r = fmaf(a.bo[(size_t) t * N + i], 2.0f * sigm(a.inj_prev[t * HC + c] / (float) HC), r);
+    // the boundary projection (cvec.hpp): the value this read computes is the hidden with the producing block's
+    // output folded in; its component along that block's direction is removed here, so every consumer of rprime -
+    // the norm's and the square sums' rows, the stored residual, this read's mix - sees only the projected value.
+    // A row whose lane runs without the vector has coefficient 0 and keeps exactly its bits.
+    if (a.cvd) {
+        const float cf = a.cvc[t * HC + c];
+        if (cf != 0.0f) r = fmaf(-cf, a.cvd[i], r);
+    }
     return r;
 }
 

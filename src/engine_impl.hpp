@@ -82,6 +82,7 @@ struct CardBuf {
     // window's per-row scales [MAXT] (0: that row's lane runs without the vector)
     float* cvec_dir = nullptr;
     float* cvc_scale = nullptr;
+    float* cvc_coef = nullptr;   // the boundary coefficients of the window in flight (cvec.hpp)
     char* stage[2] = {nullptr, nullptr};   // a parked state's copies pass through these page-locked halves (engine.cu)
     cudaEvent_t stage_ev[2] = {nullptr, nullptr};
     std::vector<LaneDev> lanes;

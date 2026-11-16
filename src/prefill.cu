@@ -95,7 +95,8 @@ constexpr int HCB_THREADS = 256, HCB_PER = N / HCB_THREADS;
 static_assert(N % HCB_THREADS == 0, "stream elements per thread");
 __global__ void __launch_bounds__(HCB_THREADS) k_hcb_prep(float* __restrict__ R, const float* __restrict__ bo, const float* __restrict__ inj,
                                                           const float* __restrict__ wn, float* __restrict__ rs, __half* __restrict__ xh,
-                                                          float eps, const uint16_t* __restrict__ w_inj, float* __restrict__ inject_out) {
+                                                          float eps, const uint16_t* __restrict__ w_inj, float* __restrict__ inject_out,
+                                                          const float* __restrict__ cvd, float uni) {
     const int t = blockIdx.x, i0 = threadIdx.x;
     __shared__ float sh[32];
     __shared__ float shi[HC][HCB_THREADS / 32];
@@ -114,6 +115,30 @@ __global__ void __launch_bounds__(HCB_THREADS) k_hcb_prep(float* __restrict__ R,
             }
             v[k] = r;
             ss += r * r;
+        }
+        // the boundary projection (src/cvec.hpp): this kernel is where the read folds the producing block's finished
+        // output into the hidden, so the projected row is the only row any later kernel sees. The dot is over the
+        // folded row, in this kernel's own order; a chunk is one lane's rows, so its lane's scale rides with the
+        // call and 0 (a lane running without the vector, or a block outside the applied range) skips the write
+        // outright: the bits stay exactly what they were.
+        if (cvd && uni) {
+            float dacc = 0.f;
+#pragma unroll
+            for (int k = 0; k < HCB_PER; ++k) dacc = fmaf(v[k], cvd[i0 + k * HCB_THREADS], dacc);
+            const float cf = uni * pf_block_sum(dacc, sh);
+            if (cf != 0.0f) {
+#pragma unroll
+                for (int k = 0; k < HCB_PER; ++k) {
+                    const int i = i0 + k * HCB_THREADS;
+                    const float rp = fmaf(-cf, cvd[i], v[k]);
+                    v[k] = rp;
+                    R[(size_t) t * D + c * N + i] = rp;
+                }
+                // the projection changed the row: its square sum is what the normalization below must use
+                ss = 0.f;
+#pragma unroll
+                for (int k = 0; k < HCB_PER; ++k) ss += v[k] * v[k];
+            }
         }
         const float r_s = rsqrtf(pf_block_sum(ss, sh) / (float) N + eps);
         if (i0 == 0) rs[t * HC + c] = r_s;
@@ -427,8 +452,9 @@ void pf_sgemm(Engine::Pf& p, const float* W, int rows, int cols, const float* x,
 }
 // the hyper-connection read for C rows (see hc.cuh for what it computes)
 void pf_hc_read(Engine::Pf& p, float* R, const float* bo, const float* inj_prev, const float* w_norm, const Q8S& w_down, const Q8S& w_up,
-                const uint16_t* w_inj, float eps, float* mixed, float* inject, int C, cudaStream_t s) {
-    k_hcb_prep<<<C, HCB_THREADS, 0, s>>>(R, bo, inj_prev, w_norm, p.rs, p.xh, eps, w_inj, inject);   // the inject rows here
+                const uint16_t* w_inj, float eps, float* mixed, float* inject, int C, cudaStream_t s,
+                const float* cvd, float uni) {
+    k_hcb_prep<<<C, HCB_THREADS, 0, s>>>(R, bo, inj_prev, w_norm, p.rs, p.xh, eps, w_inj, inject, cvd, uni);   // the inject rows here
     k_q8s_f16<<<grid_for((size_t) LR * D), 256, 0, s>>>(w_down.q, w_down.d, (size_t) LR * D, p.wh);
     pf_gemm(p, p.wh, LR, D, p.xh, C, p.lo32, LR, s);
     k_hcb_lo<<<grid_for((size_t) C * LR), 256, 0, s>>>(p.lo32, C * LR, p.lo16);
@@ -848,7 +874,7 @@ void Engine::prefill_draft(int C, int set) {
         rms_norm_rows(p.R, mc.norm_hid, p.xf, C, D, eps, s);
         pf_dense(p, mc.fc_hid.s, N, N, p.xf, HC * C, p.up32, N, s);
         add_streams(p.up32, p.bo_f, p.R, C, s);
-        pf_hc_read(p, p.R, nullptr, nullptr, L.hc_norm[0], L.hc_down[0], L.hc_up[0], nullptr, eps, p.mixed, nullptr, C, s);
+        pf_hc_read(p, p.R, nullptr, nullptr, L.hc_norm[0], L.hc_down[0], L.hc_up[0], nullptr, eps, p.mixed, nullptr, C, s, nullptr, 0.0f);
         if (L.idx_wq) {
             k_bf16_f32<<<grid_for((size_t) 512 * N), 256, 0, s>>>(L.idx_wq, (size_t) 512 * N, p.widx);
             k_bf16_f32<<<grid_for((size_t) 128 * N), 256, 0, s>>>(L.idx_wk, (size_t) 128 * N, p.widx + (size_t) 512 * N);
@@ -1076,8 +1102,9 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                                  w.ple_norm_query, w.ple_norm_conv, w.ple_conv, b.ple_hist, b.ple_hsnap, Tg, eps, s, p.ple_tmp);
                     }
                 }
+                // cvec.hpp: this read folds block l-1's finished output: the boundary projection, this lane's scale
                 pf_hc_read(p, p.R, apply ? p.bo_f : nullptr, p.inj_f, L.hc_norm[0], L.hc_down[0], L.hc_up[0], L.hc_inj[0], eps, p.mixed,
-                           p.inj_a, C, s);
+                           p.inj_a, C, s, cvc_direction(b, l - 1), cvc_scale_of(cur_));
                 if (!is_attn(l)) {
                     const int nv = w.nv(), ch = w.conv_ch(), rs_qkvz = ch + nv * HS;
                     pf_dense_xh(p, L.qkvz.s, rs_qkvz, N, C, p.qkvz, rs_qkvz, s);   // xh: the hc read's f16 of mixed
@@ -1139,8 +1166,8 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                 // the draft layer's source: R with the last attention write folded in, as a window's FFN-half read leaves it
                 each([&](int, CardBuf& b, const CardW& w, Pf& p) {
                     const LayerW& L = w.L[l];
-                    cvec_rows_chunk(b, l, p.bo_a, C);   // this block's summed attention half, before the fold
-                    pf_hc_read(p, p.R, p.bo_a, p.inj_a, L.hc_norm[1], L.hc_down[1], L.hc_up[1], L.hc_inj[1], eps, p.mixed, p.inj_f, C, b.st);
+                    pf_hc_read(p, p.R, p.bo_a, p.inj_a, L.hc_norm[1], L.hc_down[1], L.hc_up[1], L.hc_inj[1], eps, p.mixed, p.inj_f, C, b.st,
+                               nullptr, 0.0f);
                 });
                 continue;
             }
@@ -1154,8 +1181,8 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                     gu_e.ep = p.ep_gu + (size_t) l * NEXP, down_e.ep = p.ep_dn + (size_t) l * NEXP;
                     if (j == 0) ckc(cudaStreamWaitEvent(s, p.ev_ready[l & 1], 0), "stage in");
                 }
-                cvec_rows_chunk(b, l, p.bo_a, C);   // this block's summed attention half, before the fold
-                pf_hc_read(p, p.R, p.bo_a, p.inj_a, L.hc_norm[1], L.hc_down[1], L.hc_up[1], L.hc_inj[1], eps, p.mixed, p.inj_f, C, s);
+                pf_hc_read(p, p.R, p.bo_a, p.inj_a, L.hc_norm[1], L.hc_down[1], L.hc_up[1], L.hc_inj[1], eps, p.mixed, p.inj_f, C, s,
+                           nullptr, 0.0f);
                 if (p.moe_q8) quantize_q8_1(p.mixed, p.xq, N, C, s);   // else xh holds the hc read's f16 of mixed
                 pf_sgemm(p, L.router, NEXP + 1, N, p.mixed, C, p.logits, NEXP + 1);
                 k_pf_top10<<<(C + 7) / 8, 256, 0, s>>>(p.logits, C, p.topi, p.topw);
@@ -1185,8 +1212,6 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                 m.part = p.part;
                 m.topw = p.topw;
                 m.logits = p.logits;
-                cvec_rows_chunk(b, l, p.part + (size_t) C * TOPK * N, C);   // the shared expert's rows, before the
-                //                                                            ring sums the block's FFN output
                 if (p.ring_sm) ring_sum(p.ring, p.bo_f, C, (const unsigned*) (p.ctl + 1), 2 * l + 1, b.st, m);
                 else if (p.overlap) ring_async(c, b, p, p.bo_f, &m, j, p.ev_rf[j], C);
                 else pf_ring(p, c, p.bo_f, C, &m, b.ring.err, b.st);
