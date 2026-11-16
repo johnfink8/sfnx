@@ -657,7 +657,8 @@ void Engine::prefill_alloc() {
         p->bo_f = palloc<float>((size_t) pf_c_ * N);
         p->inj_a = palloc<float>((size_t) pf_c_ * HC);
         p->inj_f = palloc<float>((size_t) pf_c_ * HC);
-        p->moe_q8 = env_flag("FNX_PF_MOE_Q8");
+        // Q6_K experts have no tensor-core tile (moe_mma). The q8_1 kernels do (vec_dot_q6_K_q8_1).
+        p->moe_q8 = env_flag("FNX_PF_MOE_Q8") || w.L[0].gu_e.type == T_Q6_K || w.L[0].down_e.type == T_Q6_K;
         if (p->moe_q8) {
             p->xq = palloc<uint8_t>((size_t) pf_c_ * q8_1_bytes(N));
             q8_twin(p->xq, (size_t) pf_c_ * q8_1_bytes(N), palloc<int8_t>((size_t) pf_c_ * N), palloc<float>((size_t) pf_c_ * N / 32));
