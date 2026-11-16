@@ -1097,6 +1097,44 @@ void hc_preset_barrier(float* scratch, unsigned barriers_left) {
     if (e != cudaSuccess) throw std::runtime_error(std::string("hc_preset_barrier: ") + cudaGetErrorString(e));
 }
 
+namespace {
+// a control vector on a finished half's summed output, at the point its ring wrote the same full sum on every card
+// and before the next read folds it: each row of x loses its component along the producing block's unit direction,
+// x -= s * (x . v) * v. s: per-row scales [T] (a row whose lane runs without the vector has 0, and it is skipped
+// outright: its bits stay exactly what they were), or null with the one scale uni for every row (a prompt read: one
+// lane's rows). One block per row, 256 threads, ten elements each: the whole row is in registers for the write-back,
+// its dot by block_sum. Every card runs it on identical inputs, so the corrected rows stay identical on every card.
+constexpr int CV_THREADS = 256, CV_PER = N / CV_THREADS;
+__global__ void __launch_bounds__(CV_THREADS) k_cvec(const float* __restrict__ v, float* __restrict__ x,
+                                                     const float* __restrict__ s, float uni) {
+    const int t = blockIdx.x, i0 = threadIdx.x;
+    const float sc = s ? s[t] : uni;
+    if (!sc) return;
+    __shared__ float sh[CV_THREADS / 32];
+    float* xrow = x + (size_t) t * N;
+    float e[CV_PER];
+    float acc = 0.f;
+#pragma unroll
+    for (int k = 0; k < CV_PER; ++k) {
+        const int i = i0 + k * CV_THREADS;
+        e[k] = xrow[i];
+        acc = fmaf(e[k], v[i], acc);
+    }
+    const float c = sc * block_sum(acc, sh);
+    if (c == 0.f) return;   // a row whose component is zero: leave even a signed zero of it untouched
+#pragma unroll
+    for (int k = 0; k < CV_PER; ++k) {
+        const int i = i0 + k * CV_THREADS;
+        xrow[i] = fmaf(-c, v[i], e[k]);
+    }
+}
+}  // namespace
+
+void cvec_rows(const float* v, float* x, const float* s, float uni, int T, void* st) {
+    k_cvec<<<T, CV_THREADS, 0, (cudaStream_t) st>>>(v, x, s, uni);
+    ck_launch("cvec_rows");
+}
+
 #endif
 #if FNX_KPART == 0
 void route(const float* logits, int T, int* topi, float* topw, Job* jobs_gu, Job* jobs_down, int* njobs, void* st) {

@@ -65,6 +65,9 @@ struct GenStats {
 struct ReadHints {
     int keep = -1;       // keep=N: a checkpoint where the trailing late notes start
     bool cache = true;   // ckpt=0: a one-off request (no checkpoints, nothing parked for it)
+    int cvec = -1;       // cvec=0 / cvec=1: this conversation's lane runs without / with the control vector
+                         // (-1: the engine's default). A conversation's states are stamped with the setting they
+                         // ran under; a request of the other setting re-reads its prompt (Session::read).
     std::vector<Engine::Image> images;   // the prompt's images (Engine::set_images), their rows alive through the read
 };
 

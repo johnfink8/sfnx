@@ -68,6 +68,13 @@ void hc_read(float* R, const float* bo_prev, const float* inj_prev, const float*
 // of the wrap (FNX_HC_BAR_WRAP)
 void hc_preset_barrier(float* scratch, unsigned barriers_left);
 
+// A control vector on a finished half's summed output (src/cvec.hpp): each row of x loses its component along the
+// producing block's unit direction v, x -= s * (x . v) * v, run before the next read folds it. s: per-row scales
+// [T] (0: that row's lane runs without the vector, and its row keeps exactly its bits), or null with one scale uni
+// for every row (a prompt read: its rows all belong to one lane). Run right after the half's ring wrote the same
+// full sum on every card: identical inputs and a deterministic reduction keep the corrected rows identical.
+void cvec_rows(const float* v, float* x, const float* s, float uni, int T, void* st);
+
 // MoE routing: logits [T][NEXP] -> softmax, top-10, weights renormalized; jobs for the gate/up launch (rows = tokens,
 // outputs = pairs t*TOPK+k) and for the down launch (rows = outputs = pairs), counts in njobs[0..1]
 void route(const float* logits, int T, int* topi, float* topw, Job* jobs_gu, Job* jobs_down, int* njobs, void* st);

@@ -41,7 +41,7 @@ MAKEFLAGS += --no-builtin-rules
 .SUFFIXES:
 build: bin/sfnx bin/sfnx-vision
 test-bin: bin/fnx_run bin/batch_test bin/cache_test bin/sample_test bin/gguf_test bin/topk_test bin/sfnx_input_test bin/batch_plan_test \
-          bin/stage_test bin/pf_ring_plan_test bin/rope_test bin/card_check_test bin/ple_test
+          bin/stage_test bin/pf_ring_plan_test bin/rope_test bin/card_check_test bin/ple_test bin/cvec_test
 CONFIG ?= serve/sfnx.json
 # The config is checked as the front end checks it before loading anything (front.check_config), so a config it would
 # refuse stops the install rather than a boot; what needs the model (the context against its trained length) the engine
@@ -112,6 +112,9 @@ bin/ple_test: tools/ple_test.cpp tools/ref_tokens.hpp src/ple_io.cpp src/ple_io.
 	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -pthread -DFNX_27B=$(FNX_27B) -o $@ tools/ple_test.cpp src/ple_io.cpp src/gguf.cpp
 bin/stage_test: tools/stage_test.cpp src/gguf.cpp src/gguf.hpp build/model
 	mkdir -p bin && g++-14 -O2 -std=c++17 -DFNX_27B=$(FNX_27B) -o $@ tools/stage_test.cpp src/gguf.cpp -lpthread
+bin/cvec_test: tools/cvec_test.cpp src/cvec.cpp src/cvec.hpp src/gguf.cpp src/gguf.hpp src/env.hpp build/model
+	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -DFNX_27B=$(FNX_27B) -o $@ tools/cvec_test.cpp src/cvec.cpp src/gguf.cpp
+
 bin/sfnx_input_test: tools/sfnx_input_test.cpp tools/sfnx_input.hpp
 	mkdir -p bin && g++-14 -O2 -std=c++17 -Wall -pthread -o $@ tools/sfnx_input_test.cpp
 # the batched drafts' row plan, on the CPU alone
@@ -134,7 +137,7 @@ KPARTS := 0 1 2 3 4 5 6 7 8
 KERN_OBJ := $(foreach p,$(KPARTS),build/kernels_p$(p).o)
 # the 27B's Engine (engine.hpp's interface) is its own: s27_engine.cu and its prompt path; everything else links shared
 ENG_MODEL := $(if $(filter 1,$(FNX_27B)),s27_,)
-ENG_OBJ := build/gguf.o build/model.o build/ple_io.o build/store.o $(KERN_OBJ) build/moe_mma.o build/$(ENG_MODEL)engine.o build/engine_common.o build/peer_probe.o build/$(ENG_MODEL)prefill.o build/session.o build/batch.o
+ENG_OBJ := build/gguf.o build/model.o build/ple_io.o build/store.o $(KERN_OBJ) build/moe_mma.o build/$(ENG_MODEL)engine.o build/engine_common.o build/peer_probe.o build/$(ENG_MODEL)prefill.o build/session.o build/batch.o build/cvec.o
 PIC := -Xcompiler -fPIC
 build/kernels_p%.o: src/kernels.cu $(STAMPS)
 	@mkdir -p build

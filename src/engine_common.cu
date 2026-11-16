@@ -178,11 +178,14 @@ void Engine::use_lane(int i) {
     LaneHost& was = lanes_[(size_t) cur_];
     was.pos = pos_;
     was.tag = tag_;
+    was.cvec_ran = cvec_ran_;
     was.history = std::move(history_);
     cur_ = i;
     LaneHost& now = lanes_[(size_t) i];
     pos_ = now.pos;
     tag_ = now.tag;
+    cvec_cur_ = now.cvec;
+    cvec_ran_ = now.cvec_ran;
     history_ = std::move(now.history);
     now.history.clear();
     for (CardBuf* b : cb_) card_lane(*b, b->lanes[(size_t) i]);
@@ -445,6 +448,7 @@ std::shared_ptr<Engine::SeqState> Engine::save_state(bool kv) {
     if (!pending_.empty() || !rows_pending_.lanes.empty()) throw std::runtime_error("save_state: a window is not committed");
     auto s = std::make_shared<SeqState>();
     s->tokens = history_;
+    s->cvec = cvec_ran_;   // what its windows ran under (Session will only reuse it under that setting)
     for (const Image& im : lanes_[(size_t) cur_].images)
         if (im.cell + im.n <= pos_) s->images.push_back(Image{im.cell, im.n, im.nx, im.ny, nullptr});
     if (kv) ensure_pages(pos_);
@@ -475,6 +479,7 @@ void Engine::load_state(const SeqState& s) {
     if ((int) s.tokens.size() + 1 > max_ctx_) throw std::runtime_error("load_state: the state does not fit the context");
     if (!s.kv && (history_.size() < s.tokens.size() || !std::equal(s.tokens.begin(), s.tokens.end(), history_.begin())))
         throw std::runtime_error("load_state: a checkpoint of another sequence (the engine does not hold its K/V)");
+    cvec_ran_ = s.cvec ? 1 : 0;   // the state's own stamp: what its tokens' windows ran under
     const int pos = (int) s.tokens.size();
     if (s.kv) ensure_pages(pos);
     const unsigned half = (tag_ + 1u) & 1u;
@@ -519,6 +524,7 @@ void Engine::reset() {
     release_pages();
     history_.clear();
     pos_ = 0;
+    cvec_ran_ = -1;
     set_images({});
 }
 
@@ -686,6 +692,8 @@ std::vector<int> Engine::verify(const std::vector<int>& tokens) {
     };
     h_.ctl[0] = pos_;
     h_.ctl[1] = (int) take_tags(1);
+    cvec_ran_run(cvec_ran_, cvec_cur_);   // this lane's state is one setting's, or a mix, as the windows say
+    const std::vector<float> vscales((size_t) T, cvc_scale_of(cur_));
     float* bv = h_.bv;
     int* bi = h_.bi;
     auto upload = [&](int, CardBuf& b, const CardW&) {
@@ -693,6 +701,7 @@ std::vector<int> Engine::verify(const std::vector<int>& tokens) {
         if (late) rows_upload_tokens(b, T);
         else rows_upload(b, T);
         ck(cudaMemcpyAsync(b.ctl, h_.ctl, 2 * sizeof(int), cudaMemcpyHostToDevice, b.st), "ctl");
+        ck(cvc_upload(b, vscales.data(), T), "cvc scales");
     };
     auto download = [&](int c, CardBuf& b, const CardW&) {
         ck(cudaMemcpyAsync(&bv[c * T], b.best_v, T * 4, cudaMemcpyDeviceToHost, b.st), "best v");
@@ -843,10 +852,16 @@ std::vector<int> Engine::step(const std::vector<int>& lanes, const std::vector<i
             f(c, *cb_[c], m_.cards[c]);
         }
     };
+    std::vector<float> vscales((size_t) T);
+    for (int r = 0; r < T; ++r) {
+        vscales[(size_t) r] = cvc_scale_of(lanes[r]);
+        cvec_ran_run(lanes_[(size_t) lanes[r]].cvec_ran, lanes_[(size_t) lanes[r]].cvec);
+    }
     each([&](int, CardBuf& b, const CardW&) {
         ck(cudaEventRecord(b.ev0, b.st), "event");
         rows_upload(b, T);
         ck(cudaMemcpyAsync(b.ctl, h_.ctl, 2 * sizeof(int), cudaMemcpyHostToDevice, b.st), "ctl");
+        ck(cvc_upload(b, vscales.data(), T), "cvc scales");
         for (int r = 0; r < T; ++r)
             ck(cudaMemcpyAsync(b.lanes[(size_t) lanes[r]].ctl, &lane_ctl[(size_t) 2 * r], 2 * sizeof(int), cudaMemcpyHostToDevice, b.st),
                "lane ctl");
@@ -1039,6 +1054,13 @@ std::vector<int> Engine::verify_rows(const std::vector<int>& lanes, const std::v
             ck(cudaMemcpyAsync(b.lanes[(size_t) lanes[i]].ctl, &lane_ctl[(size_t) 2 * i], 2 * sizeof(int), cudaMemcpyHostToDevice, b.st),
                "lane ctl");
         ck(cudaMemcpyAsync(b.row_pos, row_pos.data(), (size_t) T * sizeof(int), cudaMemcpyHostToDevice, b.st), "row positions");
+        std::vector<float> vscales((size_t) T);
+        for (int r = 0; r < T; ++r) {
+            const int ln = lanes[(size_t) sg.row_lane[(size_t) r]];
+            vscales[(size_t) r] = cvc_scale_of(ln);
+            cvec_ran_run(lanes_[(size_t) ln].cvec_ran, lanes_[(size_t) ln].cvec);
+        }
+        ck(cvc_upload(b, vscales.data(), T), "cvc scales");
     });
     // the graph slot step() uses for T rows; the layout (each lane's count) is part of the key, and -1 tells it from step()'s
     std::vector<int> key = graph_key(lanes);

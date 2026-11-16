@@ -114,6 +114,9 @@ struct CardBuf {
 };
 
 // what engine_common.cu reads of this model (engine_parts.hpp says what each is)
+// the 27B has no control vector (its Engine refuses FNX_CVEC): nothing to upload
+inline cudaError_t cvc_upload(CardBuf&, const float*, int) { return cudaSuccess; }
+
 constexpr int ROW_W = N;
 constexpr int LANE_ROW_COLS = 3;   // and the row's lane's rotary table
 inline void lane_row_extra(const int** rows, int r, const LaneDev& L) { rows[2 * MAXT + r] = L.mrope; }

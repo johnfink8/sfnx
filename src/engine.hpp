@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "cvec.hpp"
 #include "kernels.hpp"
 #include "model.hpp"
 
@@ -118,6 +119,20 @@ public:
     void use_lane(int i);
     int lane() const { return cur_; }
     int lanes() const { return (int) lanes_.size(); }
+    // a control vector (src/cvec.hpp): whether this Engine loaded one at start (FNX_CVEC=FILE:SCALE). Off by
+    // default: with none set every call below is a no-op and the engine runs as it did without the feature.
+    bool cvec_active() const { return cvec_.on(); }
+    // lane `i` runs its rows with (on: the default) or without the vector: a row without it subtracts nothing at
+    // every block boundary, bit for bit the fold it was. Windows mix lanes: each row carries its lane's setting.
+    // A request's cached states belong to the setting they were read under (SeqState.cvec), which is why a request
+    // that changes it re-reads its prompt: the states a sequence reaches are different ones.
+    void set_cvec_lane(int i, bool on);
+    bool cvec_lane(int i) const { return i == cur_ ? cvec_cur_ : lanes_[(size_t) i].cvec; }
+    // the setting the lane's held state was built under: 1 with the vector, 0 without, -1 it has run nothing,
+    // 2 a mix of the two (windows ran under both). Only a state whose stamp is the request's setting is the same
+    // sequence's state; a mixed one can be reached no other way than reading it again. Saved states carry it
+    // (SeqState.cvec); Session checks both before reusing.
+    int cvec_ran(int i) const { return i == cur_ ? cvec_ran_ : lanes_[(size_t) i].cvec_ran; }
     // pages a lane can still take: the free ones, and with FNX_ARENA the ones the experts' slots can still lend
     int free_pages() const { return (int) free_pages_.size() + (arena_cap_ - arena_w_); }
     // when set: called when lane `lane` needs `pages` more pages than the pool has free (after any arena lend), before
@@ -164,6 +179,8 @@ public:
         std::vector<int> tokens;
         std::vector<Image> images;    // its images (rows null)
         bool kv = false;
+        int cvec = -1;      // Engine::cvec_ran at its save (1 with the vector, 0 without, -1 nothing ran, 2 mixed):
+                            // states of another setting are another sequence's states
         std::vector<void*> host;      // per card
         std::vector<size_t> bytes;    // per card
         size_t total() const;
@@ -218,6 +235,8 @@ private:
         std::vector<int> history, pages;   // pages: logical -> physical
         int block0 = -1, block_n = 0;      // the pool pages holding its states (lanes after 0)
         std::vector<Image> images;         // set_images()
+        bool cvec = true;   // this lane's rows run with the control vector (the default; Engine::set_cvec_lane)
+        int cvec_ran = -1;  // Engine::cvec_ran for this lane
     };
     std::vector<LaneHost> lanes_;
     int cur_ = 0;
@@ -326,6 +345,27 @@ private:
     int* pf_ctl_[PF_SETS] = {};
     float* pf_after_[PF_SETS] = {};   // pinned: the embedding of the token after a chunk's last row (the draft layer's)
     void prefill_draft(int C, int set);
+    // the control vector (off unless FNX_CVEC named one at Engine::Engine): its directions copied to every card
+    // (b.cvec_dir [NL][N]) and each window's per-row scales (b.cvc_scale [MAXT]: cvc_scale_of(lane) for the row's
+    // lane, 0 for a lane that runs without the vector and for every row of a lane that asked its request off).
+    Cvec cvec_;
+    bool cvec_cur_ = true;   // the current lane's setting (a copy of lanes_[cur_].cvec, as pos_ and tag_ are)
+    int cvec_ran_ = -1;      // and the same for cvec_ran: what the current lane's state was built under
+    float cvc_scale_of(int lane) const { return cvec_.on() && lanes_[(size_t) lane].cvec ? (float) cvec_.spec.scale : 0.0f; }
+
+    // the control vector's edit on block `produced`'s summed attention-half output (its bo_a, the ring done on
+    // every card) and on its shared expert's rows (the shared half of part, before the ring folds the routed
+    // experts in): cvec.hpp gives why those buffers and no others. No call when no vector is loaded or this block
+    // carries no direction: the rows are exactly the rows they were.
+    void cvec_rows_at(CardBuf& b, int produced, float* x, int T);
+    // the same at the prompt path's scale: a chunk is one lane's rows (its lane's scale rides with the call)
+    void cvec_rows_chunk(CardBuf& b, int produced, float* x, int C);
+    // a window ran on a lane under setting `on`: the same setting keeps its state uniformly one setting's; another
+    // makes it a mix, which no reuse can take
+    static void cvec_ran_run(int& ran, bool on) {
+        const int v = on ? 1 : 0;
+        ran = ran == -1 ? v : (ran == v ? ran : 2);
+    }
     // draft(), from per-card source rows (T rows of D on each card)
     int draft_rows(const std::vector<const float*>& src, int T, const std::vector<int>& tokens, int pos0,
                    const Penalties::Row* pen = nullptr, bool cands = false);
@@ -334,7 +374,9 @@ private:
     void dense(const DW& W, const void* y, float* out, CardBuf& b, int T);
     void attention(int T, CardBuf& b, const CardW& w, const LayerW& L, uint16_t* kc, uint16_t* vc, const int* ctl,
                    uint16_t* qsa_ring, uint16_t* qsa_pooled, int call);
-    void ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW& L, float* R, const int* ctl);
+    // produced: the block this half is the FFN output of (its summed bo_f gets that block's control vector edit);
+    // -1 for the draft layer, which carries none
+    void ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW& L, float* R, const int* ctl, int produced);
 #if FNX_27B
     // the 27B's window (s27_engine.cu): the layers and head over T rows, one sequence's or a batched window's (lanes),
     // with the recurrent core each kind runs

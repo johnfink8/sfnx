@@ -867,6 +867,7 @@ void Engine::prefill_draft(int C, int set) {
 
 void Engine::prefill(const std::vector<int>& tokens, int after) {
     if (!pending_.empty() || !rows_pending_.lanes.empty()) throw std::runtime_error("prefill: a window is not committed");
+    cvec_ran_run(cvec_ran_, cvec_cur_);   // the read writes the lane's state under this setting (cvec.hpp scope)
     if (mtp_ && after < 0) throw std::runtime_error("prefill: the draft layer needs the token after the last row");
     if (pf_[0]->seq >= PF_SEQ_RESET) {
         std::fprintf(stderr, "fnx: prompt ring sequence numbers at %u: flags zeroed, numbers from 0 again\n", pf_[0]->seq);
@@ -1138,6 +1139,7 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                 // the draft layer's source: R with the last attention write folded in, as a window's FFN-half read leaves it
                 each([&](int, CardBuf& b, const CardW& w, Pf& p) {
                     const LayerW& L = w.L[l];
+                    cvec_rows_chunk(b, l, p.bo_a, C);   // this block's summed attention half, before the fold
                     pf_hc_read(p, p.R, p.bo_a, p.inj_a, L.hc_norm[1], L.hc_down[1], L.hc_up[1], L.hc_inj[1], eps, p.mixed, p.inj_f, C, b.st);
                 });
                 continue;
@@ -1152,6 +1154,7 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                     gu_e.ep = p.ep_gu + (size_t) l * NEXP, down_e.ep = p.ep_dn + (size_t) l * NEXP;
                     if (j == 0) ckc(cudaStreamWaitEvent(s, p.ev_ready[l & 1], 0), "stage in");
                 }
+                cvec_rows_chunk(b, l, p.bo_a, C);   // this block's summed attention half, before the fold
                 pf_hc_read(p, p.R, p.bo_a, p.inj_a, L.hc_norm[1], L.hc_down[1], L.hc_up[1], L.hc_inj[1], eps, p.mixed, p.inj_f, C, s);
                 if (p.moe_q8) quantize_q8_1(p.mixed, p.xq, N, C, s);   // else xh holds the hc read's f16 of mixed
                 pf_sgemm(p, L.router, NEXP + 1, N, p.mixed, C, p.logits, NEXP + 1);
@@ -1182,6 +1185,8 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                 m.part = p.part;
                 m.topw = p.topw;
                 m.logits = p.logits;
+                cvec_rows_chunk(b, l, p.part + (size_t) C * TOPK * N, C);   // the shared expert's rows, before the
+                //                                                            ring sums the block's FFN output
                 if (p.ring_sm) ring_sum(p.ring, p.bo_f, C, (const unsigned*) (p.ctl + 1), 2 * l + 1, b.st, m);
                 else if (p.overlap) ring_async(c, b, p, p.bo_f, &m, j, p.ev_rf[j], C);
                 else pf_ring(p, c, p.bo_f, C, &m, b.ring.err, b.st);

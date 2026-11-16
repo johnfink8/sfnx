@@ -129,6 +129,7 @@ void ffn27(CardBuf& b, const CardW& w, const LayerW& L, float* R, const int* ctl
 }  // namespace
 
 Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
+    if (std::getenv("FNX_CVEC")) throw std::runtime_error("FNX_CVEC: a control vector is Flash-Next's (cvec.hpp): the 27B loads none");
     rope_.base = m_.rope_base;
     long long env_orig = 0;
     if (std::getenv("FNX_YARN_ORIG_CTX")) {
