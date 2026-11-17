@@ -338,6 +338,7 @@ logits are the logits it was. Three GPU checks say the off path stayed that way 
 | off-parity | a build with the feature compiled, `FNX_CVEC` unset, against the same build's base and against the llama.cpp teachers | `tools/lab.sh start` (no cvec), `exact base`, then `exact` on the same build: byte for byte against the base, within the bar against llama.cpp |
 | on, at the model level | the edit runs on the outputs it names and the model still holds together: logits stay finite, the bar's own KL measured with the vector at 1.0 and 1.78 (the reading is not a weight edit; a runtime direction file's agreement with one is exactly what this measures) | `lab.sh start "" "-E FNX_CVEC=<file>:1.0"`, `exact`; the same at `:1.78` |
 | on, at the behavior level | a refusal probe: the same short set of prompts that the base model refuses, answered with `cvec=0` on the request line versus absent | `lab.sh cmd` / the front end's `experimental_speed_projection` |
+| the flag is the request's, not the lane's | served front, vector loaded, greedy, interleaved rounds of `true` then absent: every absent answer byte-identical to main's; `false` after `true` on one conversation restores main's answer exactly on the same lane (lanes recycle between conversations) | refusal probe, 4 rounds |
 
 A control vector costs one small coefficient pass per boundary (47 passes over the window's rows, reads of ~19 MB
 against the ~38 GB a token's full pass moves) plus a guarded subtraction inside the fold the engine already computes.
