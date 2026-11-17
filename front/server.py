@@ -927,8 +927,8 @@ class StrataEngine:
         if sampling.get("strata_checkpoint") is False:
             keys += " ckpt=0"
         # "experimental_speed_projection": false - this request runs without the refusal-direction control vector
-        # the engine loaded at startup (cvec=0); true asks for it by name (cvec=1).  Absent / null emits nothing:
-        # the engine's default (on when a vector was loaded, meaningless when none was).
+        # (cvec=0); true asks for the vector the engine loaded at startup by name (cvec=1).  Absent / null emits
+        # nothing: the default is without - loading a file makes a vector available, never applied unasked.
         if sampling.get("experimental_speed_projection") is False:
             keys += " cvec=0"
         if sampling.get("experimental_speed_projection") is True:

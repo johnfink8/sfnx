@@ -86,7 +86,8 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         if (std::getenv(k)) throw std::runtime_error(std::string(k) + " is the 27B's: Flash-Next has nothing it sets");
     if (!m.ple_rows) throw std::runtime_error("Engine: the model has no n-gram rows (a Load::HOLD model runs no engine)");
     // the control vector (off unless FNX_CVEC names one): the directions are host-side here; each card gets a copy
-    // where its buffers are made. Every lane runs with it until Engine::set_cvec_lane says otherwise.
+    // where its buffers are made. The file makes the vector available, never applied unasked: every lane
+    // runs without it until a request asks it on (cvec=1).
     CvecSpec cspec;
     if (cvec_from_env(cspec)) {
         cvec_ = load_cvec(cspec, "qwen4exp", N, NL);

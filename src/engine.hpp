@@ -235,7 +235,7 @@ private:
         std::vector<int> history, pages;   // pages: logical -> physical
         int block0 = -1, block_n = 0;      // the pool pages holding its states (lanes after 0)
         std::vector<Image> images;         // set_images()
-        bool cvec = true;   // this lane's rows run with the control vector (the default; Engine::set_cvec_lane)
+        bool cvec = false;  // the default is without: a lane runs with the control vector only once a request asks (Engine::set_cvec_lane)
         int cvec_ran = -1;  // Engine::cvec_ran for this lane
     };
     std::vector<LaneHost> lanes_;
@@ -349,7 +349,7 @@ private:
     // (b.cvec_dir [NL][N]) and each window's per-row scales (b.cvc_scale [MAXT]: cvc_scale_of(lane) for the row's
     // lane, 0 for a lane that runs without the vector and for every row of a lane that asked its request off).
     Cvec cvec_;
-    bool cvec_cur_ = true;   // the current lane's setting (a copy of lanes_[cur_].cvec, as pos_ and tag_ are)
+    bool cvec_cur_ = false;  // the current lane's setting (a copy of lanes_[cur_].cvec, as pos_ and tag_ are)
     int cvec_ran_ = -1;      // and the same for cvec_ran: what the current lane's state was built under
     float cvc_scale_of(int lane) const { return cvec_.on() && lanes_[(size_t) lane].cvec ? (float) cvec_.spec.scale : 0.0f; }
 
