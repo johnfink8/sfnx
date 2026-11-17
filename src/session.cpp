@@ -158,9 +158,11 @@ void Session::read(const std::vector<int>& prompt, GenStats& st, const std::func
     const int n = (int) prompt.size();
     const size_t body = (size_t) n - 1;   // the tokens the engine is to hold before generate()
     const bool caching = cache_->budget > 0 && hints.cache;
-    // cvec=0 / cvec=1 (ReadHints.cvec): this conversation's lane runs without / with the vector. Absent (-1) is
-    // the engine's default and asks for nothing.
-    if (hints.cvec >= 0) e_.set_cvec_lane(lane_, hints.cvec == 1);
+    // cvec=0 / cvec=1 (ReadHints.cvec): this request runs without / with the vector, and every request states
+    // the setting: absent (-1) is the default, without, not the lane's last value. A lane is recycled between
+    // conversations, so inheriting a lane's setting would make a plain request depend on whoever used the lane
+    // last - the behavior of a request is the request.
+    e_.set_cvec_lane(lane_, hints.cvec == 1);
     const int want = e_.cvec_lane(lane_) ? 1 : 0;
     // a sequence's states belong to the setting its windows ran under (Engine::cvec_ran, carried by SeqState.cvec):
     // under a control vector the states are different states. Only a state stamped the same setting can be reused;
