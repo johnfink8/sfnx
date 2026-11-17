@@ -330,8 +330,8 @@ card of another arch than the build's (`src/card_check.hpp`).
 ## Control vectors
 
 The feature is off with nothing set: with no `FNX_CVEC` the engine makes no control-vector call anywhere, and its
-logits are the logits it was. Two GPU checks say the off path stayed that way and what the on path does.
-**Neither has run yet; these are the checks to run, not results.**
+logits are the logits it was. Three GPU checks say the off path stayed that way and what the on path does.
+**All three have run on a 4-card V100 rig; the results follow the table.**
 
 | Check | What it proves | How |
 | --- | --- | --- |
