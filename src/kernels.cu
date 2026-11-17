@@ -1053,9 +1053,10 @@ int hc_prepare(float* scratch, int cap) {
 
 void hc_read(float* R, const float* bo, const float* inj_prev, const float* w_norm, const Q8S& w_down, const Q8S& w_up,
              const uint16_t* w_inj, float eps, float* mixed, float* inject, float* scratch, unsigned* err, int T, void* st,
-             void* q8) {
+             void* q8, const float* cvd, const float* cvc) {
     HcArgs a{R, bo, inj_prev, w_norm, w_down, w_up, w_inj, eps, mixed, inject, nullptr, nullptr, nullptr, nullptr, nullptr, err,
              (block_q8_1*) q8};
+    a.cvd = cvd; a.cvc = cvc;   // nulls: the fold is exactly the fold it was
     a.part = scratch;
     a.ssp = a.part + (size_t) H_NS * T * H_ROWS;
     a.loq = (int8_t*) (a.ssp + (size_t) T * H_NS);
@@ -1095,6 +1096,43 @@ void hc_preset_barrier(float* scratch, unsigned barriers_left) {
     const unsigned v = mod - barriers_left * g;
     const cudaError_t e = cudaMemcpy(scratch + hc_scratch_floats(MAXT) - 1, &v, sizeof v, cudaMemcpyHostToDevice);
     if (e != cudaSuccess) throw std::runtime_error(std::string("hc_preset_barrier: ") + cudaGetErrorString(e));
+}
+
+namespace {
+// The boundary projection's coefficients (src/cvec.hpp): one block per row t. For each stream c it reads the row
+// exactly as rprime will compute it (R with the producing block's write folded in), dots it with that block's unit
+// direction, and writes coef[t][c] = scale[t] * (v . r'): the value the fold computes, minus coef * v, is what the
+// read stores, so every consumer of the stored hidden sees the projected row. A row whose scale is 0 (its lane runs
+// without the vector) gets a coefficient of 0: rprime's guard leaves its bits exactly what they were. The fold is
+// replicated here in rprime's own operations, so the coefficient belongs to the same value the read computes; every
+// card runs this on identical inputs, so the coefficients agree on every card.
+constexpr int CV_THREADS = 256, CV_PER = N / CV_THREADS;
+__global__ void __launch_bounds__(CV_THREADS) k_cvc_coef(const float* __restrict__ v, const float* __restrict__ R,
+                                                         const float* __restrict__ bo, const float* __restrict__ inj_prev,
+                                                         const float* __restrict__ s, float uni, float* __restrict__ coef) {
+    const int t = blockIdx.x, i0 = threadIdx.x;
+    const float sc = s ? s[t] : uni;
+    __shared__ float sh[CV_THREADS / 32];
+#pragma unroll
+    for (int c = 0; c < HC; ++c) {
+        const float g = bo ? 2.0f * sigm(inj_prev[t * HC + c] / (float) HC) : 0.f;
+        float acc = 0.f;
+#pragma unroll
+        for (int k = 0; k < CV_PER; ++k) {
+            const int i = i0 + k * CV_THREADS;
+            float r = R[(size_t) t * D + c * N + i];
+            if (bo) r = fmaf(bo[(size_t) t * N + i], g, r);
+            acc = fmaf(r, v[i], acc);
+        }
+        coef[t * HC + c] = sc * block_sum(acc, sh);
+    }
+}
+}  // namespace
+
+void cvc_coeffs(const float* v, const float* R, const float* bo, const float* inj_prev, const float* s, float uni,
+                float* coef, int T, void* st) {
+    k_cvc_coef<<<T, CV_THREADS, 0, (cudaStream_t) st>>>(v, R, bo, inj_prev, s, uni, coef);
+    ck_launch("cvc_coeffs");
 }
 
 #endif

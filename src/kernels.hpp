@@ -61,12 +61,23 @@ int hc_blocks();    // the read's blocks of work; a card with fewer SMs runs the
 // grid. cap > 0: at most cap blocks, as a card with that many SMs would run (kbench)
 int hc_prepare(float* scratch, int cap = 0);
 int hc1_rows();   // FNX_HC1: windows of up to this many rows take the read's one-barrier form (read once; throws if bad)
+// cvd / cvc (src/cvec.hpp): the boundary projection. cvd is the producing block's unit direction [N], cvc the
+// per-row per-stream coefficients [T][HC] its fold subtracts (cvc_coeffs makes them). rprime (hc.cuh) then computes
+// the folded row and removes its component along cvd before any consumer sees it; null cvd: the read is what it was.
 void hc_read(float* R, const float* bo_prev, const float* inj_prev, const float* w_norm, const Q8S& w_down,
              const Q8S& w_up, const uint16_t* w_inj, float eps, float* mixed, float* inject, float* scratch, unsigned* err,
-             int T, void* st, void* q8 = nullptr);
+             int T, void* st, void* q8 = nullptr, const float* cvd = nullptr, const float* cvc = nullptr);
 // sets the barrier counter in an hc scratch so that it wraps after barriers_left more barriers (2 per read): a test
 // of the wrap (FNX_HC_BAR_WRAP)
 void hc_preset_barrier(float* scratch, unsigned barriers_left);
+
+// The boundary projection's coefficients (src/cvec.hpp): coef[t][c] = s[t] * (v . r'_{t,c}), where r' is exactly the
+// folded row rprime will compute (R with the producing block's write folded in) - so the read that follows subtracts
+// coef[t][c] * v inside rprime and stores the projected value. A row whose lane runs without the vector has s 0, and
+// its coefficients come out 0: rprime's guard leaves its bits exactly what they were. Every row of coef is written at
+// every call, so a read can never see an earlier boundary's coefficient. One block per row, 256 threads.
+void cvc_coeffs(const float* v, const float* R, const float* bo, const float* inj_prev, const float* s, float uni,
+                float* coef, int T, void* st);
 
 // MoE routing: logits [T][NEXP] -> softmax, top-10, weights renormalized; jobs for the gate/up launch (rows = tokens,
 // outputs = pairs t*TOPK+k) and for the down launch (rows = outputs = pairs), counts in njobs[0..1]

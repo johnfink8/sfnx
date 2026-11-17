@@ -158,6 +158,16 @@ void Session::read(const std::vector<int>& prompt, GenStats& st, const std::func
     const int n = (int) prompt.size();
     const size_t body = (size_t) n - 1;   // the tokens the engine is to hold before generate()
     const bool caching = cache_->budget > 0 && hints.cache;
+    // cvec=0 / cvec=1 (ReadHints.cvec): this request runs without / with the vector, and every request states
+    // the setting: absent (-1) is the default, without, not the lane's last value. A lane is recycled between
+    // conversations, so inheriting a lane's setting would make a plain request depend on whoever used the lane
+    // last - the behavior of a request is the request.
+    e_.set_cvec_lane(lane_, hints.cvec == 1);
+    const int want = e_.cvec_lane(lane_) ? 1 : 0;
+    // a sequence's states belong to the setting its windows ran under (Engine::cvec_ran, carried by SeqState.cvec):
+    // under a control vector the states are different states. Only a state stamped the same setting can be reused;
+    // a mixed one (-1 nothing ran, 2 both) fits no setting except a matching mix, which nothing asks for.
+    const auto same_setting = [&](const State& st) { return !e_.cvec_active() || st->cvec == want; };
     // how much of a conversation the prompt can start from: all of it when the prompt extends it, else its longest
     // checkpoint inside the shared prefix (ck: that checkpoint, -1 for all)
     auto usable = [&](const std::vector<int>& toks, const std::vector<State>& ckpts, int& ck) -> size_t {
@@ -167,18 +177,24 @@ void Session::read(const std::vector<int>& prompt, GenStats& st, const std::func
         if (c == toks.size()) return c;
         size_t best = 0;
         for (size_t i = 0; i < ckpts.size(); ++i)
-            if (ckpts[i]->tokens.size() <= c && ckpts[i]->tokens.size() >= best) {
+            if (same_setting(ckpts[i]) && ckpts[i]->tokens.size() <= c && ckpts[i]->tokens.size() >= best) {
                 best = ckpts[i]->tokens.size();
                 ck = (int) i;
             }
         return best;
     };
     const std::vector<int> hist = e_.history();
+    // the live lane's state is usable only when its windows all ran under this request's setting
+    const bool live_ok = !e_.cvec_active() || e_.cvec_ran(lane_) == want;
     int ck_live = -1;
-    const size_t from_live = usable(hist, live_.ckpts, ck_live);
+    const size_t from_live = live_ok ? usable(hist, live_.ckpts, ck_live) : 0;
+    if (!live_ok && e_.cvec_active() && !hist.empty())
+        std::fprintf(stderr, "conversation cache: the lane's state ran under cvec=%d, this request wants cvec=%d: "
+                             "%zu tokens re-read\n", e_.cvec_ran(lane_), want, hist.size());
     int best_parked = -1, ck_parked = -1;
     size_t from_parked = 0;
     for (size_t i = 0; i < cache_->parked.size(); ++i) {
+        if (!same_setting(cache_->parked[i].kv)) continue;   // a parked conversation of the other setting
         int ck = -1;
         const size_t u = usable(cache_->parked[i].kv->tokens, cache_->parked[i].ckpts, ck);
         if (u > from_parked) {

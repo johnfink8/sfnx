@@ -327,6 +327,34 @@ turn: on a V100 with the grid held to 72 (`kbench`, as a 72-SM PG500-216 runs it
 1-5 rows, x1.69 at 8 and x2.00 at 16, the blocks with two shares setting the pace. The engine refuses as it loads a
 card of another arch than the build's (`src/card_check.hpp`).
 
+## Control vectors
+
+The feature is off with nothing set: with no `FNX_CVEC` the engine makes no control-vector call anywhere, and its
+logits are the logits it was. Three GPU checks say the off path stayed that way and what the on path does.
+**All three have run on a 4-card V100 rig; the results follow the table.**
+
+| Check | What it proves | How |
+| --- | --- | --- |
+| off-parity | a build with the feature compiled, `FNX_CVEC` unset, against the same build's base and against the llama.cpp teachers | `tools/lab.sh start` (no cvec), `exact base`, then `exact` on the same build: byte for byte against the base, within the bar against llama.cpp |
+| on, at the model level | the edit runs on the outputs it names and the model still holds together: logits stay finite, the bar's own KL measured with the vector at 1.0 and 1.78 (the reading is not a weight edit; a runtime direction file's agreement with one is exactly what this measures) | `lab.sh start "" "-E FNX_CVEC=<file>:1.0"`, `exact`; the same at `:1.78` |
+| on, at the behavior level | a refusal probe: the same short set of prompts that the base model refuses, answered with `cvec=0` on the request line versus absent | `lab.sh cmd` / the front end's `experimental_speed_projection` |
+| the flag is the request's, not the lane's | served front, vector loaded, greedy, interleaved rounds of `true` then absent: every absent answer byte-identical to main's; `false` after `true` on one conversation restores main's answer exactly on the same lane (lanes recycle between conversations) | refusal probe, 4 rounds |
+
+A control vector costs one small coefficient pass per boundary (47 passes over the window's rows, reads of ~19 MB
+against the ~38 GB a token's full pass moves) plus a guarded subtraction inside the fold the engine already computes.
+Measured with `lab.sh decode` against the same build with `FNX_CVEC` unset.
+
+**Measured (ai-server, 4x V100, Qwen3.8-Flash-Next UD-Q4_K_XL, the huihui `direction-r-v2` file, scale 1.0):** the
+off path is untouched (unmodified main's logits and this build's with the vector off are byte for byte on long64,
+code1, edit1 and the picture; the window-size checks pass with the vector on); the edit moves logits measurably but
+gently (KL ~4e-3 against the same engine with the vector off on long64; prose edit1 top-1 unchanged for all 300
+steps); decode costs ~2-3% at scale 1.0. An earlier build of this feature projected **block outputs** (a half's
+summed output and the shared expert) instead of the boundary: it passed the same checks, but its refusal probe went
+15 refused -> 11 of 24 prompts, against the ~1 of 50 published for the boundary reading on this model (a llama.cpp
+port projecting each stream after the block completes, layers 4-44). The boundary reading is that port's, in engine
+form; its own probe is the next thing to measure. A half folded mid-block is deliberately not projected, exactly as
+the published graph leaves a block's attention output unprojected until the block completes.
+
 ## The test inventory
 
 | What | How |
@@ -348,6 +376,7 @@ card of another arch than the build's (`src/card_check.hpp`).
 | The n-gram table read from the disk against the mapping, byte for byte, with its reads' rate (CPU; needs the model) | `bin/ple_test MODEL.gguf ref/long64.bin ref/edit1.bin` |
 | The top-k ties | `bin/topk_test` |
 | The engine's stdin handling | `bin/sfnx_input_test` |
+| The control vector's settings and its file checks: a direction file against the model (widths, layer indexes, unit norms, hints, a matrix named `direction.N`, a lying `layer_count`), ranges, and the settings refused naming their values; the real direction file the feature is built for loads (47 directions of 2,560, blocks 1..47) | `bin/cvec_test [DIRECTION.gguf]` (CPU) |
 | The conversation cache where prompts share much: two conversations alternating on a lane, a system prompt changed near its end | `tools/lab.sh cmd cache2` |
 | The front end's own tests | `.venv/bin/python -m pytest -q front/` (591 passed, 3 skipped without the anthropic SDK, ~4 min; against fake engines, no `bin/sfnx`) |
 

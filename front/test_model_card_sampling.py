@@ -86,6 +86,13 @@ class ModelCardSampling(unittest.TestCase):
         self.assertIn("temperature=0.3", k)
         self.assertIn("top_p=0.5", k)
 
+    def test_control_vector_field_flows_through_the_request(self):
+        """experimental_speed_projection is not a known sampling key: the whole request is the sampling dict, so a
+        bool reaches the engine as sent and becomes the GEN line's cvec=0 / cvec=1; absent emits nothing."""
+        self.assertIn("cvec=0", self.keys(experimental_speed_projection=False))
+        self.assertIn("cvec=1", self.keys(experimental_speed_projection=True))
+        self.assertNotIn("cvec=", self.keys())
+
     def test_config_block_and_shared_settings_win_over_the_card(self):
         self.svc.sampling_defaults = {"temperature": 0.6, "top_k": 40}
         k = self.keys()

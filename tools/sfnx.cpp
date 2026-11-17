@@ -3,6 +3,7 @@
 //
 //   sfnx --serve --native MODEL.gguf --mtp RT_DIR --draft-vocab VOCAB.bin [--max-context N] [--spec K] [--lookup K]
 //        [--conversation-cache-mib M] [--batch SLOTS]
+//        [--control-vector-scaled FILE:SCALE [--control-vector-layer-range START:END]]
 //
 // One request alone: GEN <max_new> [key=value ...] <ids>, answered with PP <done> <total> per prompt chunk, RESUME
 // <reused>, T <id> per token (speculative: the draft layer's chain and n-gram lookups, verified a window at a time),
@@ -93,6 +94,20 @@ Args parse_args(int argc, char** argv) {
             if (const char* e = std::getenv("FNX_ROPE_SCALE"); e && s != e)
                 throw std::runtime_error("--rope-scale " + s + " and FNX_ROPE_SCALE=" + e + " disagree");
             ::setenv("FNX_ROPE_SCALE", s.c_str(), 1);
+        }
+        else if (k == "--control-vector-scaled") {   // FILE:SCALE: the engine reads it as FNX_CVEC (cvec.hpp),
+            const std::string v = val();             // with the scale its own; no default: a file is named for a reason
+            if (v.find(':') == std::string::npos) throw std::runtime_error("--control-vector-scaled: want FILE:SCALE");
+            if (const char* e = std::getenv("FNX_CVEC"); e && v != e)
+                throw std::runtime_error("--control-vector-scaled " + v + " and FNX_CVEC=" + e + " disagree");
+            ::setenv("FNX_CVEC", v.c_str(), 1);
+        }
+        else if (k == "--control-vector-layer-range") {   // START:END -> FNX_CVEC_RANGE
+            const std::string v = val();
+            if (v.find(':') == std::string::npos) throw std::runtime_error("--control-vector-layer-range: want START:END");
+            if (const char* e = std::getenv("FNX_CVEC_RANGE"); e && v != e)
+                throw std::runtime_error("--control-vector-layer-range " + v + " and FNX_CVEC_RANGE=" + e + " disagree");
+            ::setenv("FNX_CVEC_RANGE", v.c_str(), 1);
         }
         else if (k == "--vision") a.vision = true;
         else throw std::runtime_error("unknown argument " + k);
@@ -273,11 +288,15 @@ GenReq parse_gen(const std::string& line, int vocab, int pad, bool batch, bool i
             if (!said) std::fprintf(stderr, "sfnx: pin= (a client's strata_prefix) is not supported: such requests go on without it\n");
             said = true;
         }
-        // Strata's per-request engine tuning (strata_tune) and its control vector: nothing in sFNX to set
-        else if (k == "pcie_frac" || k == "spec_min_p" || k == "pipe" || k == "aux_cpus" || k == "cvec") {
+        else if (k == "cvec") {   // this request with / without the control vector the engine loaded (cvec.hpp)
+            if (v != "0" && v != "1") throw std::runtime_error(cmd + ": cvec=" + v + " is not 0 or 1");
+            r.hints.cvec = v == "1" ? 1 : 0;
+        }
+        // Strata's per-request engine tuning (strata_tune): nothing in sFNX to set
+        else if (k == "pcie_frac" || k == "spec_min_p" || k == "pipe" || k == "aux_cpus") {
             static std::set<std::string> said;
             if (said.insert(k).second)
-                std::fprintf(stderr, "sfnx: %s= (Strata's per-request engine tuning or control vector) has nothing to set in sfnx: "
+                std::fprintf(stderr, "sfnx: %s= (Strata's per-request engine tuning) has nothing to set in sfnx: "
                                      "such requests go on without it\n", k.c_str());
         }
         else throw std::runtime_error(cmd + ": unknown key " + k);

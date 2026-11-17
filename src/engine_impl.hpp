@@ -78,6 +78,11 @@ struct CardBuf {
     int* ctl;                         // [0] window position, [1] ring tag (as unsigned)
     int* mrope = nullptr;             // the current lane's rotary table (its LaneDev::mrope)
     cudaEvent_t ev0, ev1;
+    // a control vector the Engine loaded (nulls when it did not): its directions on this card [NL][N] and each
+    // window's per-row scales [MAXT] (0: that row's lane runs without the vector)
+    float* cvec_dir = nullptr;
+    float* cvc_scale = nullptr;
+    float* cvc_coef = nullptr;   // the boundary coefficients of the window in flight (cvec.hpp)
     char* stage[2] = {nullptr, nullptr};   // a parked state's copies pass through these page-locked halves (engine.cu)
     cudaEvent_t stage_ev[2] = {nullptr, nullptr};
     std::vector<LaneDev> lanes;
@@ -127,6 +132,13 @@ struct CardBuf {
 };
 
 // what engine_common.cu reads of this model (engine_parts.hpp says what each is)
+// the scales of a window's rows to the card (cvec.hpp): b.cvc_scale is null when the Engine loaded no vector, and
+// then there is nothing to copy
+inline cudaError_t cvc_upload(CardBuf& b, const float* scales, int T) {
+    if (!b.cvc_scale) return cudaSuccess;
+    return cudaMemcpyAsync(b.cvc_scale, scales, (size_t) T * sizeof(float), cudaMemcpyHostToDevice, b.st);
+}
+
 constexpr int ROW_W = D;   // the HC streams of N
 constexpr int LANE_ROW_COLS = 2;
 inline void lane_row_extra(const int**, int, const LaneDev&) {}

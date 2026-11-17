@@ -85,6 +85,13 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
                           "FNX_KV_PAGES", "FNX_KV_RESERVE_MIB"})
         if (std::getenv(k)) throw std::runtime_error(std::string(k) + " is the 27B's: Flash-Next has nothing it sets");
     if (!m.ple_rows) throw std::runtime_error("Engine: the model has no n-gram rows (a Load::HOLD model runs no engine)");
+    // the control vector (off unless FNX_CVEC names one): the directions are host-side here; each card gets a copy
+    // where its buffers are made. The file makes the vector available, never applied unasked: every lane
+    // runs without it until a request asks it on (cvec=1).
+    CvecSpec cspec;
+    if (cvec_from_env(cspec)) {
+        cvec_ = load_cvec(cspec, "qwen4exp", N, NL);
+    }
     if (ngram_late()) {   // as the engine is made, so a box that cannot map them refuses at start, not at a first token
         h_.ngram_late = hmapped<float>((size_t) MAXT * N);
         h_.ngram_flag = hmapped<unsigned>(1);
@@ -163,7 +170,14 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         b->bo_f = dalloc<float>((size_t) MAXT * N);
         b->inj_a = dalloc<float>(MAXT * HC);
         b->inj_f = dalloc<float>(MAXT * HC);
-        b->hcs = dalloc<float>(hc_scratch_floats(MAXT));
+        if (cvec_.on()) {   // cvec.hpp: the directions, each window's per-row scales, and the boundary coefficients
+            b->cvec_dir = dalloc<float>((size_t) NL * N);
+            ck(cudaMemcpy(b->cvec_dir, cvec_.rows.data(), (size_t) NL * N * 4, cudaMemcpyHostToDevice), "cvec dir");
+            b->cvc_scale = dalloc<float>(MAXT);
+            ck(cudaMemset(b->cvc_scale, 0, MAXT * 4), "cvc scale");
+            b->cvc_coef = dalloc<float>((size_t) MAXT * HC);
+        }
+        b->hcs = dalloc<float>(hc_scratch_floats(MAXT));   // the hc read's scratch: its last float is the barrier counter
         if (const int g = hc_prepare(b->hcs); g < hc_blocks())
             std::fprintf(stderr, "fnx: card %d: %d SMs: the hc read runs its %d blocks of work on %d\n", c, g, hc_blocks(), g);
         if (std::getenv("FNX_HC_BAR_WRAP")) {
@@ -978,6 +992,27 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
 }
 
 // every card's work for one window of T rows, in stream order (captured into a graph unless dumping)
+// a lane runs its rows with the vector or without it (the default is with). Windows mix lanes: each row carries its
+// lane's scale, and a row with scale 0 subtracts nothing at every boundary, bit for bit the fold it was.
+
+
+// The boundary projection's read arguments (cvec.hpp): the pair a read folding block `produced`'s finished output
+// takes - that block's direction on the card, and the per-(row, stream) coefficients this window's rows need. The
+// coefficients are computed from the same fold the read will compute (cvc_coeffs replicates rprime's operation on
+// R, bo, inj before R is written), from the row's lane's scale: 0 for a lane running without the vector. Nulls when
+// no vector is loaded or this block carries no direction: the read is the read it was. The buffer is per-card and
+// fixed, so a captured window graph replays the call unchanged, with the window's scales already uploaded.
+const float* Engine::cvc_direction(CardBuf& b, int produced) const {
+    return cvec_.edits(produced) ? b.cvec_dir + (size_t) produced * N : nullptr;
+}
+
+std::pair<const float*, const float*> Engine::cvc_boundary(CardBuf& b, int produced, const float* bo, int T) {
+    if (!cvec_.edits(produced)) return {nullptr, nullptr};
+    const float* v = b.cvec_dir + (size_t) produced * N;
+    cvc_coeffs(v, b.R, bo, b.inj_f, b.cvc_scale, 0.0f, b.cvc_coef, T, b.st);
+    return {v, b.cvc_coef};
+}
+
 void Engine::enqueue(int T, bool dumps) {
     const float eps = m_.eps;
     int call = 0;
@@ -1010,8 +1045,12 @@ void Engine::enqueue(int T, bool dumps) {
                 ple_post(b.R, b.ple_key, b.ple_val, w.ple_norm_key, w.ple_norm_query, w.ple_norm_conv, w.ple_conv,
                          b.ple_hist, b.ple_hsnap, T, eps, b.st, b.ple_key + (size_t) MAXT * D);
             }
+            // cvec.hpp: the value this read folds and computes is the hidden with block l-1 fully joined (its FFN output
+            // here, its attention half at the FFN read above; the PLE block joined at hc_write, and block 0
+            // carries no direction), so the boundary projected is l-1's with that block's direction.
+            const auto [cvd, cvc] = cvc_boundary(b, l - 1, apply ? b.bo_f : nullptr, T);
             hc_read(b.R, apply ? b.bo_f : nullptr, b.inj_f, L.hc_norm[0], L.hc_down[0], L.hc_up[0], L.hc_inj[0], eps, b.mixed,
-                    b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq);
+                    b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq, cvd, cvc);
             if (!is_attn(l)) {
                 const int nv = w.nv(), ch = w.conv_ch();
                 // ab beside qkvz in one launch (a fork and a join: ~5 us more; compiled for 4096..8191 rows)
@@ -1031,7 +1070,7 @@ void Engine::enqueue(int T, bool dumps) {
             } else {
                 attention(T, b, w, L, b.kc[l], b.vc[l], b.ctl, b.qsa_ring[l], b.qsa_pooled[l], 128 + l);
             }
-            ring_sum(b.ring, b.bo_a, T, (const unsigned*) (b.ctl + 1), call, b.st);
+ring_sum(b.ring, b.bo_a, T, (const unsigned*) (b.ctl + 1), call, b.st);
         });
         ++call;
         dd("hc_mixed", l, cb_[0]->mixed, N);
@@ -1046,7 +1085,8 @@ void Engine::enqueue(int T, bool dumps) {
     }
     // ---- head: the final mixer (no injection) with the last write folded in, then this card's vocabulary
     each([&](int c, CardBuf& b, const CardW& w) {
-        hc_read(b.R, b.bo_f, b.inj_f, w.head_norm, w.head_down, w.head_up, nullptr, eps, b.mixed, b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq);
+        const auto [cvd, cvc] = cvc_boundary(b, NL - 1, b.bo_f, T);   // the head folds the last block's output
+        hc_read(b.R, b.bo_f, b.inj_f, w.head_norm, w.head_down, w.head_up, nullptr, eps, b.mixed, b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq, cvd, cvc);
         dense(w.out, b.xq, b.head_logits, b, T);
         argmax(b.head_logits, w.v1 - w.v0, T, w.v0, b.best_v, b.best_i, b.am_keys, b.ring.err, b.st);
     });
@@ -1081,8 +1121,12 @@ void Engine::enqueue_batch(const std::vector<int>& lanes) {
                              w.ple_norm_conv, w.ple_conv, b.lanes[(size_t) lanes[r]].ple_hist, b.ple_hsnap, 1, eps, b.st,
                              b.ple_key + (size_t) MAXT * D);
             }
+            // cvec.hpp: the value this read folds and computes is the hidden with block l-1 fully joined (its FFN output
+            // here, its attention half at the FFN read above; the PLE block joined at hc_write, and block 0
+            // carries no direction), so the boundary projected is l-1's with that block's direction.
+            const auto [cvd, cvc] = cvc_boundary(b, l - 1, apply ? b.bo_f : nullptr, T);
             hc_read(b.R, apply ? b.bo_f : nullptr, b.inj_f, L.hc_norm[0], L.hc_down[0], L.hc_up[0], L.hc_inj[0], eps, b.mixed,
-                    b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq);
+                    b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq, cvd, cvc);
             if (!is_attn(l)) {
                 const int nv = w.nv();
                 gemv_f32(L.ab, b.mixed, b.ab, 2 * nv, N, T, b.st);
@@ -1117,14 +1161,15 @@ void Engine::enqueue_batch(const std::vector<int>& lanes) {
                 quantize_q8_1(b.att, b.xq, w.nq * HD, T, b.st);
                 dense(L.wo, b.xq, b.bo_a, b, T);
             }
-            ring_sum(b.ring, b.bo_a, T, (const unsigned*) (b.ctl + 1), call, b.st);
+ring_sum(b.ring, b.bo_a, T, (const unsigned*) (b.ctl + 1), call, b.st);
         });
         ++call;
         each([&](int, CardBuf& b, const CardW& w) { ffn_half(T, call, b, w, w.L[l], b.R, b.ctl); });
         ++call;
     }
     each([&](int, CardBuf& b, const CardW& w) {
-        hc_read(b.R, b.bo_f, b.inj_f, w.head_norm, w.head_down, w.head_up, nullptr, eps, b.mixed, b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq);
+        const auto [cvd, cvc] = cvc_boundary(b, NL - 1, b.bo_f, T);   // the head folds the last block's output
+        hc_read(b.R, b.bo_f, b.inj_f, w.head_norm, w.head_down, w.head_up, nullptr, eps, b.mixed, b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq, cvd, cvc);
         dense(w.out, b.xq, b.head_logits, b, T);
         argmax(b.head_logits, w.v1 - w.v0, T, w.v0, b.best_v, b.best_i, b.am_keys, b.ring.err, b.st);
     });
@@ -1162,8 +1207,12 @@ void Engine::enqueue_rows(const std::vector<int>& lanes, const std::vector<int>&
                              b.ple_key + (size_t) MAXT * D);
                 }
             }
+            // cvec.hpp: the value this read folds and computes is the hidden with block l-1 fully joined (its FFN output
+            // here, its attention half at the FFN read above; the PLE block joined at hc_write, and block 0
+            // carries no direction), so the boundary projected is l-1's with that block's direction.
+            const auto [cvd, cvc] = cvc_boundary(b, l - 1, apply ? b.bo_f : nullptr, T);
             hc_read(b.R, apply ? b.bo_f : nullptr, b.inj_f, L.hc_norm[0], L.hc_down[0], L.hc_up[0], L.hc_inj[0], eps, b.mixed,
-                    b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq);
+                    b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq, cvd, cvc);
             if (!is_attn(l)) {
                 const int nv = w.nv();
                 gemv_f32(L.ab, b.mixed, b.ab, 2 * nv, N, T, b.st);
@@ -1202,14 +1251,15 @@ void Engine::enqueue_rows(const std::vector<int>& lanes, const std::vector<int>&
                 quantize_q8_1(b.att, b.xq, w.nq * HD, T, b.st);
                 dense(L.wo, b.xq, b.bo_a, b, T);
             }
-            ring_sum(b.ring, b.bo_a, T, (const unsigned*) (b.ctl + 1), call, b.st);
+ring_sum(b.ring, b.bo_a, T, (const unsigned*) (b.ctl + 1), call, b.st);
         });
         ++call;
         each([&](int, CardBuf& b, const CardW& w) { ffn_half(T, call, b, w, w.L[l], b.R, b.ctl); });
         ++call;
     }
     each([&](int, CardBuf& b, const CardW& w) {
-        hc_read(b.R, b.bo_f, b.inj_f, w.head_norm, w.head_down, w.head_up, nullptr, eps, b.mixed, b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq);
+        const auto [cvd, cvc] = cvc_boundary(b, NL - 1, b.bo_f, T);   // the head folds the last block's output
+        hc_read(b.R, b.bo_f, b.inj_f, w.head_norm, w.head_down, w.head_up, nullptr, eps, b.mixed, b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq, cvd, cvc);
         dense(w.out, b.xq, b.head_logits, b, T);
         argmax(b.head_logits, w.v1 - w.v0, T, w.v0, b.best_v, b.best_i, b.am_keys, b.ring.err, b.st);
     });
