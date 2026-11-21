@@ -2376,6 +2376,21 @@ class WebApp(unittest.TestCase):
             engine.max_context = had
             del engine.known_ctx
 
+    def test_health_says_how_many_cards_the_engine_runs_on(self):
+        """The web app takes the card count from /health instead of naming a machine, so a box that gains a card says so
+        without an edit; one that names none (a CPU run) answers 0 and the app drops the phrase."""
+        had = getattr(self.svc, "gpu_indices", None)
+        try:
+            self.svc.gpu_indices = [0, 1, 2, 3]
+            self.assertEqual(json.loads(self.get("/health")[2])["cards"], 4)
+            self.svc.gpu_indices = []
+            self.assertEqual(json.loads(self.get("/health")[2])["cards"], 0)
+        finally:
+            if had is None:
+                del self.svc.gpu_indices
+            else:
+                self.svc.gpu_indices = had
+
     def test_props_total_slots_follows_the_batch_slots(self):
         # llama.cpp clients read total_slots as the number of requests the server runs at once
         engine, had = self.svc.engine, hasattr(self.svc.engine, "batch")
