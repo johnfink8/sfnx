@@ -258,11 +258,59 @@ struct Up {
         else ck(cudaHostGetDevicePointer(&dp, (void*) h, 0), "place: mapped pointer");
         for (size_t e = 0; e < bytes / stride; ++e) host_of[e] = (const char*) dp + e * stride;
     }
+    // An expert that keeps a slot in VRAM is read from it, so it needs no copy in RAM: only the experts that live in
+    // RAM get one, in their layer's page-locked tier, compacted to those experts (FNX_EXPERT_RAM_GIB with FNX_ARENA=0:
+    // the tier is the spill and nothing else, so a box short of RAM can spill). The arena keeps a copy of every expert
+    // because it lends a slot back from its copy, so it keeps the layout where every expert is copied first.
+    struct Dest {
+        uint8_t* host = nullptr;      // the layer's tier: its RAM experts, stride apart
+        uint8_t* dev = nullptr;       // the same bytes as the card sees them
+        std::vector<uint8_t*> at;     // per expert: its slot, or its place in the tier
+        std::vector<char> slotted;    // per expert: it has a slot, so its bytes are uploaded and no copy kept
+        std::vector<uint8_t> one;     // one expert's bytes, on their way to its slot
+    };
+
+    // one layer's experts (its gate|up, or its down): where each one's bytes go. The slots come from reserve_slots,
+    // which therefore runs before a layer is read.
+    Dest dest(int l, size_t stride, bool down, const std::vector<std::vector<char>>& res) {
+        Dest d;
+        const int p = c.ec.pool_of[l];
+        const size_t part = down ? c.ec.dn_off[p] : 0;
+        d.at.resize((size_t) NEXP);
+        d.slotted.resize((size_t) NEXP);
+        size_t n_ram = 0;
+        for (int e = 0; e < NEXP; ++e) n_ram += !res[(size_t) l][(size_t) e];
+        if (n_ram) {
+            if (store) throw std::runtime_error("expert tier: the holder copies every expert, so it does not compact one");
+            void* hp = nullptr;
+            ck(cudaHostAlloc(&hp, n_ram * stride, cudaHostAllocMapped), "expert tier: page-locked room");
+            c.host_bytes += n_ram * stride;
+            d.host = (uint8_t*) hp;
+            ck(cudaHostGetDevicePointer((void**) &d.dev, hp, 0), "expert tier: the mapped pointer");
+        }
+        size_t rank = 0;
+        for (int e = 0; e < NEXP; ++e) {
+            const int s = c.ec_slot0[(size_t) l * NEXP + e];
+            if (s < 0) { d.at[e] = d.host + (rank++) * stride; continue; }
+            d.slotted[e] = 1;
+            d.at[e] = (uint8_t*) (c.ec.pool[p] + (size_t) (s - c.ec.s0[p]) * c.ec.slot_bytes[p] + part);
+        }
+        d.one.resize(stride);
+        return d;
+    }
+
     // the card's ExpertCache: a slot for each resident expert (res) in its size's pool, filled from its host copy; the
     // layers' tables. With arena_score (FNX_ARENA) the largest pool's slots go coldest first and are neither allocated
     // nor filled here: the engine puts them in its arena (Engine::arena_fill); until then its experts point at RAM
     void expert_cache(const std::vector<std::vector<char>>& res, const std::vector<const char*>& hgu, const std::vector<const char*>& hdn,
                       const std::vector<double>* arena_score) {
+        reserve_slots(res, arena_score);
+        expert_tables(hgu, hdn, false);
+    }
+
+    // the pools and every resident expert's slot, from the model's geometry and who is resident: an expert's slot has
+    // to exist before its bytes can be written into it, which is what the compact mode does
+    void reserve_slots(const std::vector<std::vector<char>>& res, const std::vector<double>* arena_score) {
         ExpertCache& ec = c.ec;
         std::vector<std::pair<size_t, size_t>> sizes;   // each pool's (gate|up, down) bytes
         for (int l = 0; l < NL; ++l) {
@@ -310,14 +358,26 @@ struct Up {
         }
         ec.n_slots = (int) owner.size();
         ec.arena_full = arena_score && ec.n_slots == NL * NEXP;
+        c.ec_owner0 = owner;
+        c.ec_slot0 = slot_of;
+    }
+
+    // the tables a window reads, and each slot filled with its expert: from its host copy, unless its bytes are
+    // already in the slot (bytes_in_slot: the compact mode, where an expert with a slot never had a copy made)
+    void expert_tables(const std::vector<const char*>& hgu, const std::vector<const char*>& hdn, bool bytes_in_slot) {
+        ExpertCache& ec = c.ec;
+        const std::vector<int>& owner = c.ec_owner0;
         std::vector<const char*> epg(hgu), epd(hdn);
         for (int s = 0; s < ec.n_slots; ++s) {
             const int i = owner[(size_t) s], p = ec.pool_of[i / NEXP];
             if (p == ec.arena_pool) continue;
             const LayerW& L = c.L[(size_t) (i / NEXP)];
             char* at = ec.pool[p] + (size_t) (s - ec.s0[p]) * ec.slot_bytes[p];
-            ck(cudaMemcpy(at, hgu[(size_t) i], L.gu_e_stride, cudaMemcpyDefault), "expert cache: fill");
-            ck(cudaMemcpy(at + ec.dn_off[p], hdn[(size_t) i], L.down_e_stride, cudaMemcpyDefault), "expert cache: fill");
+            if (hgu[(size_t) i]) {
+                ck(cudaMemcpy(at, hgu[(size_t) i], L.gu_e_stride, cudaMemcpyDefault), "expert cache: fill");
+                ck(cudaMemcpy(at + ec.dn_off[p], hdn[(size_t) i], L.down_e_stride, cudaMemcpyDefault), "expert cache: fill");
+            } else if (!bytes_in_slot)
+                throw std::runtime_error("expert cache: expert " + std::to_string(i) + " has a slot and no copy to fill it from");
             epg[(size_t) i] = at;
             epd[(size_t) i] = at + ec.dn_off[p];
         }
@@ -327,9 +387,7 @@ struct Up {
         ec.host_dn = put<const char*>(hdn.data(), hdn.size() * sizeof(char*));
         c.ec_host_gu = hgu;
         c.ec_host_dn = hdn;
-        ec.slot_of = put<int>(slot_of.data(), slot_of.size() * sizeof(int));
-        c.ec_owner0 = owner;
-        c.ec_slot0 = slot_of;
+        ec.slot_of = put<int>(c.ec_slot0.data(), c.ec_slot0.size() * sizeof(int));
         ec.owner = put<int>(owner.data(), owner.size() * sizeof(int));
         const std::vector<unsigned char> ref((size_t) ec.n_slots, 0);
         ec.ref = put<unsigned char>(ref.data(), ref.size());
@@ -551,7 +609,7 @@ struct Up {
         return w;
     }
     // per expert: rows [r0, r1) of t1 then of t2 (gate; up), expert-major
-    DW expert_rows2(const Tensor& t1, const Tensor& t2, int r0, int r1, size_t& stride, const char** host_of = nullptr) {
+    DW expert_rows2(const Tensor& t1, const Tensor& t2, int r0, int r1, size_t& stride, const char** host_of = nullptr, Dest* d = nullptr) {
         if (t1.type != t2.type || t1.ne[0] != t2.ne[0] || t1.ne[2] != t2.ne[2]) throw std::runtime_error(t1.name + " and " + t2.name + " do not stack");
         row_range(t1, r0, r1);
         row_range(t2, r0, r1);
@@ -564,12 +622,18 @@ struct Up {
         const size_t half = (size_t) (r1 - r0) * w.row_bytes, src_mat = (size_t) t1.ne[1] * w.row_bytes;
         std::vector<uint8_t> tmp;
         const size_t bytes = (size_t) t1.ne[2] * stride;
-        uint8_t* h = expert_buf(bytes, host_of, tmp);
+        uint8_t* h = d ? nullptr : expert_buf(bytes, host_of, tmp);   // d: each expert already has its own place
+        size_t rank = 0;
         for (int64_t e = 0; e < t1.ne[2]; ++e) {
-            std::memcpy(&h[e * stride], t1.data + e * src_mat + (size_t) r0 * w.row_bytes, half);
-            std::memcpy(&h[e * stride + half], t2.data + e * src_mat + (size_t) r0 * w.row_bytes, half);
+            const bool slot = d && d->slotted[e];
+            uint8_t* to = d ? (slot ? d->one.data() : d->at[e]) : &h[e * stride];
+            std::memcpy(to, t1.data + e * src_mat + (size_t) r0 * w.row_bytes, half);
+            std::memcpy(to + half, t2.data + e * src_mat + (size_t) r0 * w.row_bytes, half);
+            if (!d) continue;
+            if (slot) ck(cudaMemcpy(d->at[e], d->one.data(), stride, cudaMemcpyHostToDevice), "expert: to its slot");
+            else host_of[e] = (const char*) d->dev + (rank++) * stride;   // it lives in RAM, where the card reads it
         }
-        place(w, h, bytes, stride, host_of);
+        if (!d) place(w, h, bytes, stride, host_of);
         return w;
     }
     // f32 tensors' rows one after another
@@ -583,7 +647,7 @@ struct Up {
         return put<float>(h.data(), h.size() * 4);
     }
     // per expert: every row, input blocks [b0, b1) (down), expert-major
-    DW expert_cols(const Tensor& t, int b0, int b1, size_t& stride, const char** host_of = nullptr) {
+    DW expert_cols(const Tensor& t, int b0, int b1, size_t& stride, const char** host_of = nullptr, Dest* d = nullptr) {
         const TypeInfo ti = block32(t);
         DW w;
         w.type = t.type;
@@ -597,11 +661,18 @@ struct Up {
                                      std::to_string(src_row / ti.bytes));
         std::vector<uint8_t> tmp;
         const size_t bytes = (size_t) t.ne[2] * stride;
-        uint8_t* h = expert_buf(bytes, host_of, tmp);
-        for (int64_t e = 0; e < t.ne[2]; ++e)
+        uint8_t* h = d ? nullptr : expert_buf(bytes, host_of, tmp);   // d: each expert already has its own place
+        size_t rank = 0;
+        for (int64_t e = 0; e < t.ne[2]; ++e) {
+            const bool slot = d && d->slotted[e];
+            uint8_t* to = d ? (slot ? d->one.data() : d->at[e]) : &h[e * stride];
             for (int r = 0; r < w.n_out; ++r)
-                std::memcpy(&h[e * stride + (size_t) r * w.row_bytes], t.data + e * src_mat + (size_t) r * src_row + (size_t) b0 * ti.bytes, w.row_bytes);
-        place(w, h, bytes, stride, host_of);
+                std::memcpy(to + (size_t) r * w.row_bytes, t.data + e * src_mat + (size_t) r * src_row + (size_t) b0 * ti.bytes, w.row_bytes);
+            if (!d) continue;
+            if (slot) ck(cudaMemcpy(d->at[e], d->one.data(), stride, cudaMemcpyHostToDevice), "expert: to its slot");
+            else host_of[e] = (const char*) d->dev + (rank++) * stride;
+        }
+        if (!d) place(w, h, bytes, stride, host_of);
         return w;
     }
 };
@@ -704,7 +775,7 @@ void load_layers_27b(Stager& st, CardW& c, Up& up, const std::vector<int>& conv_
 // once this card is through with it.
 // host_experts: every routed expert to a host copy (an ExpertCache, or the lab's holder); store: the holder's shared memory
 void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resident, const std::vector<double>* arena_score,
-               Store* store, bool host_experts) {
+               Store* store, bool host_experts, const Gguf& g) {
     ck(cudaSetDevice(c.dev), "cudaSetDevice");
     Up up{c, store};
     auto L = [&](int l, const char* s) -> const Tensor& { return st.t(l, "blk." + std::to_string(l) + "." + s); };
@@ -752,6 +823,24 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
     for (int i = 0; i < NKVH * HD; ++i) kvrows_all.push_back(i);
     c.L.resize(NL);
     std::vector<const char*> hgu(host_experts ? (size_t) NL * NEXP : 0), hdn(hgu.size());   // the experts' host copies
+    Up ue{c, store, &c.expert_mem};   // its slots are tracked: Model::free_experts gives them back
+    const size_t expert_bytes0 = c.bytes;
+    // FNX_EXPERT_RAM_GIB with FNX_ARENA=0: the tier is the spill and nothing else, and a slot has to exist before the
+    // layer is read, so its strides come from the headers for once (checked against what the slicer makes of them)
+    const bool compact = host_experts && !arena_score && !store;
+    if (compact) {
+        for (int l = 0; l < NL; ++l) {
+            const std::string b = "blk." + std::to_string(l) + ".";
+            const Tensor& tg = g.t(b + "ffn_gate_exps.weight");
+            const Tensor& tu = g.t(b + "ffn_up_exps.weight");
+            const Tensor& td = g.t(b + "ffn_down_exps.weight");
+            if (tg.type != tu.type || tg.ne[0] != tu.ne[0]) throw std::runtime_error(tg.name + " and " + tu.name + " do not stack");
+            c.L[(size_t) l].gu_e_stride = 2 * (size_t) (c.ff1 - c.ff0) * tg.row_bytes();
+            c.L[(size_t) l].down_e_stride = (size_t) td.ne[1] * (size_t) (c.ff1 / 32 - c.ff0 / 32) * type_info(td.type).bytes;
+        }
+        ue.reserve_slots(resident, nullptr);
+        c.ec.slots_static = 1;   // read in place from the tier: there is nothing to demote a slot's expert to
+    }
     for (int l = 0; l < NL; ++l) {
         LayerW& w = c.L[l];
         const char** hg = host_experts ? hgu.data() + (size_t) l * NEXP : nullptr;
@@ -802,8 +891,18 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
             w.idx_qn = up.f32(L(l, "indexer.q_norm.weight"), QSA_KEY);
             w.idx_kn = up.f32(L(l, "indexer.k_norm.weight"), QSA_KEY);
         }
-        w.gu_e = up.expert_rows2(L(l, "ffn_gate_exps.weight"), L(l, "ffn_up_exps.weight"), c.ff0, c.ff1, w.gu_e_stride, hg);
-        w.down_e = up.expert_cols(L(l, "ffn_down_exps.weight"), c.ff0 / 32, c.ff1 / 32, w.down_e_stride, hd);
+        Up::Dest dg, dd;
+        size_t sgu = 0, sdn = 0;
+        if (compact) {
+            sgu = w.gu_e_stride, sdn = w.down_e_stride;
+            dg = ue.dest(l, sgu, false, resident);
+            dd = ue.dest(l, sdn, true, resident);
+        }
+        w.gu_e = up.expert_rows2(L(l, "ffn_gate_exps.weight"), L(l, "ffn_up_exps.weight"), c.ff0, c.ff1, w.gu_e_stride, hg, compact ? &dg : nullptr);
+        w.down_e = up.expert_cols(L(l, "ffn_down_exps.weight"), c.ff0 / 32, c.ff1 / 32, w.down_e_stride, hd, compact ? &dd : nullptr);
+        if (compact && (w.gu_e_stride != sgu || w.down_e_stride != sdn))
+            throw std::runtime_error("expert tier: the headers said " + std::to_string(sgu) + " + " + std::to_string(sdn) +
+                                     " bytes an expert, the slicer makes it " + std::to_string(w.gu_e_stride) + " + " + std::to_string(w.down_e_stride));
         w.sh_gu = up.dense(up.rows2(L(l, "ffn_gate_shexp.weight"), range(c.ff0, c.ff1), L(l, "ffn_up_shexp.weight"), range(c.ff0, c.ff1)));
         w.sh_down = up.dense(up.cols(L(l, "ffn_down_shexp.weight"), range(c.ff0 / 32, c.ff1 / 32)));
         if (!w.sh_gu.s.q || !w.sh_down.s.q) throw std::runtime_error("fnx: the shared expert is not Q8_0");
@@ -836,10 +935,9 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
     c.out = up.dense(up.rows(st.t(NL, "output.weight"), range(c.v0, c.v1)));
     st.done(NL);
     if (!resident.empty()) {   // tracked, so the engine can place them again with more in RAM (Engine: VRAM short)
-        const size_t before = c.bytes;
-        Up ue{c, store, &c.expert_mem};
-        ue.expert_cache(resident, hgu, hdn, arena_score);
-        c.expert_bytes = c.bytes - before;
+        if (compact) ue.expert_tables(hgu, hdn, true);   // every slot already holds its expert
+        else ue.expert_cache(resident, hgu, hdn, arena_score);
+        c.expert_bytes = c.bytes - expert_bytes0;
     } else if (host_experts) c.ec_host_gu = hgu, c.ec_host_dn = hdn;   // the holder: placed by a worker
 }
 
@@ -1401,7 +1499,7 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
         th.emplace_back([&, c] {
             try {
                 load_card(st, cards[c], resident, arena ? &score : nullptr, how == Load::HOLD ? store : nullptr,
-                          how == Load::HOLD || !resident.empty());
+                          how == Load::HOLD || !resident.empty(), g);
             } catch (const std::exception& e) {
                 errs[c] = e.what();
                 st.abort("card " + std::to_string(c) + " failed");   // the other cards wait on groups no one gives back
@@ -1566,7 +1664,8 @@ void card_fields(CardW& c, F f) {
         f(c.ple_norm_query), f(c.ple_norm_conv), f(c.ple_conv), f(c.bytes), f(c.host_bytes);
 }
 #if !FNX_27B   // the 27B has no holder (plain loads only)
-static_assert(sizeof(CardW) == 896, "CardW changed: put what load_card stores in card_fields, then update this size");
+// ExpertCache grew (slots_static); it is not in card_fields: a worker builds its own (Model::place_experts)
+static_assert(sizeof(CardW) == 904, "CardW changed: put what load_card stores in card_fields, then update this size");
 #endif
 // every address load_card stores, in a card and in a layer: a worker moves them to where it mapped the holder's memory
 template <typename F>

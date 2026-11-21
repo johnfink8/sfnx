@@ -19,7 +19,7 @@ constexpr int RR_THREADS = 256, RR_WPR = 2, RR_ROWS = RR_THREADS / 32 / RR_WPR; 
 __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache& ec, int* list) {
     const int lane = threadIdx.x & 31, base = layer * NEXP, p = ec.pool_of[layer], lent = ec.lent[p];
     // an arena's pools hold every expert until it lends, and then only its own pool's experts can be missing
-    if (ec.arena_full && (p != ec.arena_pool || lent == 0)) {
+    if (ec.slots_static || (ec.arena_full && (p != ec.arena_pool || lent == 0))) {
         if (lane == 0) list[0] = 0;
         return;
     }

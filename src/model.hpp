@@ -113,6 +113,8 @@ struct ExpertCache {
     // ref 3, skipped by CLOCK). -1: no arena
     int arena_pool = -1;
     int arena_full = 0;                  // every expert in a slot at the start (no FNX_EXPERT_RAM_GIB): nothing lent, nothing out
+    int slots_static = 0;                // the placement is final: a slot's expert has no copy to be demoted to, so no expert is
+                                       // pulled into a slot at run time (the compact tier, where only the RAM experts are copied)
     int* lent = nullptr;                 // [EC_POOLS]
 };
 
