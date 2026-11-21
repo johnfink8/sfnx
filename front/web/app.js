@@ -100,7 +100,10 @@ async function loadHealth() {
     health = await (await fetch("health")).json();
     $("attach-btn").title = health.images ? "Attach a text file or a picture (or drop it here)"
                                           : "Attach a text file (or drop it here)";
-    $("chat-empty-sub").textContent = `${health.model} runs on this server's three V100s.`;
+    // the count comes from /health (the config's "gpu"), so a machine that gains a card says so without an edit here;
+    // one that names no card (a CPU run) drops the phrase rather than naming a wrong number
+    $("chat-empty-sub").textContent = `${health.model} runs on `
+      + (health.cards ? `this server's ${health.cards} GPUs.` : "this server.");
   } catch (e) {
     setTimeout(loadHealth, 2000);
   }

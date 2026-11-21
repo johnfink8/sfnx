@@ -2360,6 +2360,7 @@ class Service:
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # default: clamp the output cap to the room left; False (--no-fit-max-tokens) = 400
+        self.gpu_indices: list[int] = []              # every card the engine is split over: main() fills it from the config (#112)
 
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
@@ -4053,7 +4054,7 @@ def make_handler(svc: Service):
             elif path in ("/health", "/api/health"):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
-
+                                 "cards": len(svc.gpu_indices),   # the web app says how many GPUs on this server rather than naming one machine
                                  "loaded": svc.loaded(), "service": "sfnx"})
             elif path == "/status":
                 if not self._authorized():                  # #212: it shows the end of the last answer
